@@ -50,6 +50,27 @@ if [ ! -f .env ]; then
     info "no .env found — copying .env.example (demo secrets, not for production)"
     cp .env.example .env
 fi
+# An .env from before a given feature was added won't have that feature's key
+# yet — backfill it rather than requiring everyone to recreate their .env by
+# hand each time the app grows a new required secret.
+ensure_env_secret() {
+    local key="$1"
+    if ! grep -q "^${key}=" .env; then
+        info "${key} missing from .env — generating one"
+        # 48 raw bytes -> 64 base64 chars before stripping. Stripping '=+/'
+        # (tr -d, not just trimming padding) can remove a handful of chars
+        # unpredictably, so start with enough headroom that the result is
+        # reliably >=32 chars (config.go's minSecretLength) even in the
+        # worst case, then truncate to a fixed, deterministic length rather
+        # than trust however many survived stripping.
+        local value
+        value=$(docker run --rm golang:1.22 sh -c "head -c 48 /dev/urandom | base64 -w0" | tr -d '=+/\n' | head -c 40)
+        printf '\n%s=%s\n' "$key" "$value" >> .env
+    fi
+}
+ensure_env_secret APP_DB_PASSWORD          # migration 019, the bss_app least-privilege role
+ensure_env_secret RADIUS_VERIFIER_SECRET   # the RADIUS fast-verifier cache (NFR-PERF-001)
+
 # shellcheck disable=SC1091
 set -a; source .env; set +a
 
@@ -105,6 +126,19 @@ if ! docker run --rm --network "$COMPOSE_NETWORK" \
     exit 1
 fi
 pass "migrations applied"
+
+# Migration 019 creates the bss_app role without a password (the migration
+# file is committed to git, so it can't contain one) — set it here from
+# APP_DB_PASSWORD instead, as the postgres superuser, every run. Idempotent:
+# ALTER ROLE ... PASSWORD always succeeds and simply sets it to the current
+# value, whether that's unchanged or new.
+if ! docker compose exec -T -e PGPASSWORD="${DB_SECURE_PASSWORD}" postgres_primary \
+        psql -U postgres -d isp_bss_oss -c "ALTER ROLE bss_app WITH PASSWORD '${APP_DB_PASSWORD}';" >/tmp/app_role_out.txt 2>&1; then
+    fail "setting bss_app password failed"
+    cat /tmp/app_role_out.txt
+    exit 1
+fi
+pass "bss_app role password set"
 
 if ! docker compose exec -T -e PGPASSWORD="${DB_SECURE_PASSWORD}" postgres_primary \
         psql -U postgres -d isp_bss_oss < scripts/seed_local.sql >/tmp/seed_out.txt 2>&1; then

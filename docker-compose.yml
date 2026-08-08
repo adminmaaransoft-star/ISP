@@ -151,12 +151,25 @@ services:
     ports:
       - "1812:1812/udp"
       - "1813:1813/udp"
-      - "9100:9100"   # Prometheus metrics
+      # Host 9100 -> container 9101: config.go's METRICS_ADDR default is
+      # :9101 (same as api_service, confirmed by this daemon's own "metrics
+      # listening" startup log) — this was previously mapped 9100:9100,
+      # which meant the metrics endpoint was never actually reachable on the
+      # host at all. Kept at host-side 9100 (distinct from api_service's
+      # 9101) so the two services don't collide on the same host port.
+      - "9100:9101"   # Prometheus metrics
     environment:
-      - DB_DSN=host=postgres_primary user=postgres password=${DB_SECURE_PASSWORD} dbname=isp_bss_oss port=5432 sslmode=disable
+      # bss_app, not postgres: the app must run as a non-superuser,
+      # non-owner role so PostgreSQL RLS (lea_audit_log's append-only
+      # policy, migration 014) actually applies to it — a superuser or
+      # table owner bypasses RLS entirely regardless of policy. Migrations
+      # still run as postgres (see scripts/demo_up.sh); only the running
+      # application's own connection uses this least-privilege role.
+      - DB_DSN=host=postgres_primary user=bss_app password=${APP_DB_PASSWORD} dbname=isp_bss_oss port=5432 sslmode=disable
       - REDIS_SENTINEL_ADDRS=bss_redis_sentinel_1:26379,bss_redis_sentinel_2:26379,bss_redis_sentinel_3:26379
       - REDIS_MASTER_NAME=${REDIS_MASTER_NAME}
       - RADIUS_SECRET=${RADIUS_SECRET}
+      - RADIUS_VERIFIER_SECRET=${RADIUS_VERIFIER_SECRET}
       - AES_KEY_STORE_URL=${AES_KEY_STORE_URL}
       - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID}
       - WHATSAPP_ACCESS_TOKEN=${WHATSAPP_ACCESS_TOKEN}
@@ -194,7 +207,8 @@ services:
       # scripts/demo_up.sh, or by hand (see .env.example).
       - ./config/keys:/app/config/keys:ro
     environment:
-      - DB_DSN=host=postgres_primary user=postgres password=${DB_SECURE_PASSWORD} dbname=isp_bss_oss port=5432 sslmode=disable
+      # bss_app, not postgres — see the same note on aaa_core_daemon above.
+      - DB_DSN=host=postgres_primary user=bss_app password=${APP_DB_PASSWORD} dbname=isp_bss_oss port=5432 sslmode=disable
       - REDIS_SENTINEL_ADDRS=bss_redis_sentinel_1:26379,bss_redis_sentinel_2:26379,bss_redis_sentinel_3:26379
       - REDIS_MASTER_NAME=${REDIS_MASTER_NAME}
       - JWT_SECRET=${JWT_SECRET}

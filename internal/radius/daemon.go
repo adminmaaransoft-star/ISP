@@ -67,23 +67,29 @@ type radiusJob struct {
 
 // RadiusDaemon is the fixed-worker-pool RADIUS server.
 type RadiusDaemon struct {
-	addr        string
-	secret      []byte
-	db          DBQuerier
-	redisClient redis.UniversalClient
-	guard       *BruteForceGuard
-	packetQueue chan radiusJob
+	addr          string
+	secret        []byte
+	db            DBQuerier
+	redisClient   redis.UniversalClient
+	guard         *BruteForceGuard
+	verifierCache *VerifierCache
+	packetQueue   chan radiusJob
 }
 
-// NewRadiusDaemon constructs a RadiusDaemon.
-func NewRadiusDaemon(addr string, secret []byte, db DBQuerier, rc redis.UniversalClient) *RadiusDaemon {
+// NewRadiusDaemon constructs a RadiusDaemon. verifierSecret keys the
+// fast-verifier cache (see VerifierCache) that lets repeat authentications
+// skip bcrypt cost-12 to meet NFR-PERF-001's 15ms p99 budget; it must be a
+// separate secret from secret (the RADIUS shared secret used for NAS
+// protocol obfuscation), not the same value reused for a different purpose.
+func NewRadiusDaemon(addr string, secret []byte, db DBQuerier, rc redis.UniversalClient, verifierSecret []byte) *RadiusDaemon {
 	return &RadiusDaemon{
-		addr:        addr,
-		secret:      secret,
-		db:          db,
-		redisClient: rc,
-		guard:       NewBruteForceGuard(rc),
-		packetQueue: make(chan radiusJob, workerCount*4),
+		addr:          addr,
+		secret:        secret,
+		db:            db,
+		redisClient:   rc,
+		guard:         NewBruteForceGuard(rc),
+		verifierCache: NewVerifierCache(rc, verifierSecret),
+		packetQueue:   make(chan radiusJob, workerCount*4),
 	}
 }
 

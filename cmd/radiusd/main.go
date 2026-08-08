@@ -88,7 +88,7 @@ func run() error {
 	// Access-Request misses the NFR-PERF-001 15ms p99 budget by roughly 3x.
 	subscriberCache := cache.NewSubscriberCache(database.Radius(), redisClient, cfg.SubscriberCacheTTL)
 
-	daemon := radius.NewRadiusDaemon(cfg.RadiusAddr, []byte(cfg.RadiusSecret), subscriberCache, redisClient)
+	daemon := radius.NewRadiusDaemon(cfg.RadiusAddr, []byte(cfg.RadiusSecret), subscriberCache, redisClient, []byte(cfg.RadiusVerifierSecret))
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

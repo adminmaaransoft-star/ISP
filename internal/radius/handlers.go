@@ -69,12 +69,30 @@ func (d *RadiusDaemon) handleAuth(ctx context.Context, w radius.ResponseWriter, 
 		return
 	}
 
-	// bcrypt password check (cost=12 per spec)
-	if err := bcrypt.CompareHashAndPassword([]byte(sub.PasswordHash), []byte(password)); err != nil {
-		d.recordAuthFailure(ctx, username)
-		w.Write(r.Response(radius.CodeAccessReject)) //nolint:errcheck,gosec
-		radiusAuthReject.Inc()
-		return
+	// Fast path: skip bcrypt cost=12 (~280ms, ~19x the 15ms p99 budget) if this
+	// exact password was already bcrypt-verified against this exact password
+	// hash recently. Binding to sub.PasswordHash (not just the password) means
+	// a password change self-invalidates immediately: the old password no
+	// longer matches the cached verifier once the hash changes, even within
+	// the cache's TTL. A miss or mismatch here is NOT a rejection — it only
+	// means "pay the full bcrypt cost below", same as if the cache did not
+	// exist.
+	authenticated, err := d.verifierCache.Check(ctx, username, password, sub.PasswordHash)
+	if err != nil {
+		log.Warn().Err(err).Str("username", username).Msg("radius: verifier cache check failed")
+	}
+
+	if !authenticated {
+		// bcrypt password check (cost=12 per spec) — the authoritative check.
+		if err := bcrypt.CompareHashAndPassword([]byte(sub.PasswordHash), []byte(password)); err != nil {
+			d.recordAuthFailure(ctx, username)
+			w.Write(r.Response(radius.CodeAccessReject)) //nolint:errcheck,gosec
+			radiusAuthReject.Inc()
+			return
+		}
+		if err := d.verifierCache.Store(ctx, username, password, sub.PasswordHash); err != nil {
+			log.Warn().Err(err).Str("username", username).Msg("radius: verifier cache store failed")
+		}
 	}
 
 	// Successful auth clears the failure counter so a later typo does not inherit

@@ -53,6 +53,7 @@ type Config struct {
 	JWTSecret             string
 	PortalJWTSecret       string
 	RadiusSecret          string
+	RadiusVerifierSecret  string
 	RazorpayWebhookSecret string
 	RazorpayKeyID         string
 	RazorpayKeySecret     string
@@ -114,6 +115,7 @@ func Load(service string) (*Config, error) {
 		JWTSecret:             env("JWT_SECRET", ""),
 		PortalJWTSecret:       env("PORTAL_JWT_SECRET", ""),
 		RadiusSecret:          env("RADIUS_SECRET", ""),
+		RadiusVerifierSecret:  env("RADIUS_VERIFIER_SECRET", ""),
 		RazorpayWebhookSecret: env("RAZORPAY_WEBHOOK_SECRET", ""),
 		RazorpayKeyID:         env("RAZORPAY_KEY_ID", ""),
 		RazorpayKeySecret:     env("RAZORPAY_KEY_SECRET", ""),
@@ -164,6 +166,14 @@ func Load(service string) (*Config, error) {
 			value string
 			req   Requirement
 		}{cfg.RadiusSecret, RequiredSecret}
+		// Required, not optional: without it the fast-verifier cache (the fix
+		// for NFR-PERF-001's 15ms p99 budget) cannot function, and radiusd
+		// would silently pay bcrypt cost=12 on every request instead of
+		// failing loudly at startup.
+		rules["RADIUS_VERIFIER_SECRET"] = struct {
+			value string
+			req   Requirement
+		}{cfg.RadiusVerifierSecret, RequiredSecret}
 	default:
 		return nil, fmt.Errorf("config: unknown service %q (want api or radiusd)", service)
 	}
@@ -204,24 +214,25 @@ func (c *Config) UsesSentinel() bool { return len(c.RedisSentinelAddrs) > 0 }
 // marker so a startup log can show what is configured without leaking values.
 func (c *Config) Redact() map[string]string {
 	return map[string]string{
-		"environment":         c.Environment,
-		"api_addr":            c.APIAddr,
-		"metrics_addr":        c.MetricsAddr,
-		"radius_addr":         c.RadiusAddr,
-		"db_dsn":              redactDSN(c.DBDSN),
-		"db_max_conns":        strconv.Itoa(int(c.DBMaxConns)),
-		"redis_mode":          redisMode(c),
-		"redis_master":        c.RedisMasterName,
-		"jwt_secret":          setOrUnset(c.JWTSecret),
-		"radius_secret":       setOrUnset(c.RadiusSecret),
-		"aes_key_store":       setOrUnset(c.AESKeyStoreURL),
-		"razorpay_secret":     setOrUnset(c.RazorpayWebhookSecret),
-		"razorpay_key_id":     setOrUnset(c.RazorpayKeyID),
-		"razorpay_key_secret": setOrUnset(c.RazorpayKeySecret),
-		"whatsapp_token":      setOrUnset(c.WhatsAppAccessToken),
-		"sms_api_key":         setOrUnset(c.SMSAPIKey),
-		"pagerduty_key":       setOrUnset(c.PagerDutyRoutingKey),
-		"gotenberg_url":       c.GotenbergURL,
+		"environment":            c.Environment,
+		"api_addr":               c.APIAddr,
+		"metrics_addr":           c.MetricsAddr,
+		"radius_addr":            c.RadiusAddr,
+		"db_dsn":                 redactDSN(c.DBDSN),
+		"db_max_conns":           strconv.Itoa(int(c.DBMaxConns)),
+		"redis_mode":             redisMode(c),
+		"redis_master":           c.RedisMasterName,
+		"jwt_secret":             setOrUnset(c.JWTSecret),
+		"radius_secret":          setOrUnset(c.RadiusSecret),
+		"radius_verifier_secret": setOrUnset(c.RadiusVerifierSecret),
+		"aes_key_store":          setOrUnset(c.AESKeyStoreURL),
+		"razorpay_secret":        setOrUnset(c.RazorpayWebhookSecret),
+		"razorpay_key_id":        setOrUnset(c.RazorpayKeyID),
+		"razorpay_key_secret":    setOrUnset(c.RazorpayKeySecret),
+		"whatsapp_token":         setOrUnset(c.WhatsAppAccessToken),
+		"sms_api_key":            setOrUnset(c.SMSAPIKey),
+		"pagerduty_key":          setOrUnset(c.PagerDutyRoutingKey),
+		"gotenberg_url":          c.GotenbergURL,
 	}
 }
 

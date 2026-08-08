@@ -11,6 +11,7 @@ package radius
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ import (
 )
 
 var itSecret = []byte("testing123")
+var itVerifierSecret = []byte("test-verifier-cache-secret-32-bytes-min")
 
 // ── Test doubles ────────────────────────────────────────────────────────────
 
@@ -70,7 +72,7 @@ func itNewDaemon(t *testing.T, subs map[string]*Subscriber) (*RadiusDaemon, *min
 	mr := miniredis.RunT(t)
 	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rc.Close() })
-	return NewRadiusDaemon(":0", itSecret, &itSubscriberDB{subs: subs}, rc), mr
+	return NewRadiusDaemon(":0", itSecret, &itSubscriberDB{subs: subs}, rc, itVerifierSecret), mr
 }
 
 func itHashPassword(t *testing.T, password string) string {
@@ -400,5 +402,215 @@ func TestDedup_DuplicateInterimSkipped(t *testing.T) {
 	}
 	if len(mr.Keys()) != 2 {
 		t.Errorf("want 2 dedup keys after counter advance, got %d", len(mr.Keys()))
+	}
+}
+
+// ── Fast-verifier cache (DoD Phase 1 Step 3, NFR-PERF-001) ─────────────────
+
+// TestVerifierCache_SecondAuthUsesFastPath verifies a second authentication
+// with the same correct password is served by the fast-verifier cache
+// (radius_verifier_cache_hit_total increments) rather than bcrypt, while
+// still producing an ordinary Access-Accept.
+func TestVerifierCache_SecondAuthUsesFastPath(t *testing.T) {
+	d, _ := itNewDaemon(t, map[string]*Subscriber{
+		"carol@isp": {
+			ID:           3,
+			Username:     "carol@isp",
+			PasswordHash: itHashPassword(t, "carol-password"),
+			Status:       "active",
+			RateLimitStr: "100M/100M",
+		},
+	})
+	ctx := context.Background()
+
+	// First auth: cache miss, pays full bcrypt, populates the cache.
+	w1 := &itResponseWriter{}
+	d.handleAuth(ctx, w1, itAccessRequest(t, "carol@isp", "carol-password"))
+	if got := w1.last(); got == nil || got.Code != radius.CodeAccessAccept {
+		t.Fatalf("first auth: want Access-Accept, got %v", got)
+	}
+
+	beforeHits := itCounterValue(t, radiusVerifierCacheHit)
+
+	// Second auth, same password: should hit the fast path.
+	w2 := &itResponseWriter{}
+	d.handleAuth(ctx, w2, itAccessRequest(t, "carol@isp", "carol-password"))
+	if got := w2.last(); got == nil || got.Code != radius.CodeAccessAccept {
+		t.Fatalf("second auth: want Access-Accept, got %v", got)
+	}
+	if got := itCounterValue(t, radiusVerifierCacheHit); got != beforeHits+1 {
+		t.Errorf("radius_verifier_cache_hit_total: want +1 on the second auth, got %v", got-beforeHits)
+	}
+}
+
+// TestVerifierCache_WrongPasswordAfterCachedEntry_StillRejected verifies that
+// once a verifier is cached for the correct password, a *different*
+// (incorrect) password on a later request still falls through to bcrypt and
+// is still rejected — a cache miss/mismatch must never be treated as a
+// rejection on its own.
+func TestVerifierCache_WrongPasswordAfterCachedEntry_StillRejected(t *testing.T) {
+	d, _ := itNewDaemon(t, map[string]*Subscriber{
+		"dave@isp": {
+			ID:           4,
+			Username:     "dave@isp",
+			PasswordHash: itHashPassword(t, "dave-real-password"),
+			Status:       "active",
+			RateLimitStr: "100M/100M",
+		},
+	})
+	ctx := context.Background()
+
+	// Populate the cache with the correct password.
+	w1 := &itResponseWriter{}
+	d.handleAuth(ctx, w1, itAccessRequest(t, "dave@isp", "dave-real-password"))
+	if got := w1.last(); got == nil || got.Code != radius.CodeAccessAccept {
+		t.Fatalf("setup auth: want Access-Accept, got %v", got)
+	}
+
+	// A guess with the wrong password must still be rejected.
+	w2 := &itResponseWriter{}
+	d.handleAuth(ctx, w2, itAccessRequest(t, "dave@isp", "a-guess"))
+	if got := w2.last(); got == nil || got.Code != radius.CodeAccessReject {
+		t.Fatalf("wrong password after a cached entry exists: want Access-Reject, got %v", got)
+	}
+}
+
+// TestVerifierCache_ExpiredEntryFallsBackToBcrypt verifies an entry past its
+// TTL is treated as a miss (falls through to bcrypt) rather than as a
+// rejection or a stale accept.
+func TestVerifierCache_ExpiredEntryFallsBackToBcrypt(t *testing.T) {
+	d, mr := itNewDaemon(t, map[string]*Subscriber{
+		"erin@isp": {
+			ID:           5,
+			Username:     "erin@isp",
+			PasswordHash: itHashPassword(t, "erin-password"),
+			Status:       "active",
+			RateLimitStr: "100M/100M",
+		},
+	})
+	ctx := context.Background()
+
+	w1 := &itResponseWriter{}
+	d.handleAuth(ctx, w1, itAccessRequest(t, "erin@isp", "erin-password"))
+	if got := w1.last(); got == nil || got.Code != radius.CodeAccessAccept {
+		t.Fatalf("setup auth: want Access-Accept, got %v", got)
+	}
+
+	mr.FastForward(verifierCacheTTL + time.Second)
+
+	beforeHits := itCounterValue(t, radiusVerifierCacheHit)
+	w2 := &itResponseWriter{}
+	d.handleAuth(ctx, w2, itAccessRequest(t, "erin@isp", "erin-password"))
+	if got := w2.last(); got == nil || got.Code != radius.CodeAccessAccept {
+		t.Fatalf("auth after TTL expiry: want Access-Accept (via bcrypt fallback), got %v", got)
+	}
+	if got := itCounterValue(t, radiusVerifierCacheHit); got != beforeHits {
+		t.Errorf("expired entry must not count as a fast-path hit: delta %v", got-beforeHits)
+	}
+}
+
+// TestVerifierCache_PasswordChange_OldRejectedNewAccepted verifies that when
+// a subscriber's password changes after a verifier was cached under the old
+// one, the old password is rejected and the new password succeeds (via the
+// bcrypt fallback, which re-populates the cache under the new password).
+func TestVerifierCache_PasswordChange_OldRejectedNewAccepted(t *testing.T) {
+	sub := &Subscriber{
+		ID:           6,
+		Username:     "frank@isp",
+		PasswordHash: itHashPassword(t, "old-password"),
+		Status:       "active",
+		RateLimitStr: "100M/100M",
+	}
+	d, _ := itNewDaemon(t, map[string]*Subscriber{"frank@isp": sub})
+	ctx := context.Background()
+
+	// Cache a verifier under the old password.
+	w1 := &itResponseWriter{}
+	d.handleAuth(ctx, w1, itAccessRequest(t, "frank@isp", "old-password"))
+	if got := w1.last(); got == nil || got.Code != radius.CodeAccessAccept {
+		t.Fatalf("setup auth: want Access-Accept, got %v", got)
+	}
+
+	// Simulate a password change (an admin/portal flow rehashing PasswordHash).
+	sub.PasswordHash = itHashPassword(t, "new-password")
+
+	t.Run("the old password is now rejected", func(t *testing.T) {
+		w := &itResponseWriter{}
+		d.handleAuth(ctx, w, itAccessRequest(t, "frank@isp", "old-password"))
+		if got := w.last(); got == nil || got.Code != radius.CodeAccessReject {
+			t.Errorf("want Access-Reject for the old password, got %v", got)
+		}
+	})
+
+	t.Run("the new password is accepted", func(t *testing.T) {
+		w := &itResponseWriter{}
+		d.handleAuth(ctx, w, itAccessRequest(t, "frank@isp", "new-password"))
+		if got := w.last(); got == nil || got.Code != radius.CodeAccessAccept {
+			t.Errorf("want Access-Accept for the new password, got %v", got)
+		}
+	})
+}
+
+// TestHandleAuth_RepeatAuthMeetsP99Budget is the direct verification of
+// NFR-PERF-001/NFR-SCAL-001: with a *real* bcrypt cost=12 hash (not
+// bcrypt.MinCost, which every other test in this file uses to stay fast),
+// the first authentication pays full bcrypt cost, but 200 subsequent
+// authentications with the same password — the fast-verifier-cache path —
+// must have a p99 latency under 15ms.
+func TestHandleAuth_RepeatAuthMeetsP99Budget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real bcrypt cost=12 hashing is slow; skipped in -short mode")
+	}
+
+	const cost12Password = "p99-budget-password"
+	hash, err := bcrypt.GenerateFromPassword([]byte(cost12Password), 12)
+	if err != nil {
+		t.Fatalf("bcrypt hash at cost=12: %v", err)
+	}
+
+	d, _ := itNewDaemon(t, map[string]*Subscriber{
+		"p99@isp": {
+			ID:           7,
+			Username:     "p99@isp",
+			PasswordHash: string(hash),
+			Status:       "active",
+			RateLimitStr: "100M/100M",
+		},
+	})
+	ctx := context.Background()
+
+	// First request: cache miss, pays the full ~280ms bcrypt cost. Confirm it
+	// really is slow, so the later assertion is proving something — if this
+	// environment's bcrypt happened to be fast, a passing p99 below would be
+	// meaningless.
+	first := time.Now()
+	w0 := &itResponseWriter{}
+	d.handleAuth(ctx, w0, itAccessRequest(t, "p99@isp", cost12Password))
+	firstLatency := time.Since(first)
+	if got := w0.last(); got == nil || got.Code != radius.CodeAccessAccept {
+		t.Fatalf("first auth: want Access-Accept, got %v", got)
+	}
+	if firstLatency < 15*time.Millisecond {
+		t.Skipf("bcrypt cost=12 completed in %v on this machine — too fast to demonstrate the fast path's benefit here", firstLatency)
+	}
+
+	const n = 200
+	latencies := make([]time.Duration, n)
+	for i := 0; i < n; i++ {
+		start := time.Now()
+		w := &itResponseWriter{}
+		d.handleAuth(ctx, w, itAccessRequest(t, "p99@isp", cost12Password))
+		latencies[i] = time.Since(start)
+		if got := w.last(); got == nil || got.Code != radius.CodeAccessAccept {
+			t.Fatalf("repeat auth %d: want Access-Accept, got %v", i, got)
+		}
+	}
+
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	p99 := latencies[int(float64(n)*0.99)]
+	t.Logf("first (cold, bcrypt) auth: %v | repeat (cached) auth p99: %v, max: %v", firstLatency, p99, latencies[n-1])
+
+	if p99 >= 15*time.Millisecond {
+		t.Errorf("repeat-auth p99 = %v, want < 15ms (NFR-PERF-001)", p99)
 	}
 }
