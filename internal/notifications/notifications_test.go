@@ -2,6 +2,8 @@ package notifications_test
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/maaransoft/isp-bss-oss/internal/notifications"
@@ -92,5 +94,44 @@ func TestDispatch_DND_Allows_Transactional(t *testing.T) {
 	}
 	if sms.calls != 1 {
 		t.Errorf("expected 1 SMS call for transactional, got %d", sms.calls)
+	}
+}
+
+// TestSMS_InvalidPhoneRejected verifies DoD Phase 2 Step 4: SendSMS refuses
+// a non-E.164 phone number before ever attempting the gateway call.
+func TestSMS_InvalidPhoneRejected(t *testing.T) {
+	client := notifications.NewMSG91Client("test-key", "TESTID")
+
+	err := client.SendSMS(context.Background(), "not-a-phone-number", "hello")
+	if err == nil {
+		t.Fatal("expected an error for a non-E.164 phone number, got nil")
+	}
+}
+
+// TestWhatsApp_SendTemplate_InvalidPhoneRejected is the WhatsApp-channel
+// counterpart: SendTemplate must refuse a non-E.164 phone number before
+// ever calling the Meta API — proven here by asserting the mock server
+// never received a request, not just that an error came back.
+func TestWhatsApp_SendTemplate_InvalidPhoneRejected(t *testing.T) {
+	var called bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	wa := notifications.NewWhatsAppClient("phone-id", "token", &stubNotifDB{})
+	wa.SetBaseURL(srv.URL)
+
+	err := wa.SendTemplate(context.Background(), notifications.TemplateMessage{
+		SubscriberID: 1,
+		ToPhoneE164:  "not-a-phone-number",
+		TemplateID:   "TMPL-001",
+	})
+	if err == nil {
+		t.Fatal("expected an error for a non-E.164 phone number, got nil")
+	}
+	if called {
+		t.Error("the Meta API must not be called when the phone number is invalid")
 	}
 }

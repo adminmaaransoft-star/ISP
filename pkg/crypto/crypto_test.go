@@ -1,6 +1,8 @@
 package crypto_test
 
 import (
+	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -218,5 +220,54 @@ func TestDecrypt_CrossKeyVersion(t *testing.T) {
 	}
 	if _, err := crypto.Decrypt(ciphertexts["v1"], withoutV1); err == nil {
 		t.Error("decrypting v1 ciphertext without the v1 key must fail")
+	}
+}
+
+func TestDecrypt_UnknownKeyVersion(t *testing.T) {
+	store, _ := crypto.NewInMemoryKeyStore(map[string][]byte{"v1": testKey(0x05)}, "v1")
+	_, err := crypto.Decrypt("v99:c29tZWJhc2U2NA==", store)
+	if err == nil {
+		t.Error("expected an error for an unknown key version")
+	}
+}
+
+func TestDecrypt_InvalidBase64Payload(t *testing.T) {
+	store, _ := crypto.NewInMemoryKeyStore(map[string][]byte{"v1": testKey(0x06)}, "v1")
+	_, err := crypto.Decrypt("v1:not-valid-base64!!!", store)
+	if err == nil {
+		t.Error("expected an error for a non-base64 payload")
+	}
+}
+
+func TestDecrypt_CiphertextTooShort(t *testing.T) {
+	store, _ := crypto.NewInMemoryKeyStore(map[string][]byte{"v1": testKey(0x07)}, "v1")
+	// Valid base64, but far fewer bytes than GCM's 12-byte nonce requires.
+	short := base64.StdEncoding.EncodeToString([]byte{1, 2, 3})
+	_, err := crypto.Decrypt("v1:"+short, store)
+	if err == nil {
+		t.Error("expected an error for a ciphertext shorter than the GCM nonce size")
+	}
+}
+
+func TestNewInMemoryKeyStore_ActiveVersionNotFound(t *testing.T) {
+	_, err := crypto.NewInMemoryKeyStore(map[string][]byte{"v1": testKey(0x08)}, "v2")
+	if err == nil {
+		t.Error("expected an error when activeVersion is not present in keys")
+	}
+}
+
+// brokenKeyStore always names an active version that GetKey then refuses —
+// an internally inconsistent KeyStore, used only to exercise
+// NewAESEncryptor's own error handling regardless of which real KeyStore
+// implementation is in use.
+type brokenKeyStore struct{}
+
+func (brokenKeyStore) GetKey(string) ([]byte, error) { return nil, fmt.Errorf("boom") }
+func (brokenKeyStore) ActiveVersion() string         { return "v1" }
+
+func TestNewAESEncryptor_ActiveKeyLookupFails(t *testing.T) {
+	_, err := crypto.NewAESEncryptor(brokenKeyStore{})
+	if err == nil {
+		t.Error("expected an error when the active key cannot be loaded")
 	}
 }

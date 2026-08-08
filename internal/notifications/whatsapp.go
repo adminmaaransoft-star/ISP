@@ -15,6 +15,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog/log"
+
+	"github.com/maaransoft/isp-bss-oss/pkg/validate"
 )
 
 var (
@@ -123,6 +125,10 @@ func (c *WhatsAppClient) SetBaseURL(u string) {
 
 // SendTemplate dispatches a WhatsApp template message.
 func (c *WhatsAppClient) SendTemplate(ctx context.Context, req TemplateMessage) error {
+	if !validate.E164(req.ToPhoneE164) {
+		return fmt.Errorf("notifications: %q is not a valid E.164 phone number", req.ToPhoneE164)
+	}
+
 	templateName := req.TemplateName
 	if templateName == "" {
 		templateName = TemplateNameFor(req.TemplateID)

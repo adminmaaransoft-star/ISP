@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/maaransoft/isp-bss-oss/pkg/validate"
 )
 
 // MSG91Client implements SMSSender for the MSG91 SMS gateway.
@@ -24,6 +26,10 @@ func NewMSG91Client(apiKey, senderID string) *MSG91Client {
 
 // SendSMS sends a plain-text SMS via MSG91.
 func (c *MSG91Client) SendSMS(ctx context.Context, toPhone, message string) error {
+	if !validate.E164(toPhone) {
+		return fmt.Errorf("sms: %q is not a valid E.164 phone number", toPhone)
+	}
+
 	// Sanitise: strip leading '+' for MSG91 (expects 91XXXXXXXXXX format)
 	mobile := strings.TrimPrefix(toPhone, "+")
 

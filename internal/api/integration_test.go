@@ -307,3 +307,79 @@ func TestCreateSubscriber_RequiresAdminRole(t *testing.T) {
 		t.Error("no subscriber may be created by a forbidden role")
 	}
 }
+
+// TestCreateSubscriber_RejectsNonE164Phone verifies the DoD Phase 2 Step 4
+// fix: mobile_number must be valid E.164, checked before anything reaches
+// the store.
+//
+// DoD Phase 2 Step 4 | FR-SUB (subscriber onboarding)
+func TestCreateSubscriber_RejectsNonE164Phone(t *testing.T) {
+	cases := []struct {
+		name  string
+		phone string
+	}{
+		{"missing leading +", "919876543210"},
+		{"contains a space", "+91 9876543210"},
+		{"contains a dash", "+91-9876543210"},
+		{"leading zero after +", "+0919876543210"},
+		{"not a phone number at all", "not-a-phone"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			subs := &itSubscriberStore{}
+			h := api.NewHandler(api.HandlerDeps{
+				DB: subs, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}), KeyStore: itKeyStore(t, "v1", "v1"),
+			})
+			mux := http.NewServeMux()
+			h.RegisterRoutes(mux, itJWTSecret)
+
+			body, _ := json.Marshal(api.CreateSubscriberRequest{
+				CAFNumber: "CAF-BAD", Username: "bad@isp", Password: "pw",
+				MobileNumber: tc.phone, PlanID: 1, RegisteredState: "TN",
+			})
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/subscribers", bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+itAdminToken(t))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnprocessableEntity {
+				t.Errorf("want 422, got %d — %s", rec.Code, rec.Body.String())
+			}
+			if len(subs.rows) != 0 {
+				t.Error("no subscriber may be created with an invalid phone number")
+			}
+		})
+	}
+}
+
+// TestCreateSubscriber_AcceptsValidE164Phone is the positive counterpart to
+// TestCreateSubscriber_RejectsNonE164Phone.
+func TestCreateSubscriber_AcceptsValidE164Phone(t *testing.T) {
+	subs := &itSubscriberStore{}
+	h := api.NewHandler(api.HandlerDeps{
+		DB: subs, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}), KeyStore: itKeyStore(t, "v1", "v1"),
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, itJWTSecret)
+
+	body, _ := json.Marshal(api.CreateSubscriberRequest{
+		CAFNumber: "CAF-GOOD", Username: "good@isp", Password: "pw",
+		MobileNumber: "+919876543210", PlanID: 1, RegisteredState: "TN",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/subscribers", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+itAdminToken(t))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("want 201, got %d — %s", rec.Code, rec.Body.String())
+	}
+	if len(subs.rows) != 1 {
+		t.Fatalf("want 1 subscriber created, got %d", len(subs.rows))
+	}
+}

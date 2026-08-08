@@ -502,3 +502,49 @@ func TestPortalStore_GetPlanRenewalInfo(t *testing.T) {
 		}
 	})
 }
+
+// TestSubscribers_MobileNumberE164Constraint verifies migration 020's
+// DB-level defense-in-depth for E.164 phone format: a malformed number is
+// rejected by the database itself, not just by application-level validation
+// (internal/api's CreateSubscriber, internal/notifications' send paths) —
+// so any future code path that inserts directly still cannot store one.
+//
+// DoD Phase 2 Step 4 | DBD §6.2
+func TestSubscribers_MobileNumberE164Constraint(t *testing.T) {
+	_, pool := newTestDB(t)
+	ctx := context.Background()
+
+	seedPlan(ctx, t, pool, 1, "P", "100M/100M", 0, "", "799.00")
+
+	t.Run("a non-E.164 mobile_number is rejected", func(t *testing.T) {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO subscribers (caf_number, username, password_hash, mobile_number, plan_id, status, registered_state)
+			VALUES ('CAF-BAD', 'bad-phone@isp', 'h', '9876543210', 1, 'active', 'TN')`) // missing leading +
+		if err == nil {
+			t.Fatal("expected the chk_subscribers_mobile_e164 constraint to reject a number missing '+'")
+		}
+	})
+
+	t.Run("a valid E.164 mobile_number is accepted", func(t *testing.T) {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO subscribers (caf_number, username, password_hash, mobile_number, plan_id, status, registered_state)
+			VALUES ('CAF-GOOD', 'good-phone@isp', 'h', '+919876543210', 1, 'active', 'TN')`)
+		if err != nil {
+			t.Fatalf("a valid E.164 number must be accepted: %v", err)
+		}
+	})
+}
+
+// TestFranchises_MobileNumberE164Constraint is the same constraint on the
+// franchises table.
+func TestFranchises_MobileNumberE164Constraint(t *testing.T) {
+	_, pool := newTestDB(t)
+	ctx := context.Background()
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO franchises (name, owner_name, mobile_number, commission_rate_pct, status)
+		VALUES ('Bad Franchise', 'Owner', 'not-a-phone', 10.00, 'active')`)
+	if err == nil {
+		t.Fatal("expected the chk_franchises_mobile_e164 constraint to reject a malformed number")
+	}
+}

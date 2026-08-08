@@ -16,6 +16,7 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/billing"
 	"github.com/maaransoft/isp-bss-oss/internal/middleware"
 	"github.com/maaransoft/isp-bss-oss/pkg/crypto"
+	"github.com/maaransoft/isp-bss-oss/pkg/validate"
 	"github.com/rs/zerolog/log"
 	"github.com/shopspring/decimal"
 	"golang.org/x/crypto/bcrypt"
@@ -404,6 +405,9 @@ func validateCreateSubscriber(req CreateSubscriberRequest) error {
 	}
 	if req.MobileNumber == "" {
 		return fmt.Errorf("mobile_number is required")
+	}
+	if !validate.E164(req.MobileNumber) {
+		return fmt.Errorf("mobile_number must be E.164 format (e.g. +919876543210)")
 	}
 	if req.PlanID == 0 {
 		return fmt.Errorf("plan_id is required")
