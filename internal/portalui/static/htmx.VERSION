@@ -1,0 +1,6 @@
+htmx.org 1.9.12
+Source: https://unpkg.com/htmx.org@1.9.12/dist/htmx.min.js
+Vendored (not CDN-loaded) so the login/renew/payment pages never depend on a
+third-party script at runtime. To upgrade: download the new
+dist/htmx.min.js from https://unpkg.com/htmx.org@<version>/dist/htmx.min.js,
+overwrite static/htmx.min.js, and update this file.

@@ -1,0 +1,24 @@
+{{define "tickets-list"}}
+<div id="tickets-list">
+  {{if .Error}}<div class="alert alert-error">{{.Error}}</div>{{end}}
+  {{if .Tickets}}
+  <table>
+    <thead>
+      <tr><th>Category</th><th>Description</th><th>Status</th><th>Filed</th></tr>
+    </thead>
+    <tbody>
+      {{range .Tickets}}
+      <tr>
+        <td>{{.Category}}</td>
+        <td>{{.Description}}</td>
+        <td><span class="badge badge-{{.Status}}">{{.Status}}</span></td>
+        <td>{{datetime .CreatedAt}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="empty-state">No tickets filed yet.</div>
+  {{end}}
+</div>
+{{end}}

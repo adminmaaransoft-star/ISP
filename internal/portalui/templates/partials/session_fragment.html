@@ -1,0 +1,23 @@
+{{define "session-inner"}}
+{{if .}}
+<h2>Live Usage</h2>
+<div class="grid">
+  <div>
+    <div class="stat-label">Data used this cycle</div>
+    <div class="stat" style="font-size:1.25rem">{{gb .GBUsed}} GB of {{gb .GBIncluded}} GB</div>
+    <div class="progress-bar" style="margin-top:0.5rem">
+      <div class="progress-bar-fill{{if .FUPThrottled}} warn{{end}}" style="width:{{pctWidth .PctUsed}}%"></div>
+    </div>
+  </div>
+  <div>
+    <div class="stat-label">Speed</div>
+    <div class="stat" style="font-size:1.25rem">
+      {{if .FUPThrottled}}<span style="color:var(--warn)">Throttled (FUP)</span>{{else}}Full speed{{end}}
+    </div>
+  </div>
+</div>
+{{else}}
+<h2>Live Usage</h2>
+<div class="empty-state">No active session — you appear to be offline.</div>
+{{end}}
+{{end}}

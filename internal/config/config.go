@@ -1,0 +1,295 @@
+// Package config loads service configuration from the environment.
+//
+// Every value is read once at startup and validated before any connection is
+// opened, so a missing or too-short secret fails the process immediately with a
+// list of what is wrong rather than surfacing as a confusing runtime error on
+// the first request that needs it.
+//
+// Secrets are never logged. Redact() produces a safe view for startup logging.
+//
+// IDD §8.1, §8.5 | SecD §9.3
+package config
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// minSecretLength is the floor for anything used as a signing or shared key.
+// A 32-byte HMAC secret is the practical minimum for HS256 (SecD §9.3).
+const minSecretLength = 32
+
+// Config is the full service configuration.
+type Config struct {
+	// Service
+	Environment string
+	LogFormat   string
+	LogLevel    string
+	APIAddr     string
+	MetricsAddr string
+	RadiusAddr  string
+
+	// PostgreSQL
+	DBDSN         string
+	DBMaxConns    int32
+	DBMinConns    int32
+	DBConnTimeout time.Duration
+
+	// Redis: Sentinel in production, a direct address for local development.
+	RedisSentinelAddrs []string
+	RedisMasterName    string
+	RedisAddr          string
+	RedisPassword      string
+
+	// SubscriberCacheTTL bounds how long the RADIUS auth cache serves a record.
+	// It is the window in which a suspended subscriber could still re-authenticate,
+	// so raising it trades enforcement latency for database load.
+	SubscriberCacheTTL time.Duration
+
+	// Secrets
+	JWTSecret             string
+	PortalJWTSecret       string
+	RadiusSecret          string
+	RazorpayWebhookSecret string
+	RazorpayKeyID         string
+	RazorpayKeySecret     string
+	AESKeyStoreURL        string
+
+	// WhatsApp (Meta Cloud API)
+	WhatsAppPhoneNumberID      string
+	WhatsAppAccessToken        string
+	WhatsAppWebhookVerifyToken string
+	WhatsAppAppSecret          string
+
+	// SMS
+	SMSProvider string
+	SMSAPIKey   string
+	SMSSenderID string
+
+	// Integrations
+	GotenbergURL        string
+	PagerDutyRoutingKey string
+}
+
+// Requirement describes how strictly a field is enforced.
+type Requirement int
+
+const (
+	// Optional fields may be empty; the feature they enable stays off.
+	Optional Requirement = iota
+	// Required fields must be present.
+	Required
+	// RequiredSecret must be present and at least minSecretLength characters.
+	RequiredSecret
+)
+
+// Load reads configuration from the environment and validates it.
+//
+// service selects which fields are mandatory: the API and the RADIUS daemon need
+// overlapping but different sets, and demanding a WhatsApp token from the RADIUS
+// daemon would block startup for no reason.
+func Load(service string) (*Config, error) {
+	cfg := &Config{
+		Environment: env("ENVIRONMENT", "development"),
+		LogFormat:   env("LOG_FORMAT", "console"),
+		LogLevel:    env("LOG_LEVEL", "info"),
+		APIAddr:     env("API_ADDR", ":8080"),
+		MetricsAddr: env("METRICS_ADDR", ":9101"),
+		RadiusAddr:  env("RADIUS_ADDR", ":1812"),
+
+		DBDSN:         env("DB_DSN", ""),
+		DBMaxConns:    int32(envInt("DB_MAX_CONNS", 25)), //nolint:gosec // bounded by envInt
+		DBMinConns:    int32(envInt("DB_MIN_CONNS", 5)),  //nolint:gosec // bounded by envInt
+		DBConnTimeout: time.Duration(envInt("DB_CONN_TIMEOUT_SECONDS", 10)) * time.Second,
+
+		RedisSentinelAddrs: envList("REDIS_SENTINEL_ADDRS"),
+		RedisMasterName:    env("REDIS_MASTER_NAME", "bss_master"),
+		RedisAddr:          env("REDIS_ADDR", ""),
+		RedisPassword:      env("REDIS_PASSWORD", ""),
+		SubscriberCacheTTL: time.Duration(envInt("SUBSCRIBER_CACHE_TTL_SECONDS", 60)) * time.Second,
+
+		JWTSecret:             env("JWT_SECRET", ""),
+		PortalJWTSecret:       env("PORTAL_JWT_SECRET", ""),
+		RadiusSecret:          env("RADIUS_SECRET", ""),
+		RazorpayWebhookSecret: env("RAZORPAY_WEBHOOK_SECRET", ""),
+		RazorpayKeyID:         env("RAZORPAY_KEY_ID", ""),
+		RazorpayKeySecret:     env("RAZORPAY_KEY_SECRET", ""),
+		AESKeyStoreURL:        env("AES_KEY_STORE_URL", ""),
+
+		WhatsAppPhoneNumberID:      env("WHATSAPP_PHONE_NUMBER_ID", ""),
+		WhatsAppAccessToken:        env("WHATSAPP_ACCESS_TOKEN", ""),
+		WhatsAppWebhookVerifyToken: env("WHATSAPP_WEBHOOK_VERIFY_TOKEN", ""),
+		WhatsAppAppSecret:          env("WHATSAPP_APP_SECRET", ""),
+
+		SMSProvider: env("SMS_GATEWAY_PROVIDER", "msg91"),
+		SMSAPIKey:   env("SMS_GATEWAY_API_KEY", ""),
+		SMSSenderID: env("SMS_GATEWAY_SENDER_ID", "BSSOSS"),
+
+		GotenbergURL:        env("GOTENBERG_URL", ""),
+		PagerDutyRoutingKey: env("PAGERDUTY_ROUTING_KEY", ""),
+	}
+
+	// The portal signs its own tokens so a leaked staff token cannot be replayed
+	// against subscriber endpoints, and vice versa.
+	if cfg.PortalJWTSecret == "" && cfg.JWTSecret != "" {
+		cfg.PortalJWTSecret = cfg.JWTSecret + "_portal"
+	}
+
+	rules := map[string]struct {
+		value string
+		req   Requirement
+	}{
+		"DB_DSN":                  {cfg.DBDSN, Required},
+		"AES_KEY_STORE_URL":       {cfg.AESKeyStoreURL, Optional},
+		"JWT_SECRET":              {cfg.JWTSecret, Optional},
+		"RADIUS_SECRET":           {cfg.RadiusSecret, Optional},
+		"RAZORPAY_WEBHOOK_SECRET": {cfg.RazorpayWebhookSecret, Optional},
+	}
+
+	switch service {
+	case "api":
+		rules["JWT_SECRET"] = struct {
+			value string
+			req   Requirement
+		}{cfg.JWTSecret, RequiredSecret}
+		rules["AES_KEY_STORE_URL"] = struct {
+			value string
+			req   Requirement
+		}{cfg.AESKeyStoreURL, Required}
+	case "radiusd":
+		rules["RADIUS_SECRET"] = struct {
+			value string
+			req   Requirement
+		}{cfg.RadiusSecret, RequiredSecret}
+	default:
+		return nil, fmt.Errorf("config: unknown service %q (want api or radiusd)", service)
+	}
+
+	var problems []string
+	for name, rule := range rules {
+		switch rule.req {
+		case Required:
+			if rule.value == "" {
+				problems = append(problems, name+" is required but not set")
+			}
+		case RequiredSecret:
+			if rule.value == "" {
+				problems = append(problems, name+" is required but not set")
+			} else if len(rule.value) < minSecretLength {
+				problems = append(problems,
+					fmt.Sprintf("%s must be at least %d characters (got %d)", name, minSecretLength, len(rule.value)))
+			}
+		case Optional:
+		}
+	}
+
+	if len(cfg.RedisSentinelAddrs) == 0 && cfg.RedisAddr == "" {
+		problems = append(problems, "one of REDIS_SENTINEL_ADDRS or REDIS_ADDR must be set")
+	}
+
+	if len(problems) > 0 {
+		return nil, fmt.Errorf("config: invalid configuration for %s:\n  - %s",
+			service, strings.Join(problems, "\n  - "))
+	}
+	return cfg, nil
+}
+
+// UsesSentinel reports whether Redis should be reached through Sentinel.
+func (c *Config) UsesSentinel() bool { return len(c.RedisSentinelAddrs) > 0 }
+
+// Redact returns a copy safe to log: every secret is replaced by a set/unset
+// marker so a startup log can show what is configured without leaking values.
+func (c *Config) Redact() map[string]string {
+	return map[string]string{
+		"environment":         c.Environment,
+		"api_addr":            c.APIAddr,
+		"metrics_addr":        c.MetricsAddr,
+		"radius_addr":         c.RadiusAddr,
+		"db_dsn":              redactDSN(c.DBDSN),
+		"db_max_conns":        strconv.Itoa(int(c.DBMaxConns)),
+		"redis_mode":          redisMode(c),
+		"redis_master":        c.RedisMasterName,
+		"jwt_secret":          setOrUnset(c.JWTSecret),
+		"radius_secret":       setOrUnset(c.RadiusSecret),
+		"aes_key_store":       setOrUnset(c.AESKeyStoreURL),
+		"razorpay_secret":     setOrUnset(c.RazorpayWebhookSecret),
+		"razorpay_key_id":     setOrUnset(c.RazorpayKeyID),
+		"razorpay_key_secret": setOrUnset(c.RazorpayKeySecret),
+		"whatsapp_token":      setOrUnset(c.WhatsAppAccessToken),
+		"sms_api_key":         setOrUnset(c.SMSAPIKey),
+		"pagerduty_key":       setOrUnset(c.PagerDutyRoutingKey),
+		"gotenberg_url":       c.GotenbergURL,
+	}
+}
+
+func redisMode(c *Config) string {
+	if c.UsesSentinel() {
+		return fmt.Sprintf("sentinel(%d)", len(c.RedisSentinelAddrs))
+	}
+	return "direct"
+}
+
+func setOrUnset(v string) string {
+	if v == "" {
+		return "unset"
+	}
+	return "set"
+}
+
+// redactDSN strips the password from a PostgreSQL DSN so it can be logged.
+func redactDSN(dsn string) string {
+	if dsn == "" {
+		return "unset"
+	}
+	// URL form: postgres://user:password@host/db
+	if at := strings.LastIndex(dsn, "@"); at > 0 {
+		if scheme := strings.Index(dsn, "://"); scheme >= 0 && scheme+3 < at {
+			return dsn[:scheme+3] + "***@" + dsn[at+1:]
+		}
+	}
+	// Keyword form: host=... password=... dbname=...
+	fields := strings.Fields(dsn)
+	for i, f := range fields {
+		if strings.HasPrefix(strings.ToLower(f), "password=") {
+			fields[i] = "password=***"
+		}
+	}
+	return strings.Join(fields, " ")
+}
+
+func env(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envInt(key string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+func envList(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}

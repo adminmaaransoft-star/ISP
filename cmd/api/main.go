@@ -1,0 +1,392 @@
+// Command api runs the BSS/OSS HTTP API and the subscriber self-service portal.
+//
+// Wires the persistence layer, the Redis session cache and the AES key store
+// into the route handlers, then serves the API on API_ADDR and Prometheus
+// metrics on METRICS_ADDR.
+//
+// IDD §8.1 | API §7
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/hibiken/asynq"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+
+	"github.com/maaransoft/isp-bss-oss/internal/api"
+	"github.com/maaransoft/isp-bss-oss/internal/billing"
+	"github.com/maaransoft/isp-bss-oss/internal/cache"
+	"github.com/maaransoft/isp-bss-oss/internal/config"
+	"github.com/maaransoft/isp-bss-oss/internal/db"
+	"github.com/maaransoft/isp-bss-oss/internal/health"
+	"github.com/maaransoft/isp-bss-oss/internal/notifications"
+	"github.com/maaransoft/isp-bss-oss/internal/portal"
+	"github.com/maaransoft/isp-bss-oss/internal/portalui"
+	"github.com/maaransoft/isp-bss-oss/pkg/crypto"
+	"github.com/shopspring/decimal"
+)
+
+const (
+	readTimeout     = 15 * time.Second
+	writeTimeout    = 30 * time.Second
+	idleTimeout     = 60 * time.Second
+	shutdownTimeout = 15 * time.Second
+)
+
+func main() {
+	if err := run(); err != nil {
+		// zerolog is configured inside run(); if it failed before that, stderr
+		// is the only channel guaranteed to work.
+		fmt.Fprintf(os.Stderr, "api: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg, err := config.Load("api")
+	if err != nil {
+		return err
+	}
+	configureLogging(cfg)
+
+	log.Info().Interface("config", cfg.Redact()).Msg("api: starting")
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// ── Dependencies ────────────────────────────────────────────────────────
+
+	database, err := db.Connect(ctx, dbConfig(cfg))
+	if err != nil {
+		return fmt.Errorf("connect to PostgreSQL: %w", err)
+	}
+	defer database.Close()
+	log.Info().Msg("api: PostgreSQL connected")
+
+	redisClient := newRedisClient(cfg)
+	defer redisClient.Close() //nolint:errcheck
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("connect to Redis: %w", err)
+	}
+	log.Info().Msg("api: Redis connected")
+
+	keyStore, err := crypto.LoadKeyStore(cfg.AESKeyStoreURL)
+	if err != nil {
+		return fmt.Errorf("load AES key store: %w", err)
+	}
+	log.Info().Str("active_version", keyStore.ActiveVersion()).Msg("api: key store loaded")
+
+	sessions := cache.NewSessionStore(redisClient)
+
+	// The API enqueues session-control (PoD/CoA) tasks for the radiusd worker
+	// pool to execute; it never talks RADIUS itself.
+	asynqClient := asynq.NewClient(asynqRedisOpt(cfg))
+	defer asynqClient.Close() //nolint:errcheck
+
+	// Gotenberg is optional: GetInvoicePDF reports 503 rather than the process
+	// refusing to start when it is not configured.
+	var pdfGen api.PDFGenerator
+	if cfg.GotenbergURL != "" {
+		pdfGen = billing.NewInvoicePDFClient(cfg.GotenbergURL)
+		log.Info().Str("url", cfg.GotenbergURL).Msg("api: Gotenberg PDF client configured")
+	} else {
+		log.Warn().Msg("api: GOTENBERG_URL unset — invoice PDF downloads will return 503")
+	}
+
+	// Razorpay order creation is optional: /portal/renew reports 503 rather
+	// than the process refusing to start when credentials are not configured.
+	var razorpayClient portal.RazorpayOrderCreator
+	if cfg.RazorpayKeyID != "" && cfg.RazorpayKeySecret != "" {
+		razorpayClient = billing.NewRazorpayClient(cfg.RazorpayKeyID, cfg.RazorpayKeySecret)
+		log.Info().Msg("api: Razorpay payment link client configured")
+	} else {
+		log.Warn().Msg("api: RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET unset — /portal/renew will return 503")
+	}
+
+	// ── Handlers ────────────────────────────────────────────────────────────
+
+	walletSvc := billing.NewWalletService(database.Billing())
+
+	apiHandler := api.NewHandler(api.HandlerDeps{
+		DB:       database.API(),
+		KYC:      database.API(),
+		Wallet:   walletSvc,
+		KeyStore: keyStore,
+
+		Ledger:     database.Billing(),
+		Sessions:   sessions,
+		SessionCtl: database.FUP(),
+		Tasks:      asynqClient,
+		Invoices:   database.Billing(),
+		PDF:        pdfGen,
+		Tickets:    database.Tickets(),
+		LEA:        database.FUP(),
+		LEAAudit:   database.FUP(),
+
+		RazorpayWebhookSecret: cfg.RazorpayWebhookSecret,
+	})
+	healthHandler := health.NewHandler(database.Health(), sessions)
+
+	portalHandler := portal.NewHandler(
+		database.Portal(),
+		sessions.Portal(),
+		database.Portal(),
+		database.Portal(),
+		razorpayClient,
+		cfg.PortalJWTSecret,
+	)
+	portalHandler.SetRenewalProcessor(&renewalProcessor{wallet: walletSvc, planExpiry: database.Portal()})
+
+	portalUIHandler := portalui.NewHandler(portalui.Deps{
+		Subscribers:    database.Portal(),
+		Sessions:       sessions.Portal(),
+		SessionHistory: database.Portal(),
+		Invoices:       database.Billing(),
+		PDF:            pdfGen,
+		Razorpay:       razorpayClient,
+		Tickets:        database.Portal(),
+		Notifications:  database.Portal(),
+		JWTSecret:      cfg.PortalJWTSecret,
+	})
+
+	notificationWebhook := notifications.NewWebhookHandler(
+		database.Notifications(), cfg.WhatsAppAppSecret, cfg.WhatsAppWebhookVerifyToken)
+
+	mux := http.NewServeMux()
+	apiHandler.RegisterRoutes(mux, cfg.JWTSecret)
+	portalHandler.RegisterRoutes(mux)
+	portalUIHandler.RegisterRoutes(mux)
+
+	// The subscriber health endpoint lives in its own package; api.Handler only
+	// reserves the route, so bind the real implementation over it here.
+	mux.HandleFunc("GET /api/v1/subscribers/{id}/health-detail", healthHandler.GetSubscriberHealth)
+
+	// Meta delivery callbacks: GET is the subscription handshake, POST carries
+	// delivery statuses. Both are HMAC- or token-verified, never JWT.
+	mux.HandleFunc("GET /webhooks/whatsapp", notificationWebhook.Verify)
+	mux.HandleFunc("POST /webhooks/whatsapp/status", notificationWebhook.HandleDeliveryStatus)
+
+	mux.HandleFunc("GET /readyz", readinessHandler(database, redisClient))
+
+	// ── Servers ─────────────────────────────────────────────────────────────
+
+	apiServer := &http.Server{
+		Addr:              cfg.APIAddr,
+		Handler:           requestLogger(mux),
+		ReadTimeout:       readTimeout,
+		ReadHeaderTimeout: readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("GET /metrics", promhttp.Handler())
+	metricsServer := &http.Server{
+		Addr:              cfg.MetricsAddr,
+		Handler:           metricsMux,
+		ReadHeaderTimeout: readTimeout,
+	}
+
+	errCh := make(chan error, 2)
+
+	go func() {
+		log.Info().Str("addr", cfg.APIAddr).Msg("api: listening")
+		if err := apiServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("API server: %w", err)
+		}
+	}()
+
+	go func() {
+		log.Info().Str("addr", cfg.MetricsAddr).Msg("api: metrics listening")
+		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("metrics server: %w", err)
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		log.Info().Msg("api: shutdown signal received")
+	}
+
+	// Drain in-flight requests before closing the pools they may still be using.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
+
+	if err := apiServer.Shutdown(shutdownCtx); err != nil {
+		log.Error().Err(err).Msg("api: graceful shutdown failed")
+	}
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		log.Error().Err(err).Msg("api: metrics shutdown failed")
+	}
+
+	log.Info().Msg("api: stopped")
+	return nil
+}
+
+// renewalProcessor credits a completed portal renewal through the wallet
+// service, which supplies the idempotency the gateway callback needs, and
+// extends the subscriber's plan_expiry to match.
+type renewalProcessor struct {
+	wallet     *billing.WalletService
+	planExpiry portal.PlanExpiryStore
+}
+
+func (p *renewalProcessor) ApplyRenewal(ctx context.Context, subscriberID int, amount decimal.Decimal, paymentID string) (*portal.RenewalPayment, error) {
+	tx, err := p.wallet.Recharge(ctx, billing.RechargeRequest{
+		SubscriberID:     subscriberID,
+		Amount:           amount,
+		TransactionToken: paymentID,
+		Description:      "portal one-tap renewal",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("apply renewal: %w", err)
+	}
+
+	// The wallet credit above already committed and must not be undone just
+	// because the expiry extension fails below — log and let ops reconcile,
+	// rather than leaving a paid subscriber uncredited on a retry.
+	if p.planExpiry != nil {
+		if err := extendPlanExpiry(ctx, p.planExpiry, subscriberID, time.Now); err != nil {
+			log.Error().Err(err).Int("subscriber_id", subscriberID).Msg("renewal: plan expiry extension failed")
+		}
+	}
+
+	return &portal.RenewalPayment{TransactionID: tx.ID, Balance: tx.BalanceAfter}, nil
+}
+
+// extendPlanExpiry computes and applies the new plan_expiry for a renewal:
+// max(now, currentExpiry) + validityDays. Extending from now unconditionally
+// would silently discard remaining days for a subscriber who renews early;
+// extending from a stale (already-lapsed) currentExpiry would grant days
+// retroactively. max(now, currentExpiry) is the only rule that never loses
+// paid-for days and never backdates the extension.
+//
+// now is injected (rather than calling time.Now directly) so the date math
+// is unit-testable without a real clock.
+func extendPlanExpiry(ctx context.Context, store portal.PlanExpiryStore, subscriberID int, now func() time.Time) error {
+	validityDays, currentExpiry, err := store.GetPlanRenewalInfo(ctx, subscriberID)
+	if err != nil {
+		return fmt.Errorf("get plan renewal info: %w", err)
+	}
+
+	base := now()
+	if currentExpiry != nil && currentExpiry.After(base) {
+		base = *currentExpiry
+	}
+	newExpiry := base.AddDate(0, 0, validityDays)
+
+	if err := store.SetPlanExpiry(ctx, subscriberID, newExpiry); err != nil {
+		return fmt.Errorf("set plan expiry: %w", err)
+	}
+	return nil
+}
+
+// readinessHandler reports whether both backing stores are reachable, so an
+// orchestrator can withhold traffic from an instance that cannot serve it.
+func readinessHandler(database *db.DB, redisClient redis.UniversalClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		if err := database.Ping(ctx); err != nil {
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if err := redisClient.Ping(ctx).Err(); err != nil {
+			http.Error(w, "redis unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ready"}`)) //nolint:errcheck
+	}
+}
+
+// requestLogger records method, path, status and duration for every request.
+func requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+
+		// Only the path is logged, never the query string: LEA lookups and
+		// webhook callbacks carry identifiers that must not reach logs.
+		log.Info().
+			Str("method", r.Method).
+			Str("path", r.URL.Path).
+			Int("status", rec.status).
+			Dur("duration", time.Since(start)).
+			Msg("http_request")
+	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func dbConfig(cfg *config.Config) db.Config {
+	c := db.DefaultConfig(cfg.DBDSN)
+	c.MaxConns = cfg.DBMaxConns
+	c.MinConns = cfg.DBMinConns
+	c.ConnectTimeout = cfg.DBConnTimeout
+	return c
+}
+
+func newRedisClient(cfg *config.Config) redis.UniversalClient {
+	if cfg.UsesSentinel() {
+		return redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    cfg.RedisMasterName,
+			SentinelAddrs: cfg.RedisSentinelAddrs,
+			Password:      cfg.RedisPassword,
+		})
+	}
+	return redis.NewClient(&redis.Options{
+		Addr:     cfg.RedisAddr,
+		Password: cfg.RedisPassword,
+	})
+}
+
+// asynqRedisOpt mirrors the Redis configuration for Asynq, which takes its own
+// connection options rather than an existing client. Kept in step with
+// cmd/radiusd's copy: both must resolve to the same Redis so a task the API
+// enqueues is visible to the radiusd worker pool that executes it.
+func asynqRedisOpt(cfg *config.Config) asynq.RedisConnOpt {
+	if cfg.UsesSentinel() {
+		return asynq.RedisFailoverClientOpt{
+			MasterName:    cfg.RedisMasterName,
+			SentinelAddrs: cfg.RedisSentinelAddrs,
+			Password:      cfg.RedisPassword,
+		}
+	}
+	return asynq.RedisClientOpt{
+		Addr:     cfg.RedisAddr,
+		Password: cfg.RedisPassword,
+	}
+}
+
+func configureLogging(cfg *config.Config) {
+	zerolog.TimeFieldFormat = time.RFC3339
+	if level, err := zerolog.ParseLevel(cfg.LogLevel); err == nil {
+		zerolog.SetGlobalLevel(level)
+	}
+	if cfg.LogFormat != "json" {
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339})
+	}
+}

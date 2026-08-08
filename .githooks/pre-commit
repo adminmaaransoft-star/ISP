@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# pre-commit hook — PII plaintext guard
+#
+# NFR-SEC-002 | ENV-008 | verified by scripts/int_pii_001_precommit_hook.sh
+#
+# Install: ./scripts/install-hooks.sh
+# Or manually: cp .githooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+#
+# Blocks a commit that passes a raw PII field name to a log or print call.
+# Encrypted and hashed forms (aadhaar_encrypted, password_hash, aadhaarEncrypted)
+# are allowed: the pattern only matches a PII token that is NOT followed by
+# another word character, so any suffix takes it out of scope.
+
+set -uo pipefail
+
+# POSIX ERE, not grep -P. PCRE is unavailable in BusyBox and BSD grep, and even
+# where the binary supports it, `grep -P` exits 2 under a non-UTF-8 locale. An
+# earlier version of this hook paired -P with `|| true`, which turned that error
+# into "no violations found" and silently let every leak through.
+PII_PATTERN='(zerolog|log\.|fmt\.Print|fmt\.Fprint|println)([^;]*)(aadhaar|pan_number|mobile_number|password)([^a-zA-Z0-9_]|$)'
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM | grep '\.go$')
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
+
+VIOLATIONS=""
+for f in $STAGED; do
+    [ -f "$f" ] || continue
+
+    HIT=$(grep -nEi "$PII_PATTERN" "$f")
+    STATUS=$?
+
+    # grep exits 0 on match, 1 on no match, >1 on an actual error. Treating an
+    # error as "clean" is what made this hook a no-op, so fail loudly instead.
+    if [ "$STATUS" -gt 1 ]; then
+        echo "pre-commit: grep failed on $f (exit $STATUS) — cannot verify PII safety, blocking commit" >&2
+        exit 1
+    fi
+
+    if [ -n "$HIT" ]; then
+        VIOLATIONS="${VIOLATIONS}
+${f}:
+${HIT}"
+    fi
+done
+
+if [ -n "$VIOLATIONS" ]; then
+    echo "Pre-commit BLOCKED: potential plaintext PII in staged files:"
+    echo "$VIOLATIONS"
+    echo ""
+    echo "Use *_encrypted or *_hash fields. Never log raw aadhaar/pan/mobile/password."
+    echo "If this is a false positive, rename the field or move the value out of the log call."
+    exit 1
+fi
+
+exit 0

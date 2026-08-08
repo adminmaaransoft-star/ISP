@@ -1,0 +1,43 @@
+# API service — admin REST API and subscriber self-service portal.
+# Referenced by docker-compose.yml service api_service.
+
+# ── Build ────────────────────────────────────────────────────────────────────
+FROM golang:1.22-alpine AS build
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/api \
+    ./cmd/api
+
+# ── Runtime ──────────────────────────────────────────────────────────────────
+FROM alpine:3.19
+
+# ca-certificates for outbound TLS (Razorpay, Meta, Gotenberg); tzdata so GST
+# period boundaries and dunning schedules resolve in Asia/Kolkata.
+# wget is deliberately not installed: busybox already provides it, and the
+# standalone package conflicts with that applet.
+RUN apk add --no-cache ca-certificates tzdata \
+    && adduser -D -u 10001 -h /app bss
+
+WORKDIR /app
+COPY --from=build /out/api /app/api
+
+USER bss
+
+EXPOSE 8080 9101
+
+# Readiness rather than liveness: /readyz fails while PostgreSQL or Redis is
+# unreachable, so an instance that cannot serve is kept out of rotation.
+# Flags kept to what busybox wget supports.
+HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
+    CMD wget -q -O /dev/null http://127.0.0.1:8080/readyz || exit 1
+
+ENTRYPOINT ["/app/api"]

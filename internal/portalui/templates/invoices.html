@@ -1,0 +1,24 @@
+{{define "content"}}
+<div class="card">
+  <h2>Invoices &amp; Payments</h2>
+  {{if .Invoices}}
+  <table>
+    <thead>
+      <tr><th>Invoice</th><th>Date</th><th>Amount</th><th></th></tr>
+    </thead>
+    <tbody>
+      {{range .Invoices}}
+      <tr>
+        <td>INV-{{printf "%06d" .ID}}</td>
+        <td>{{datetime .CreatedAt}}</td>
+        <td>₹{{.TotalAmount}}</td>
+        <td><a class="btn btn-secondary" href="/ui/invoices/{{.ID}}/pdf" target="_blank" rel="noopener">Download PDF</a></td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="empty-state">No invoices yet.</div>
+  {{end}}
+</div>
+{{end}}

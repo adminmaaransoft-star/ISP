@@ -1,0 +1,735 @@
+//go:build integration
+
+// Integration tests for the FUP scanner, CoA sender and dead-letter monitor.
+//
+// Covers INT-FUP-001 .. INT-FUP-004 and INT-NOTIF-005 from the Integration Tests
+// tracker sheet. The tracker lists the last three under ./internal/tasks/; the
+// Asynq handlers actually live in this package, so they are exercised here.
+//
+// Asynq runs against a real Redis (miniredis, in-process), so queue routing,
+// task IDs and archival are exercised through the genuine client and inspector.
+//
+// Run: ./scripts/run_tests.ps1 -Pkg ./internal/fup -Tags integration
+package fup
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/hibiken/asynq"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"layeh.com/radius"
+)
+
+// ── Test doubles ────────────────────────────────────────────────────────────
+
+// itFUPDB is an in-memory FUPQuerier.
+type itFUPDB struct {
+	mu          sync.Mutex
+	aboveFUP    []SessionStats
+	atWarning   []SessionStats
+	fupActiveOn map[int]bool
+}
+
+func (db *itFUPDB) GetActiveSessionsAboveFUP(context.Context) ([]SessionStats, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.aboveFUP, nil
+}
+
+func (db *itFUPDB) GetSessionsAtWarning(context.Context, int) ([]SessionStats, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.atWarning, nil
+}
+
+func (db *itFUPDB) SetFUPActive(_ context.Context, subscriberID int, active bool) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.fupActiveOn == nil {
+		db.fupActiveOn = map[int]bool{}
+	}
+	db.fupActiveOn[subscriberID] = active
+	return nil
+}
+
+// itCoADB is an in-memory CoAQuerier pointing at a stub NAS.
+type itCoADB struct {
+	nasIP     string
+	sessionID string
+	rateLimit string
+}
+
+func (db *itCoADB) GetSubscriberNASSession(context.Context, int) (string, string, string, error) {
+	return db.nasIP, db.sessionID, db.rateLimit, nil
+}
+
+// itAlerter records the alerts fired at it.
+type itAlerter struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (a *itAlerter) Trigger(event string, _ any) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.events = append(a.events, event)
+}
+
+func (a *itAlerter) WasTriggered(event string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, e := range a.events {
+		if e == event {
+			return true
+		}
+	}
+	return false
+}
+
+// itNotifier records the notifications the warning handler dispatches.
+type itNotifier struct {
+	mu    sync.Mutex
+	calls []itNotifyCall
+	err   error
+}
+
+type itNotifyCall struct {
+	SubscriberID int
+	TemplateID   string
+	TriggerEvent string
+	Vars         []string
+}
+
+func (n *itNotifier) Notify(_ context.Context, subscriberID int, templateID, triggerEvent string, vars []string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.err != nil {
+		return n.err
+	}
+	n.calls = append(n.calls, itNotifyCall{subscriberID, templateID, triggerEvent, vars})
+	return nil
+}
+
+func (n *itNotifier) snapshot() []itNotifyCall {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]itNotifyCall(nil), n.calls...)
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+func itRedis(t *testing.T) (asynq.RedisClientOpt, *asynq.Client, *asynq.Inspector) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	opt := asynq.RedisClientOpt{Addr: mr.Addr()}
+	client := asynq.NewClient(opt)
+	inspector := asynq.NewInspector(opt)
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = inspector.Close()
+	})
+	return opt, client, inspector
+}
+
+// itPendingTasks lists pending tasks, treating a queue that has never received
+// a task as empty — asynq reports ErrQueueNotFound rather than an empty list.
+func itPendingTasks(t *testing.T, inspector *asynq.Inspector, queue string) []*asynq.TaskInfo {
+	t.Helper()
+	tasks, err := inspector.ListPendingTasks(queue)
+	if errors.Is(err, asynq.ErrQueueNotFound) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("list %s: %v", queue, err)
+	}
+	return tasks
+}
+
+func itCounterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatalf("read counter: %v", err)
+	}
+	return m.GetCounter().GetValue()
+}
+
+func itCounterVecValue(t *testing.T, v *prometheus.CounterVec, labels ...string) float64 {
+	t.Helper()
+	c, err := v.GetMetricWithLabelValues(labels...)
+	if err != nil {
+		t.Fatalf("counter vec %v: %v", labels, err)
+	}
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatalf("read counter vec: %v", err)
+	}
+	return m.GetCounter().GetValue()
+}
+
+// itStubNAS listens on 127.0.0.1 and answers CoA-Requests with the given code.
+// It returns the port it bound and a channel counting received requests.
+func itStubNAS(t *testing.T, secret []byte, respondWith radius.Code) (int, <-chan struct{}) {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("stub NAS listen: %v", err)
+	}
+	received := make(chan struct{}, 64)
+
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		_ = conn.Close()
+	})
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, addr, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				select {
+				case <-done:
+					return
+				default:
+					return
+				}
+			}
+			req, err := radius.Parse(buf[:n], secret)
+			if err != nil {
+				continue
+			}
+			select {
+			case received <- struct{}{}:
+			default:
+			}
+			resp := req.Response(respondWith)
+			encoded, err := resp.Encode()
+			if err != nil {
+				continue
+			}
+			_, _ = conn.WriteToUDP(encoded, addr)
+		}
+	}()
+
+	return conn.LocalAddr().(*net.UDPAddr).Port, received
+}
+
+// ── INT-FUP-001 ─────────────────────────────────────────────────────────────
+
+// TestFUPScanner_EnqueuesCoAOn100Pct verifies a session at or above its FUP
+// threshold enqueues exactly one CoA task on the network_commands queue and
+// flips fup_active.
+//
+// INT-FUP-001 | FR-FUP-001
+func TestFUPScanner_EnqueuesCoAOn100Pct(t *testing.T) {
+	_, client, inspector := itRedis(t)
+
+	const threshold = int64(1_771_674_009_600) // 1.65 TB
+	db := &itFUPDB{
+		aboveFUP: []SessionStats{{
+			SubscriberID: 42,
+			Username:     "heavy@isp",
+			NasIP:        "10.10.0.1",
+			FUPThreshold: threshold,
+			BytesUsed:    threshold + 1,
+		}},
+	}
+
+	scanner := NewScanner(db, client)
+	if err := scanner.scan(context.Background()); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	pending := itPendingTasks(t, inspector, QueueNetCommands)
+	if len(pending) != 1 {
+		t.Fatalf("%s queue: want 1 task, got %d", QueueNetCommands, len(pending))
+	}
+	if pending[0].Type != TaskTypeCoA {
+		t.Errorf("task type: want %q, got %q", TaskTypeCoA, pending[0].Type)
+	}
+
+	var payload CoAPayload
+	if err := json.Unmarshal(pending[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal CoA payload: %v", err)
+	}
+	if payload.SubscriberID != 42 {
+		t.Errorf("payload subscriber_id: want 42, got %d", payload.SubscriberID)
+	}
+	if payload.NasIP != "10.10.0.1" {
+		t.Errorf("payload nas_ip: want 10.10.0.1, got %q", payload.NasIP)
+	}
+	if !db.fupActiveOn[42] {
+		t.Error("expected fup_active to be set for the breaching subscriber")
+	}
+}
+
+// TestFUPScanner_SkipsUnlimitedAndAlreadyThrottled verifies unlimited plans and
+// already-throttled sessions do not generate CoA traffic.
+//
+// INT-FUP-001 (supporting) | FR-FUP-001
+func TestFUPScanner_SkipsUnlimitedAndAlreadyThrottled(t *testing.T) {
+	_, client, inspector := itRedis(t)
+
+	db := &itFUPDB{
+		aboveFUP: []SessionStats{
+			{SubscriberID: 1, Username: "unlimited@isp", FUPThreshold: 0, BytesUsed: 9_999_999_999},
+			{SubscriberID: 2, Username: "throttled@isp", FUPThreshold: 100, BytesUsed: 500, FUPActive: true},
+		},
+	}
+
+	scanner := NewScanner(db, client)
+	if err := scanner.scan(context.Background()); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	if pending := itPendingTasks(t, inspector, QueueNetCommands); len(pending) != 0 {
+		t.Errorf("want no CoA tasks, got %d", len(pending))
+	}
+}
+
+// ── INT-FUP-002 ─────────────────────────────────────────────────────────────
+
+// TestFUPScanner_Warns80Pct verifies an 80%-of-quota session enqueues one
+// warning notification, and that a repeat scan does not enqueue a second.
+//
+// INT-FUP-002 | FR-FUP-004
+func TestFUPScanner_Warns80Pct(t *testing.T) {
+	_, client, inspector := itRedis(t)
+
+	const threshold = int64(3_543_348_019_200) // 3.3 TB
+	db := &itFUPDB{
+		atWarning: []SessionStats{{
+			SubscriberID: 77,
+			Username:     "nearly@isp",
+			NasIP:        "10.10.0.2",
+			FUPThreshold: threshold,
+			BytesUsed:    threshold * 82 / 100,
+		}},
+	}
+
+	before := itCounterValue(t, fupWarningEnqueued)
+	scanner := NewScanner(db, client)
+	if err := scanner.scan(context.Background()); err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+
+	pending := itPendingTasks(t, inspector, QueueNotifications)
+	if len(pending) != 1 {
+		t.Fatalf("%s queue: want 1 task, got %d", QueueNotifications, len(pending))
+	}
+	if pending[0].Type != TaskTypeFUPWarning {
+		t.Errorf("task type: want %q, got %q", TaskTypeFUPWarning, pending[0].Type)
+	}
+
+	var payload WarningPayload
+	if err := json.Unmarshal(pending[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal warning payload: %v", err)
+	}
+	if payload.SubscriberID != 77 || payload.Username != "nearly@isp" {
+		t.Errorf("payload: got %+v", payload)
+	}
+	if payload.PctUsed < FUPWarningPct || payload.PctUsed >= 100 {
+		t.Errorf("pct_used: want between %d and 99, got %d", FUPWarningPct, payload.PctUsed)
+	}
+	if got := itCounterValue(t, fupWarningEnqueued); got != before+1 {
+		t.Errorf("fup_warning_enqueued_total: want +1, got %v", got-before)
+	}
+
+	// The scanner runs every 10s; the idempotency key must stop the same
+	// subscriber being warned again on the next tick.
+	if err := scanner.scan(context.Background()); err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+	pending = itPendingTasks(t, inspector, QueueNotifications)
+	if len(pending) != 1 {
+		t.Errorf("idempotency key failed: want 1 task after rescan, got %d", len(pending))
+	}
+	if got := itCounterValue(t, fupWarningEnqueued); got != before+1 {
+		t.Errorf("rescan must not count a second enqueue, delta %v", got-before)
+	}
+}
+
+// TestFUPScanner_WarningTaskIDIsPerQuotaCycle verifies the idempotency key
+// distinguishes subscribers and quota cycles.
+//
+// INT-FUP-002 (supporting) | FR-FUP-004
+func TestFUPScanner_WarningTaskIDIsPerQuotaCycle(t *testing.T) {
+	if a, b := WarningTaskID(1, 100), WarningTaskID(2, 100); a == b {
+		t.Errorf("different subscribers must get different task IDs, both %q", a)
+	}
+	if a, b := WarningTaskID(1, 100), WarningTaskID(1, 200); a == b {
+		t.Errorf("different quota cycles must get different task IDs, both %q", a)
+	}
+}
+
+// ── INT-FUP-003 ─────────────────────────────────────────────────────────────
+
+// TestCoATask_RetriesOnNAK verifies a CoA-NAK from the NAS produces an error
+// from ProcessTask (which is what drives the Asynq retry) and counts a nak.
+//
+// INT-FUP-003 | FR-FUP-002
+func TestCoATask_RetriesOnNAK(t *testing.T) {
+	secret := []byte("coa-secret")
+	port, received := itStubNAS(t, secret, radius.CodeCoANAK)
+
+	handler := NewCoAHandler(&itCoADB{
+		nasIP:     "127.0.0.1",
+		sessionID: "sess-nak-001",
+		rateLimit: "10M/10M",
+	}, secret)
+	handler.SetPort(port)
+
+	beforeNAK := itCounterVecValue(t, coaAckTotal, "nak")
+
+	payload, _ := json.Marshal(CoAPayload{SubscriberID: 9, NasIP: "127.0.0.1"})
+	err := handler.ProcessTask(context.Background(), asynq.NewTask(TaskTypeCoA, payload))
+
+	if err == nil {
+		t.Fatal("CoA-NAK must return an error so Asynq retries the task")
+	}
+	select {
+	case <-received:
+	default:
+		t.Error("stub NAS received no CoA-Request")
+	}
+	if got := itCounterVecValue(t, coaAckTotal, "nak"); got != beforeNAK+1 {
+		t.Errorf("fup_coa_ack_total{result=nak}: want +1, got %v", got-beforeNAK)
+	}
+}
+
+// TestCoATask_SucceedsOnACK verifies a CoA-ACK completes the task without error.
+//
+// INT-FUP-003 (supporting) | FR-FUP-002
+func TestCoATask_SucceedsOnACK(t *testing.T) {
+	secret := []byte("coa-secret")
+	port, _ := itStubNAS(t, secret, radius.CodeCoAACK)
+
+	handler := NewCoAHandler(&itCoADB{
+		nasIP:     "127.0.0.1",
+		sessionID: "sess-ack-001",
+		rateLimit: "10M/10M",
+	}, secret)
+	handler.SetPort(port)
+
+	beforeACK := itCounterVecValue(t, coaAckTotal, "ack")
+
+	payload, _ := json.Marshal(CoAPayload{SubscriberID: 10, NasIP: "127.0.0.1"})
+	if err := handler.ProcessTask(context.Background(), asynq.NewTask(TaskTypeCoA, payload)); err != nil {
+		t.Fatalf("CoA-ACK must succeed, got: %v", err)
+	}
+	if got := itCounterVecValue(t, coaAckTotal, "ack"); got != beforeACK+1 {
+		t.Errorf("fup_coa_ack_total{result=ack}: want +1, got %v", got-beforeACK)
+	}
+}
+
+// TestCoATask_AsynqRetriesFailedTask drives the failure through a live Asynq
+// server and asserts the task is actually re-attempted rather than dropped.
+//
+// INT-FUP-003 | FR-FUP-002
+func TestCoATask_AsynqRetriesFailedTask(t *testing.T) {
+	opt, client, inspector := itRedis(t)
+
+	secret := []byte("coa-secret")
+	port, _ := itStubNAS(t, secret, radius.CodeCoANAK)
+	handler := NewCoAHandler(&itCoADB{
+		nasIP:     "127.0.0.1",
+		sessionID: "sess-retry-001",
+		rateLimit: "10M/10M",
+	}, secret)
+	handler.SetPort(port)
+
+	srv := asynq.NewServer(opt, asynq.Config{
+		Concurrency: 1,
+		Queues:      map[string]int{QueueNetCommands: 1},
+		RetryDelayFunc: func(int, error, *asynq.Task) time.Duration {
+			return 50 * time.Millisecond
+		},
+	})
+	mux := asynq.NewServeMux()
+	mux.Handle(TaskTypeCoA, handler)
+	if err := srv.Start(mux); err != nil {
+		t.Fatalf("start asynq server: %v", err)
+	}
+	defer srv.Shutdown()
+
+	payload, _ := json.Marshal(CoAPayload{SubscriberID: 11, NasIP: "127.0.0.1"})
+	info, err := client.Enqueue(
+		asynq.NewTask(TaskTypeCoA, payload),
+		asynq.Queue(QueueNetCommands),
+		asynq.MaxRetry(5),
+	)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		task, err := inspector.GetTaskInfo(QueueNetCommands, info.ID)
+		if err == nil && task.Retried >= 1 {
+			return // the NAK was retried, which is what INT-FUP-003 asserts
+		}
+		if time.Now().After(deadline) {
+			retried := -1
+			if err == nil {
+				retried = task.Retried
+			}
+			t.Fatalf("task was not retried after CoA-NAK (retried=%d, lookup err=%v)", retried, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// ── PoD (session-control disconnect) ────────────────────────────────────────
+
+// TestPoDTask_SucceedsOnACK verifies a Disconnect-ACK completes the task
+// without error.
+//
+// FR-NET-002
+func TestPoDTask_SucceedsOnACK(t *testing.T) {
+	secret := []byte("pod-secret")
+	port, received := itStubNAS(t, secret, radius.CodeDisconnectACK)
+
+	handler := NewPoDHandler(&itCoADB{
+		nasIP:     "127.0.0.1",
+		sessionID: "sess-pod-ack-001",
+	}, secret)
+	handler.SetPort(port)
+
+	beforeACK := itCounterVecValue(t, podAckTotal, "ack")
+
+	payload, _ := json.Marshal(PoDPayload{SubscriberID: 20})
+	if err := handler.ProcessTask(context.Background(), asynq.NewTask(TaskTypePoD, payload)); err != nil {
+		t.Fatalf("Disconnect-ACK must succeed, got: %v", err)
+	}
+	select {
+	case <-received:
+	default:
+		t.Error("stub NAS received no Disconnect-Request")
+	}
+	if got := itCounterVecValue(t, podAckTotal, "ack"); got != beforeACK+1 {
+		t.Errorf("fup_pod_ack_total{result=ack}: want +1, got %v", got-beforeACK)
+	}
+}
+
+// TestPoDTask_RetriesOnNAK verifies a Disconnect-NAK produces an error so
+// Asynq retries, mirroring the CoA-NAK behaviour.
+//
+// FR-NET-002
+func TestPoDTask_RetriesOnNAK(t *testing.T) {
+	secret := []byte("pod-secret")
+	port, _ := itStubNAS(t, secret, radius.CodeDisconnectNAK)
+
+	handler := NewPoDHandler(&itCoADB{
+		nasIP:     "127.0.0.1",
+		sessionID: "sess-pod-nak-001",
+	}, secret)
+	handler.SetPort(port)
+
+	beforeNAK := itCounterVecValue(t, podAckTotal, "nak")
+
+	payload, _ := json.Marshal(PoDPayload{SubscriberID: 21})
+	err := handler.ProcessTask(context.Background(), asynq.NewTask(TaskTypePoD, payload))
+
+	if err == nil {
+		t.Fatal("Disconnect-NAK must return an error so Asynq retries the task")
+	}
+	if got := itCounterVecValue(t, podAckTotal, "nak"); got != beforeNAK+1 {
+		t.Errorf("fup_pod_ack_total{result=nak}: want +1, got %v", got-beforeNAK)
+	}
+}
+
+// TestPoDTask_NoLiveSessionSkipsRetry verifies that a subscriber with no open
+// session (already disconnected, or the task ran very late) is not retried:
+// there is nothing left to disconnect, so retrying can never succeed.
+//
+// FR-NET-002
+func TestPoDTask_NoLiveSessionSkipsRetry(t *testing.T) {
+	handler := NewPoDHandler(&itNoSessionDB{}, []byte("pod-secret"))
+
+	payload, _ := json.Marshal(PoDPayload{SubscriberID: 22})
+	err := handler.ProcessTask(context.Background(), asynq.NewTask(TaskTypePoD, payload))
+
+	if err == nil {
+		t.Fatal("expected an error when there is no live session")
+	}
+	if !errorIsSkipRetry(err) {
+		t.Errorf("a missing session must wrap asynq.SkipRetry, got: %v", err)
+	}
+}
+
+// itNoSessionDB reports every subscriber as having no live session.
+// Not internal/db.ErrNotFound: this package cannot import internal/db without
+// creating an import cycle, since internal/db already depends on this
+// package's CoAQuerier interface. Any error works — PoDHandler only cares
+// that GetSubscriberNASSession failed, not which sentinel it returned.
+type itNoSessionDB struct{}
+
+func (itNoSessionDB) GetSubscriberNASSession(context.Context, int) (string, string, string, error) {
+	return "", "", "", errors.New("no active session")
+}
+
+// ── INT-FUP-004 ─────────────────────────────────────────────────────────────
+
+// TestDeadLetterMonitor_AlertsOnNonZero verifies an archived (dead-lettered)
+// task raises the dead_letter_queue_non_empty alert.
+//
+// INT-FUP-004 | FR-FUP-003
+func TestDeadLetterMonitor_AlertsOnNonZero(t *testing.T) {
+	opt, client, inspector := itRedis(t)
+
+	payload, _ := json.Marshal(CoAPayload{SubscriberID: 12, NasIP: "10.0.0.9"})
+	info, err := client.Enqueue(asynq.NewTask(TaskTypeCoA, payload), asynq.Queue(QueueNetCommands))
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	// Exhausting retries is what archives a task in production; archiving it
+	// directly reaches the same terminal state without burning the retry delays.
+	if err := inspector.ArchiveTask(QueueNetCommands, info.ID); err != nil {
+		t.Fatalf("archive task: %v", err)
+	}
+
+	alerter := &itAlerter{}
+	monitor := NewDeadLetterMonitor(opt, alerter)
+
+	if err := monitor.checkOnce(inspector); err != nil {
+		t.Fatalf("checkOnce: %v", err)
+	}
+
+	if !alerter.WasTriggered("dead_letter_queue_non_empty") {
+		t.Error("expected dead_letter_queue_non_empty alert for an archived task")
+	}
+}
+
+// TestDeadLetterMonitor_SilentWhenEmpty verifies no alert fires on a clean queue.
+//
+// INT-FUP-004 (supporting) | FR-FUP-003
+func TestDeadLetterMonitor_SilentWhenEmpty(t *testing.T) {
+	opt, client, inspector := itRedis(t)
+
+	payload, _ := json.Marshal(CoAPayload{SubscriberID: 13, NasIP: "10.0.0.10"})
+	if _, err := client.Enqueue(asynq.NewTask(TaskTypeCoA, payload), asynq.Queue(QueueNetCommands)); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	alerter := &itAlerter{}
+	monitor := NewDeadLetterMonitor(opt, alerter)
+
+	if err := monitor.checkOnce(inspector); err != nil {
+		t.Fatalf("checkOnce: %v", err)
+	}
+
+	if alerter.WasTriggered("dead_letter_queue_non_empty") {
+		t.Error("no alert expected while the queue has no archived tasks")
+	}
+}
+
+// TestDeadLetterMonitor_RunAlertsOnTick verifies the polling loop fires the
+// alert without needing the caller to drive checkOnce.
+//
+// INT-FUP-004 (supporting) | FR-FUP-003
+func TestDeadLetterMonitor_RunAlertsOnTick(t *testing.T) {
+	opt, client, inspector := itRedis(t)
+
+	payload, _ := json.Marshal(CoAPayload{SubscriberID: 14, NasIP: "10.0.0.11"})
+	info, err := client.Enqueue(asynq.NewTask(TaskTypeCoA, payload), asynq.Queue(QueueNetCommands))
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := inspector.ArchiveTask(QueueNetCommands, info.ID); err != nil {
+		t.Fatalf("archive task: %v", err)
+	}
+
+	alerter := &itAlerter{}
+	monitor := NewDeadLetterMonitor(opt, alerter)
+	monitor.SetInterval(20 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go monitor.Run(ctx)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !alerter.WasTriggered("dead_letter_queue_non_empty") {
+		if time.Now().After(deadline) {
+			t.Fatal("monitor loop did not raise dead_letter_queue_non_empty within 5s")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// ── INT-NOTIF-005 ───────────────────────────────────────────────────────────
+
+// TestFUPWarningTask_DispatchesWhatsApp verifies the warning task handler
+// dispatches template TMPL-001 for the subscriber in the payload.
+//
+// INT-NOTIF-005 | FR-FUP-004
+func TestFUPWarningTask_DispatchesWhatsApp(t *testing.T) {
+	notifier := &itNotifier{}
+	handler := NewWarningHandler(notifier)
+
+	payload, _ := json.Marshal(WarningPayload{SubscriberID: 55, Username: "nearly@isp", PctUsed: 82})
+	if err := handler.ProcessTask(context.Background(), asynq.NewTask(TaskTypeFUPWarning, payload)); err != nil {
+		t.Fatalf("ProcessTask: %v", err)
+	}
+
+	calls := notifier.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("want 1 notification dispatched, got %d", len(calls))
+	}
+	if calls[0].TemplateID != TemplateFUPWarning {
+		t.Errorf("template_id: want %q, got %q", TemplateFUPWarning, calls[0].TemplateID)
+	}
+	if calls[0].SubscriberID != 55 {
+		t.Errorf("subscriber_id: want 55, got %d", calls[0].SubscriberID)
+	}
+	if calls[0].TriggerEvent != "fup_warning_80pct" {
+		t.Errorf("trigger event: want fup_warning_80pct, got %q", calls[0].TriggerEvent)
+	}
+}
+
+// TestFUPWarningTask_MalformedPayloadSkipsRetry verifies an undecodable payload
+// is not retried, since it can never succeed.
+//
+// INT-NOTIF-005 (supporting) | FR-FUP-004
+func TestFUPWarningTask_MalformedPayloadSkipsRetry(t *testing.T) {
+	handler := NewWarningHandler(&itNotifier{})
+
+	err := handler.ProcessTask(context.Background(), asynq.NewTask(TaskTypeFUPWarning, []byte("{not json")))
+	if err == nil {
+		t.Fatal("expected an error for a malformed payload")
+	}
+	if !errorIsSkipRetry(err) {
+		t.Errorf("malformed payload must wrap asynq.SkipRetry, got: %v", err)
+	}
+}
+
+func errorIsSkipRetry(err error) bool {
+	for e := err; e != nil; {
+		if e == asynq.SkipRetry { //nolint:errorlint,err113
+			return true
+		}
+		unwrapper, ok := e.(interface{ Unwrap() []error })
+		if ok {
+			for _, sub := range unwrapper.Unwrap() {
+				if errorIsSkipRetry(sub) {
+					return true
+				}
+			}
+			return false
+		}
+		single, ok := e.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		e = single.Unwrap()
+	}
+	return false
+}

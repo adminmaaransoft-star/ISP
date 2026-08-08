@@ -1,0 +1,21 @@
+{{define "content"}}
+<div class="grid">
+  <div class="card">
+    <h2>Wallet Balance</h2>
+    <div class="stat">₹{{money .Profile.WalletBalance}}</div>
+  </div>
+  <div class="card">
+    <h2>Plan</h2>
+    <div class="stat" style="font-size:1.1rem">{{.Profile.PlanName}}</div>
+    <div class="stat-label">Expires {{date .Profile.PlanExpiry}}</div>
+  </div>
+  <div class="card">
+    <h2>Status</h2>
+    <span class="badge {{statusBadge .Profile.Status}}">{{.Profile.Status}}</span>
+  </div>
+</div>
+
+<div class="card" id="session-card" hx-get="/ui/dashboard/session" hx-trigger="every 15s" hx-swap="innerHTML">
+{{template "session-inner" .Session}}
+</div>
+{{end}}

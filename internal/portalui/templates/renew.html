@@ -1,0 +1,14 @@
+{{define "content"}}
+<div class="card">
+  <h2>Renew Plan</h2>
+  <form hx-post="/ui/renew" hx-target="#renew-result" hx-swap="innerHTML">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+    <div class="form-group">
+      <label for="amount">Amount (₹)</label>
+      <input type="text" id="amount" name="amount" placeholder="e.g. 799.00" required>
+    </div>
+    <button class="btn" type="submit">Get Payment Link</button>
+  </form>
+  <div id="renew-result" style="margin-top:1rem"></div>
+</div>
+{{end}}

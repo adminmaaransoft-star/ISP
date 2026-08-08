@@ -1,0 +1,32 @@
+# Binaries
+/bin/
+/dist/
+
+# Go build cache
+*.test
+*.test.exe
+*.out
+coverage.out
+.coverage.out
+.gotmp/
+.testbin/
+
+# Environment secrets — NEVER commit
+.env
+
+# IDE
+.idea/
+.vscode/settings.json
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Excel lock files (created while a tracker is open)
+~$*.xlsx
+
+# Key material
+config/keys/*.json
+config/keys/*.pem

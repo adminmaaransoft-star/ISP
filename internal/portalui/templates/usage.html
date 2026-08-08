@@ -1,0 +1,30 @@
+{{define "content"}}
+<div class="card">
+  <h2>Usage History</h2>
+  {{if .Sessions}}
+  <table>
+    <thead>
+      <tr><th>Start</th><th>Stop</th><th>Data Used</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+      {{range .Sessions}}
+      <tr>
+        <td>{{datetime .StartTime}}</td>
+        <td>{{if .StopTime}}{{datetime .StopTime}}{{else}}—{{end}}</td>
+        <td>{{gb .GBUsed}} GB</td>
+        <td>
+          {{if .StopTime}}
+            <span class="badge">{{if .TerminateCause}}{{.TerminateCause}}{{else}}closed{{end}}</span>
+          {{else}}
+            <span class="badge badge-active">active</span>
+          {{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="empty-state">No session history yet.</div>
+  {{end}}
+</div>
+{{end}}

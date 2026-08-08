@@ -1,0 +1,21 @@
+# Reverse proxy / TLS termination for api_service — SecD §9.7, IDD §8.1.
+#
+# api_service itself speaks plain HTTP on the internal Docker network only
+# (docker-compose.yml does not publish its port to the host); this is the
+# only externally reachable HTTP(S) entry point. NFR-SEC-001 requires TLS 1.3
+# minimum on all external endpoints, so the tls block below pins the range to
+# exactly 1.3 rather than trusting Caddy's default (which also allows 1.2).
+#
+# {$DOMAIN} controls certificate issuance, not just the hostname: a real
+# public FQDN makes Caddy request a Let's Encrypt certificate automatically;
+# the default "localhost" makes Caddy issue a certificate from its own local
+# CA instead, since ACME cannot validate ownership of "localhost". Clients
+# talking to a local/demo deployment must use `curl -k` (or trust that local
+# CA) since it is not in any public trust store.
+{$DOMAIN:localhost} {
+	tls {
+		protocols tls1.3
+	}
+
+	reverse_proxy api_service:8080
+}

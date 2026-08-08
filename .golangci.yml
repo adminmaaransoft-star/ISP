@@ -1,0 +1,68 @@
+﻿version: "2"
+
+run:
+  timeout: 5m
+  go: "1.22"
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - contextcheck
+    - gosec
+    - misspell
+    - noctx
+    - prealloc
+    - revive
+    - unconvert
+    - unparam
+  settings:
+    gosec:
+      excludes:
+        - G304
+    revive:
+      rules:
+        - name: var-naming
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+          disabled: true
+        - name: unused-parameter
+          disabled: true
+        - name: package-comments
+          disabled: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclusions:
+    rules:
+      - path: "_test\\.go"
+        linters:
+          - gosec
+          - unparam
+          - errcheck
+          - noctx
+      - text: "Error return value of `.*\\.Close\\(\\)` is not checked"
+        linters:
+          - errcheck
+      - text: "Error return value of `.*\\.Write\\("
+        linters:
+          - errcheck
+      - text: "Error return value of `\\(\\*encoding/json\\.Encoder\\)\\.Encode` is not checked"
+        linters:
+          - errcheck
+      - text: "Error return value of `golang.org/x/crypto/bcrypt\\.CompareHashAndPassword` is not checked"
+        linters:
+          - errcheck

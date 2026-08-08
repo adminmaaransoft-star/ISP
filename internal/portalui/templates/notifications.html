@@ -1,0 +1,24 @@
+{{define "content"}}
+<div class="card">
+  <h2>Notification History</h2>
+  {{if .Notifications}}
+  <table>
+    <thead>
+      <tr><th>Channel</th><th>Type</th><th>Status</th><th>Sent</th></tr>
+    </thead>
+    <tbody>
+      {{range .Notifications}}
+      <tr>
+        <td>{{.Channel}}</td>
+        <td>{{if .TemplateName}}{{.TemplateName}}{{else}}{{.Class}}{{end}}</td>
+        <td><span class="badge badge-{{.DeliveryStatus}}">{{.DeliveryStatus}}</span></td>
+        <td>{{datetime .SentAt}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="empty-state">No notifications yet.</div>
+  {{end}}
+</div>
+{{end}}

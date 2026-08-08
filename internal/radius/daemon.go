@@ -1,0 +1,168 @@
+// Package radius implements the RADIUS AAA worker pool daemon.
+//
+// FR: FR-AAA-001..004 | NFR: NFR-PERF-001, NFR-SCAL-001 | DDS §5.1
+package radius
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/redis/go-redis/v9"
+	"layeh.com/radius"
+)
+
+const (
+	workerCount = 128 // fixed pool — prevents goroutine storms during auth peaks
+	// shutdownGrace bounds how long in-flight packets may finish on shutdown.
+	shutdownGrace = 10 * time.Second
+)
+
+// Prometheus metrics
+var (
+	radiusAuthDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "radius_auth_duration_seconds",
+		Help:    "RADIUS authentication request duration",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.015, 0.025, 0.05, 0.1},
+	})
+	radiusDedupSkipped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "radius_acct_dedup_skipped_total",
+		Help: "Accounting packets skipped due to deduplication",
+	})
+	radiusAuthAccept = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "radius_auth_accept_total",
+		Help: "RADIUS Access-Accept responses sent",
+	})
+	radiusAuthReject = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "radius_auth_reject_total",
+		Help: "RADIUS Access-Reject responses sent",
+	})
+)
+
+// DBQuerier is the minimal DB interface required by the RADIUS daemon.
+type DBQuerier interface {
+	GetSubscriberByUsername(ctx context.Context, username string) (*Subscriber, error)
+}
+
+// Subscriber holds the fields needed for RADIUS auth decisions.
+type Subscriber struct {
+	ID           int
+	Username     string
+	PasswordHash string
+	Status       string // active | grace_period | soft_suspended | hard_suspended | terminated
+	RateLimitStr string // MikroTik format: "100M/100M"
+	FUPActive    bool
+	FUPThrottle  string
+}
+
+// radiusJob bundles the ResponseWriter and Request so both can pass through the worker queue.
+type radiusJob struct {
+	w radius.ResponseWriter
+	r *radius.Request
+}
+
+// RadiusDaemon is the fixed-worker-pool RADIUS server.
+type RadiusDaemon struct {
+	addr        string
+	secret      []byte
+	db          DBQuerier
+	redisClient redis.UniversalClient
+	guard       *BruteForceGuard
+	packetQueue chan radiusJob
+}
+
+// NewRadiusDaemon constructs a RadiusDaemon.
+func NewRadiusDaemon(addr string, secret []byte, db DBQuerier, rc redis.UniversalClient) *RadiusDaemon {
+	return &RadiusDaemon{
+		addr:        addr,
+		secret:      secret,
+		db:          db,
+		redisClient: rc,
+		guard:       NewBruteForceGuard(rc),
+		packetQueue: make(chan radiusJob, workerCount*4),
+	}
+}
+
+// Start binds the UDP port, launches the worker pool, and begins serving.
+// It blocks until the server returns an error.
+//
+// Deprecated: prefer StartContext, which can be shut down.
+//
+// DDS §5.1
+func (d *RadiusDaemon) Start() error {
+	return d.StartContext(context.Background())
+}
+
+// StartContext binds the UDP port, launches the worker pool, and serves until
+// ctx is cancelled or the listener fails.
+//
+// On cancellation the listener stops accepting first, then queued packets are
+// drained: a subscriber whose Access-Request was already accepted should get an
+// answer rather than a timeout during a rolling restart.
+//
+// DDS §5.1
+func (d *RadiusDaemon) StartContext(ctx context.Context) error {
+	udpAddr, err := net.ResolveUDPAddr("udp", d.addr)
+	if err != nil {
+		return fmt.Errorf("radius: resolve addr %s: %w", d.addr, err)
+	}
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return fmt.Errorf("radius: listen UDP %s: %w", d.addr, err)
+	}
+
+	var workers sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			d.workerPoolConsumer(ctx)
+		}()
+	}
+
+	server := &radius.PacketServer{
+		Addr:         d.addr,
+		SecretSource: radius.StaticSecretSource(d.secret),
+		Handler: radius.HandlerFunc(func(w radius.ResponseWriter, r *radius.Request) {
+			select {
+			case d.packetQueue <- radiusJob{w: w, r: r}:
+			case <-ctx.Done():
+			}
+		}),
+	}
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve(conn) }()
+
+	select {
+	case err := <-serveErr:
+		close(d.packetQueue)
+		workers.Wait()
+		return err
+	case <-ctx.Done():
+		// Deliberately not derived from ctx: we are here *because* ctx was
+		// cancelled, and a Shutdown given a dead context returns immediately
+		// without draining, defeating the point of a graceful stop.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		//nolint:errcheck,contextcheck // already shutting down; fresh deadline is required to drain
+		_ = server.Shutdown(shutdownCtx)
+		close(d.packetQueue)
+		workers.Wait()
+		return nil
+	}
+}
+
+// workerPoolConsumer drains the packet queue until it is closed.
+//
+// ctx is the daemon lifetime; each request still gets its own deadline so one
+// slow backend cannot pin a worker indefinitely.
+func (d *RadiusDaemon) workerPoolConsumer(ctx context.Context) {
+	for job := range d.packetQueue {
+		d.handleRequest(ctx, job.w, job.r)
+	}
+}

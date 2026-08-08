@@ -1,0 +1,345 @@
+package db
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/maaransoft/isp-bss-oss/internal/api"
+	"github.com/maaransoft/isp-bss-oss/internal/billing"
+	"github.com/shopspring/decimal"
+)
+
+// BillingStore serves wallet, dunning, ledger and invoice operations.
+// Satisfies billing.WalletQuerier, billing.DunningQuerier, api.LedgerQuerier
+// and api.InvoiceQuerier.
+type BillingStore struct{ pool *pgxpool.Pool }
+
+var (
+	_ billing.WalletQuerier  = (*BillingStore)(nil)
+	_ billing.DunningQuerier = (*BillingStore)(nil)
+	_ api.LedgerQuerier      = (*BillingStore)(nil)
+	_ api.InvoiceQuerier     = (*BillingStore)(nil)
+)
+
+// GetSubscriberBalance reads the current wallet balance.
+func (s *BillingStore) GetSubscriberBalance(ctx context.Context, subscriberID int) (decimal.Decimal, error) {
+	const q = `SELECT wallet_balance::text FROM subscribers WHERE id = $1`
+
+	var balance string
+	err := s.pool.QueryRow(ctx, q, subscriberID).Scan(&balance)
+	if isNoRows(err) {
+		return decimal.Zero, fmt.Errorf("db: subscriber %d: %w", subscriberID, ErrNotFound)
+	}
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("db: get balance for subscriber %d: %w", subscriberID, err)
+	}
+	return parseDecimal(balance)
+}
+
+// GetTransactionByToken looks up a prior recharge by its idempotency token.
+// Returns (nil, nil) when the token has not been seen.
+func (s *BillingStore) GetTransactionByToken(ctx context.Context, token string) (*billing.Transaction, error) {
+	if token == "" {
+		return nil, nil
+	}
+	const q = `
+		SELECT id, subscriber_id, entry_type, amount::text, balance_after::text,
+		       COALESCE(transaction_token, ''), COALESCE(description, '')
+		FROM wallet_ledgers
+		WHERE transaction_token = $1
+		LIMIT 1`
+
+	var (
+		tx                   billing.Transaction
+		amount, balanceAfter string
+	)
+	err := s.pool.QueryRow(ctx, q, token).Scan(
+		&tx.ID, &tx.SubscriberID, &tx.EntryType, &amount, &balanceAfter,
+		&tx.TransactionToken, &tx.Description,
+	)
+	if isNoRows(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db: get transaction by token: %w", err)
+	}
+	if tx.Amount, err = parseDecimal(amount); err != nil {
+		return nil, err
+	}
+	if tx.BalanceAfter, err = parseDecimal(balanceAfter); err != nil {
+		return nil, err
+	}
+	return &tx, nil
+}
+
+// RecordRecharge writes both ledger legs and the new wallet balance in one
+// transaction, so a crash can never leave the ledger and subscribers.wallet_balance
+// disagreeing — which the nightly reconciliation would then report as variance.
+//
+// FR: FR-BIL-003, FR-BIL-005 | DBD §6.2 wallet_ledgers
+func (s *BillingStore) RecordRecharge(ctx context.Context, p billing.RechargePosting) (*billing.Transaction, error) {
+	const insertLeg = `
+		INSERT INTO wallet_ledgers (
+			subscriber_id, franchise_id, account, entry_type,
+			amount, balance_after, transaction_token, description
+		) VALUES ($1,$2,$3,$4,$5::numeric,$6::numeric,$7,$8)
+		RETURNING id`
+
+	const updateBalance = `UPDATE subscribers SET wallet_balance = $2::numeric WHERE id = $1`
+
+	var tx *billing.Transaction
+
+	err := inTx(ctx, s.pool, func(dbTx pgx.Tx) error {
+		// The counter-leg carries no token: idx_wallet_token is unique over
+		// non-null tokens, so both legs holding it would collide with themselves.
+		if _, err := dbTx.Exec(ctx, insertLeg,
+			p.Debit.SubscriberID, p.Debit.FranchiseID, p.Debit.Account, p.Debit.EntryType,
+			p.Debit.Amount.String(), p.Debit.BalanceAfter.String(), nil, p.Debit.Description,
+		); err != nil {
+			return fmt.Errorf("db: insert debit leg: %w", err)
+		}
+
+		var creditID int
+		if err := dbTx.QueryRow(ctx, insertLeg,
+			p.Credit.SubscriberID, p.Credit.FranchiseID, p.Credit.Account, p.Credit.EntryType,
+			p.Credit.Amount.String(), p.Credit.BalanceAfter.String(), p.Credit.TransactionToken,
+			p.Credit.Description,
+		).Scan(&creditID); err != nil {
+			return fmt.Errorf("db: insert credit leg: %w", err)
+		}
+
+		if _, err := dbTx.Exec(ctx, updateBalance, p.SubscriberID, p.NewBalance.String()); err != nil {
+			return fmt.Errorf("db: update wallet balance: %w", err)
+		}
+
+		token := ""
+		if p.Credit.TransactionToken != nil {
+			token = *p.Credit.TransactionToken
+		}
+		tx = &billing.Transaction{
+			ID:               creditID,
+			SubscriberID:     p.Credit.SubscriberID,
+			EntryType:        p.Credit.EntryType,
+			Amount:           p.Credit.Amount,
+			BalanceAfter:     p.NewBalance,
+			TransactionToken: token,
+			Description:      p.Credit.Description,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
+// GetSubscriberDunningState returns the current dunning stage and plan expiry.
+func (s *BillingStore) GetSubscriberDunningState(ctx context.Context, subscriberID int) (billing.DunningState, time.Time, error) {
+	const q = `SELECT dunning_state, COALESCE(plan_expiry, NOW()) FROM subscribers WHERE id = $1`
+
+	var (
+		state  string
+		expiry time.Time
+	)
+	err := s.pool.QueryRow(ctx, q, subscriberID).Scan(&state, &expiry)
+	if isNoRows(err) {
+		return "", time.Time{}, fmt.Errorf("db: subscriber %d: %w", subscriberID, ErrNotFound)
+	}
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("db: get dunning state for subscriber %d: %w", subscriberID, err)
+	}
+	return billing.DunningState(state), expiry, nil
+}
+
+// SetSubscriberDunningState advances the dunning stage and the derived
+// subscribers.status that RADIUS enforces on the next Access-Request.
+//
+// Both columns move together in one statement: a dunning state of
+// hard_suspended with a status still 'active' would keep a non-paying
+// subscriber online.
+func (s *BillingStore) SetSubscriberDunningState(ctx context.Context, subscriberID int, state billing.DunningState, status string) error {
+	const q = `UPDATE subscribers SET dunning_state = $2, status = $3 WHERE id = $1`
+
+	tag, err := s.pool.Exec(ctx, q, subscriberID, string(state), status)
+	if err != nil {
+		return fmt.Errorf("db: set dunning state for subscriber %d: %w", subscriberID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("db: subscriber %d: %w", subscriberID, ErrNotFound)
+	}
+	return nil
+}
+
+// CreateInvoice persists a computed GST invoice.
+//
+// The chk_gst_logic CHECK rejects an invoice carrying both intrastate and
+// interstate tax, so a miscomputed invoice fails here rather than reaching GSTR-1.
+func (s *BillingStore) CreateInvoice(ctx context.Context, inv billing.Invoice) (int, error) {
+	const q = `
+		INSERT INTO invoices (
+			subscriber_id, base_amount, cgst_amount, sgst_amount, igst_amount,
+			total_amount, gst_rate_id, gb_included, gb_used
+		) VALUES ($1,$2::numeric,$3::numeric,$4::numeric,$5::numeric,$6::numeric,$7,$8,$9::numeric)
+		RETURNING id`
+
+	var id int
+	err := s.pool.QueryRow(ctx, q,
+		inv.SubscriberID, inv.BaseAmount.String(), inv.CgstAmount.String(),
+		inv.SgstAmount.String(), inv.IgstAmount.String(), inv.TotalAmount.String(),
+		inv.GstRateID, inv.GbIncluded, inv.GbUsed.String(),
+	).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("db: create invoice for subscriber %d: %w", inv.SubscriberID, err)
+	}
+	return id, nil
+}
+
+// GetActiveGstRate returns the rate effective now.
+func (s *BillingStore) GetActiveGstRate(ctx context.Context) (billing.GstRate, error) {
+	const q = `
+		SELECT id, cgst_rate::text, sgst_rate::text, igst_rate::text
+		FROM gst_rates
+		WHERE effective_from <= NOW()
+		ORDER BY effective_from DESC
+		LIMIT 1`
+
+	var (
+		rate             billing.GstRate
+		cgst, sgst, igst string
+	)
+	err := s.pool.QueryRow(ctx, q).Scan(&rate.ID, &cgst, &sgst, &igst)
+	if isNoRows(err) {
+		return billing.GstRate{}, fmt.Errorf("db: no effective GST rate: %w", ErrNotFound)
+	}
+	if err != nil {
+		return billing.GstRate{}, fmt.Errorf("db: get active GST rate: %w", err)
+	}
+	if rate.CgstRate, err = parseDecimal(cgst); err != nil {
+		return billing.GstRate{}, err
+	}
+	if rate.SgstRate, err = parseDecimal(sgst); err != nil {
+		return billing.GstRate{}, err
+	}
+	if rate.IgstRate, err = parseDecimal(igst); err != nil {
+		return billing.GstRate{}, err
+	}
+	return rate, nil
+}
+
+// ── Ledger (API-004) ────────────────────────────────────────────────────────
+
+// ListLedgerEntries returns a subscriber's wallet_ledgers rows, newest first,
+// optionally bounded by [from, to].
+func (s *BillingStore) ListLedgerEntries(ctx context.Context, subscriberID int, from, to *time.Time, limit int) ([]api.LedgerEntry, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	const q = `
+		SELECT id, entry_type, account, amount::text, balance_after::text,
+		       COALESCE(transaction_token, ''), COALESCE(description, ''), created_at
+		FROM wallet_ledgers
+		WHERE subscriber_id = $1
+		  AND ($2::timestamptz IS NULL OR created_at >= $2)
+		  AND ($3::timestamptz IS NULL OR created_at <= $3)
+		ORDER BY created_at DESC
+		LIMIT $4`
+
+	rows, err := s.pool.Query(ctx, q, subscriberID, from, to, limit)
+	if err != nil {
+		return nil, fmt.Errorf("db: list ledger entries for subscriber %d: %w", subscriberID, err)
+	}
+	defer rows.Close()
+
+	entries := make([]api.LedgerEntry, 0, limit)
+	for rows.Next() {
+		var e api.LedgerEntry
+		if err := rows.Scan(&e.ID, &e.EntryType, &e.Account, &e.Amount, &e.BalanceAfter,
+			&e.TransactionToken, &e.Description, &e.CreatedAt); err != nil {
+			return nil, fmt.Errorf("db: scan ledger row: %w", err)
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterate ledger entries: %w", err)
+	}
+	return entries, nil
+}
+
+// ── Invoices (API-004) ──────────────────────────────────────────────────────
+
+// ListInvoices returns invoice summaries for a subscriber, newest first.
+func (s *BillingStore) ListInvoices(ctx context.Context, subscriberID int) ([]api.InvoiceSummary, error) {
+	const q = `
+		SELECT id, subscriber_id, base_amount::text, cgst_amount::text, sgst_amount::text,
+		       igst_amount::text, total_amount::text, gb_included, gb_used::text, created_at
+		FROM invoices
+		WHERE subscriber_id = $1
+		ORDER BY created_at DESC`
+
+	rows, err := s.pool.Query(ctx, q, subscriberID)
+	if err != nil {
+		return nil, fmt.Errorf("db: list invoices for subscriber %d: %w", subscriberID, err)
+	}
+	defer rows.Close()
+
+	invoices := make([]api.InvoiceSummary, 0, 12)
+	for rows.Next() {
+		var inv api.InvoiceSummary
+		if err := rows.Scan(&inv.ID, &inv.SubscriberID, &inv.BaseAmount, &inv.CGSTAmount, &inv.SGSTAmount,
+			&inv.IGSTAmount, &inv.TotalAmount, &inv.GBIncluded, &inv.GBUsed, &inv.CreatedAt); err != nil {
+			return nil, fmt.Errorf("db: scan invoice row: %w", err)
+		}
+		invoices = append(invoices, inv)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterate invoices: %w", err)
+	}
+	return invoices, nil
+}
+
+// GetInvoiceDetail loads everything the PDF template needs for one invoice:
+// the invoice row joined to the subscriber, their plan, and the GST rate the
+// invoice was computed under.
+func (s *BillingStore) GetInvoiceDetail(ctx context.Context, invoiceID int) (*api.InvoiceDetail, error) {
+	const q = `
+		SELECT i.id, i.subscriber_id, i.base_amount::text, i.cgst_amount::text, i.sgst_amount::text,
+		       i.igst_amount::text, i.total_amount::text, i.gb_included, i.gb_used::text, i.created_at,
+		       s.username, s.mobile_number, s.registered_state,
+		       p.name, g.cgst_rate::text, g.sgst_rate::text, g.igst_rate::text,
+		       p.rate_limit_string, COALESCE(p.fup_throttle_string, ''), s.fup_active
+		FROM invoices i
+		JOIN subscribers s ON s.id = i.subscriber_id
+		JOIN plans p       ON p.id = s.plan_id
+		JOIN gst_rates g   ON g.id = i.gst_rate_id
+		WHERE i.id = $1`
+
+	var (
+		d                      api.InvoiceDetail
+		rateLimit, fupThrottle string
+		fupActive              bool
+	)
+	err := s.pool.QueryRow(ctx, q, invoiceID).Scan(
+		&d.ID, &d.SubscriberID, &d.BaseAmount, &d.CGSTAmount, &d.SGSTAmount,
+		&d.IGSTAmount, &d.TotalAmount, &d.GBIncluded, &d.GBUsed, &d.CreatedAt,
+		&d.SubscriberName, &d.MobileNumber, &d.RegisteredState,
+		&d.PlanName, &d.CGSTRate, &d.SGSTRate, &d.IGSTRate,
+		&rateLimit, &fupThrottle, &fupActive,
+	)
+	if isNoRows(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db: get invoice detail %d: %w", invoiceID, err)
+	}
+
+	d.FUPApplied = fupActive && fupThrottle != ""
+	if d.FUPApplied {
+		d.SpeedActive = fupThrottle
+	} else {
+		d.SpeedActive = rateLimit
+	}
+	return &d, nil
+}

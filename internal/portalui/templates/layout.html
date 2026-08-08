@@ -1,0 +1,33 @@
+{{define "layout"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subscriber Portal</title>
+<link rel="stylesheet" href="/ui/static/portalui.css">
+<script src="/ui/static/htmx.min.js"></script>
+</head>
+<body>
+{{if .Authenticated}}
+<nav class="nav">
+  <div class="nav-brand">ISP Portal</div>
+  <div class="nav-links">
+    <a href="/ui/dashboard"{{if eq .Active "dashboard"}} class="active"{{end}}>Dashboard</a>
+    <a href="/ui/usage"{{if eq .Active "usage"}} class="active"{{end}}>Usage</a>
+    <a href="/ui/invoices"{{if eq .Active "invoices"}} class="active"{{end}}>Invoices</a>
+    <a href="/ui/renew"{{if eq .Active "renew"}} class="active"{{end}}>Renew</a>
+    <a href="/ui/tickets"{{if eq .Active "tickets"}} class="active"{{end}}>Support</a>
+    <a href="/ui/notifications"{{if eq .Active "notifications"}} class="active"{{end}}>Notifications</a>
+    <form method="post" action="/ui/logout" style="display:inline;margin:0">
+      <button class="btn btn-secondary" type="submit">Logout</button>
+    </form>
+  </div>
+</nav>
+{{end}}
+<div class="container">
+{{template "content" .}}
+</div>
+</body>
+</html>
+{{end}}

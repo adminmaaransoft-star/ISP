@@ -1,0 +1,27 @@
+{{define "content"}}
+<div class="card">
+  <h2>File a Support Ticket</h2>
+  <form hx-post="/ui/tickets" hx-target="#tickets-list" hx-swap="outerHTML">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+    <div class="form-group">
+      <label for="category">Category</label>
+      <select id="category" name="category" required>
+        <option value="connectivity">Connectivity</option>
+        <option value="billing">Billing</option>
+        <option value="plan_change">Plan Change</option>
+        <option value="other">Other</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label for="description">Description</label>
+      <textarea id="description" name="description" rows="3" required></textarea>
+    </div>
+    <button class="btn" type="submit">Submit Ticket</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Your Tickets</h2>
+  {{template "tickets-list" .List}}
+</div>
+{{end}}
