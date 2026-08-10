@@ -383,3 +383,192 @@ func TestCreateSubscriber_AcceptsValidE164Phone(t *testing.T) {
 		t.Fatalf("want 1 subscriber created, got %d", len(subs.rows))
 	}
 }
+
+// itStaffToken signs a token for any of the staff-facing roles (as opposed
+// to itAdminToken's fixed billing_admin).
+func itStaffToken(t *testing.T, role string) string {
+	t.Helper()
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, middleware.Claims{
+		Role:             role,
+		RegisteredClaims: jwt.RegisteredClaims{Subject: "staff", ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour))},
+	}).SignedString([]byte(itJWTSecret))
+	if err != nil {
+		t.Fatalf("sign %s token: %v", role, err)
+	}
+	return tok
+}
+
+// ── GetSubscriber / UpdateSubscriber / GetSubscriberHealth ──────────────────
+//
+// api_test.go's TestGetSubscriber_UnauthenticatedReturns401 only proves the
+// route is behind auth; these are the tests that actually reach the handler.
+
+func TestGetSubscriber_Found(t *testing.T) {
+	subs := &itSubscriberStore{}
+	if _, err := subs.CreateSubscriber(context.Background(), api.SubscriberRecord{
+		CAFNumber: "CAF-GET-1", Username: "get-me@isp", Status: "active",
+	}, "hash"); err != nil {
+		t.Fatalf("seed subscriber: %v", err)
+	}
+
+	h := api.NewHandler(api.HandlerDeps{
+		DB: subs, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}), KeyStore: itKeyStore(t, "v1", "v1"),
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, itJWTSecret)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/subscribers/1", nil) //nolint:noctx
+	req.Header.Set("Authorization", "Bearer "+itStaffToken(t, "noc_engineer"))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", rec.Code, rec.Body.String())
+	}
+	var got api.SubscriberRecord
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Username != "get-me@isp" {
+		t.Errorf("username: want get-me@isp, got %q", got.Username)
+	}
+}
+
+func TestGetSubscriber_NotFound(t *testing.T) {
+	subs := &itSubscriberStore{}
+	h := api.NewHandler(api.HandlerDeps{
+		DB: subs, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}), KeyStore: itKeyStore(t, "v1", "v1"),
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, itJWTSecret)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/subscribers/999", nil) //nolint:noctx
+	req.Header.Set("Authorization", "Bearer "+itStaffToken(t, "csr"))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("want 404, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUpdateSubscriber_Success(t *testing.T) {
+	subs := &itSubscriberStore{}
+	if _, err := subs.CreateSubscriber(context.Background(), api.SubscriberRecord{
+		CAFNumber: "CAF-UPD-1", Username: "update-me@isp", Status: "active",
+	}, "hash"); err != nil {
+		t.Fatalf("seed subscriber: %v", err)
+	}
+
+	h := api.NewHandler(api.HandlerDeps{
+		DB: subs, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}), KeyStore: itKeyStore(t, "v1", "v1"),
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, itJWTSecret)
+
+	body, _ := json.Marshal(map[string]any{"status": "hard_suspended"})
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/subscribers/1", bytes.NewReader(body)) //nolint:noctx
+	req.Header.Set("Authorization", "Bearer "+itAdminToken(t))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUpdateSubscriber_RequiresAdminRole(t *testing.T) {
+	subs := &itSubscriberStore{}
+	h := api.NewHandler(api.HandlerDeps{
+		DB: subs, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}), KeyStore: itKeyStore(t, "v1", "v1"),
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, itJWTSecret)
+
+	body, _ := json.Marshal(map[string]any{"status": "hard_suspended"})
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/subscribers/1", bytes.NewReader(body)) //nolint:noctx
+	req.Header.Set("Authorization", "Bearer "+itStaffToken(t, "csr"))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("want 403 for csr, got %d", rec.Code)
+	}
+}
+
+func TestGetSubscriberHealth_NotImplemented(t *testing.T) {
+	h := api.NewHandler(api.HandlerDeps{
+		DB: &itSubscriberStore{}, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}), KeyStore: itKeyStore(t, "v1", "v1"),
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, itJWTSecret)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/subscribers/1/health", nil) //nolint:noctx
+	req.Header.Set("Authorization", "Bearer "+itStaffToken(t, "technician"))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	// api.Handler only reserves this route; the real implementation is bound
+	// over it separately in cmd/api/main.go via health.Handler.
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("want 501 (route is a placeholder), got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── WalletRecharge ───────────────────────────────────────────────────────────
+
+func TestWalletRecharge_Success(t *testing.T) {
+	h := api.NewHandler(api.HandlerDeps{
+		DB: &itSubscriberStore{}, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}), KeyStore: itKeyStore(t, "v1", "v1"),
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, itJWTSecret)
+
+	body, _ := json.Marshal(map[string]any{
+		"subscriber_id": 1, "amount": "500.00", "payment_method": "razorpay", "transaction_token": "tok_001",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/recharge", bytes.NewReader(body)) //nolint:noctx
+	req.Header.Set("Authorization", "Bearer "+itAdminToken(t))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", rec.Code, rec.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	// billing.Transaction has no json tags, so its exported field names are
+	// used as-is ("ID", not "id").
+	if got["ID"] == nil {
+		t.Error("expected a transaction ID in the response")
+	}
+}
+
+// TestWalletRecharge_InvalidAmount is the real version of the validation
+// test its old, misleadingly-named unauthenticated-only counterpart in
+// api_test.go never actually was.
+func TestWalletRecharge_InvalidAmount(t *testing.T) {
+	h := api.NewHandler(api.HandlerDeps{
+		DB: &itSubscriberStore{}, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}), KeyStore: itKeyStore(t, "v1", "v1"),
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, itJWTSecret)
+
+	body, _ := json.Marshal(map[string]any{
+		"subscriber_id": 1, "amount": "badnum", "payment_method": "razorpay", "transaction_token": "tok_002",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/recharge", bytes.NewReader(body)) //nolint:noctx
+	req.Header.Set("Authorization", "Bearer "+itAdminToken(t))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422 for an unparseable amount, got %d — %s", rec.Code, rec.Body.String())
+	}
+}

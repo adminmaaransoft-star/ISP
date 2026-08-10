@@ -8,14 +8,18 @@
 #   NFR-SEC-002   zero plaintext PII in logs
 #
 # Usage:
-#   ./scripts/run_nfr_tests.sh                    # default 20,000 subscribers
+#   ./scripts/run_nfr_tests.sh                    # 20,000 subscribers, DoD levels
 #   SUBSCRIBERS=5000 ./scripts/run_nfr_tests.sh   # smaller run
-#   DURATION=60s RATE=5000 ./scripts/run_nfr_tests.sh
+#   DURATION=60s RATE=8000 ./scripts/run_nfr_tests.sh  # past the DoD floor
+#
+# NFR-SEC-001 (TLS 1.3 floor) is covered by scripts/verify_tls.sh, which is
+# kept separate because it needs only the Caddy edge — not the seeded database
+# and load-test stack this script builds.
 #
 # NFR-SCAL-001 (1-hour hold), NFR-AVAIL-001 (Sentinel failover), NFR-DUR-001
-# (replica loss mid-storm), NFR-PERF-003 (Meta round trip) and NFR-SEC-001 (TLS)
-# are not run here: they need either the full Sentinel stack, real provider
-# credentials, or an hour of sustained load. See the tracker notes.
+# (replica loss mid-storm) and NFR-PERF-003 (Meta round trip) are not run here:
+# they need either the full Sentinel stack, real provider credentials, or an
+# hour of sustained load. See the tracker notes.
 
 set -uo pipefail
 
@@ -30,9 +34,13 @@ GO_IMAGE="${GO_IMAGE:-golang:1.22}"
 K6_IMAGE="${K6_IMAGE:-grafana/k6:latest}"
 
 SUBSCRIBERS="${SUBSCRIBERS:-20000}"
-RATE="${RATE:-2000}"
+# RATE and API_VUS default to the levels the DoD actually specifies (L6-001:
+# 5,000 req/s; L6-002: 500 concurrent). They previously defaulted to 2,000 and
+# 100, so a green run demonstrated roughly a fifth of the required RADIUS load
+# and a fifth of the required API concurrency while reading as a full pass.
+RATE="${RATE:-5000}"
 DURATION="${DURATION:-30s}"
-API_VUS="${API_VUS:-100}"
+API_VUS="${API_VUS:-500}"
 API_DURATION="${API_DURATION:-30s}"
 
 SUFFIX="$$"
@@ -44,6 +52,7 @@ RADIUSD="nfr_radiusd_${SUFFIX}"
 
 JWT_SECRET="nfr_test_jwt_secret_is_32_chars_ok!!"
 RADIUS_SECRET="nfr_test_radius_secret_32_chars_ok!"
+RADIUS_VERIFIER_SECRET="nfr_test_verifier_cache_secret_32c!"
 TEST_PASSWORD="TestPass1234!"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BOLD='\033[1m'; NC='\033[0m'
@@ -162,6 +171,7 @@ docker run -d --rm --name "$API" --network "$NETWORK" \
 docker run -d --rm --name "$RADIUSD" --network "$NETWORK" \
     -e "DB_DSN=${DSN}" -e "REDIS_ADDR=${REDIS}:6379" \
     -e "RADIUS_SECRET=${RADIUS_SECRET}" \
+    -e "RADIUS_VERIFIER_SECRET=${RADIUS_VERIFIER_SECRET}" \
     -e "LOG_FORMAT=json" -e "LOG_LEVEL=warn" \
     -e "DB_MAX_CONNS=50" \
     isp-bss-radiusd:nfr >/dev/null
@@ -182,7 +192,11 @@ head1 "NFR-PERF-001 — RADIUS auth latency (threshold: p99 <= 15ms)"
 # A single pass/fail at the target rate cannot distinguish "the code is slow"
 # from "this machine cannot offer that rate". Sweeping first establishes where
 # the p99 budget actually holds, which is the number worth recording.
-SWEEP="${RATE_SWEEP:-250,500,1000,2000}"
+# The first sweep row absorbs one bcrypt per distinct subscriber as the
+# fast-verifier cache fills (SUBSCRIBERS cold misses at cost-12, ~280ms each),
+# so its p99 reads high and is not a measure of steady-state auth latency.
+# Later rows and the target-rate run below are the numbers to record.
+SWEEP="${RATE_SWEEP:-1000,2000,3000,5000}"
 SUSTAINED=0
 info "capacity sweep before the target-rate run"
 printf "  %-10s %-12s %-12s %-12s %s\n" "rate" "achieved" "p50" "p99" "verdict"

@@ -90,12 +90,16 @@ func TestHealthRoute(t *testing.T) {
 	}
 }
 
-func TestGetSubscriberNotFound(t *testing.T) {
+// TestGetSubscriber_UnauthenticatedReturns401 verifies the route is behind
+// auth. It does NOT reach GetSubscriber's own not-found handling — that is
+// covered separately (with a valid token) in integration_test.go, since a
+// route can never exercise its own handler logic without first getting past
+// the auth gate this test stops at.
+func TestGetSubscriber_UnauthenticatedReturns401(t *testing.T) {
 	h := newTestHandler()
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux, "test-secret")
 
-	// unauthenticated â€” should get 401
 	req := httptest.NewRequest("GET", "/api/v1/subscribers/404", nil) //nolint:noctx
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -105,7 +109,11 @@ func TestGetSubscriberNotFound(t *testing.T) {
 	}
 }
 
-func TestWalletRechargeValidation(t *testing.T) {
+// TestWalletRecharge_UnauthenticatedReturns401 is the WalletRecharge
+// counterpart to TestGetSubscriber_UnauthenticatedReturns401 — see its
+// comment. The actual amount-validation behavior is covered (with a valid
+// token) in integration_test.go.
+func TestWalletRecharge_UnauthenticatedReturns401(t *testing.T) {
 	h := newTestHandler()
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux, "test-secret")
@@ -118,7 +126,6 @@ func TestWalletRechargeValidation(t *testing.T) {
 	}
 	b, _ := json.Marshal(body)
 	req := httptest.NewRequest("POST", "/api/v1/wallets/recharge", bytes.NewReader(b)) //nolint:noctx
-	// unauthenticated â€” should get 401
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {

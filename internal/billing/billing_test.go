@@ -1,10 +1,13 @@
 package billing_test
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/maaransoft/isp-bss-oss/internal/billing"
 	"github.com/shopspring/decimal"
@@ -83,51 +86,117 @@ func TestValidateRazorpaySignature_ValidSig(t *testing.T) {
 	}
 }
 
-// TestDunningTransition_ValidEdge verifies a permitted state machine transition.
-func TestDunningTransition_ValidEdge(t *testing.T) {
-	// Valid: active → remind_7d
-	validFrom := billing.DunningActive
-	validTo := billing.DunningRemind7d
-	_ = validFrom
-	_ = validTo
-	// If TransitionDunning is called with a DB that returns DunningActive,
-	// and we request DunningRemind7d, it should succeed.
-	// Full integration tested in integration test suite INT-BIL-*.
+// dunningSetCall records one SetSubscriberDunningState invocation.
+type dunningSetCall struct {
+	state  billing.DunningState
+	status string
 }
 
-// TestDunningToSubscriberStatus verifies hard_suspended maps correctly.
-func TestDunningToSubscriberStatus(t *testing.T) {
-	// Test via the exported CalculateGstInvoice function signature (indirect)
-	// Direct table-driven test of dunning state labels
-	cases := []struct {
-		state  billing.DunningState
-		expect string
-	}{
-		{billing.DunningActive, "active"},
-		{billing.DunningGracePeriod, "grace_period"},
-		{billing.DunningSoftSuspended, "soft_suspended"},
-		{billing.DunningHardSuspended, "hard_suspended"},
+// fakeDunningQuerier is a package-level test double for
+// billing.DunningQuerier — no real DB needed to exercise the state machine
+// logic in TransitionDunning itself.
+type fakeDunningQuerier struct {
+	currentState billing.DunningState
+	getErr       error
+	setErr       error
+	setCalls     []dunningSetCall
+}
+
+func (f *fakeDunningQuerier) GetSubscriberDunningState(_ context.Context, _ int) (billing.DunningState, time.Time, error) {
+	if f.getErr != nil {
+		return "", time.Time{}, f.getErr
 	}
-	for _, c := range cases {
-		// validate the const values are what the spec requires
-		switch c.state {
-		case billing.DunningActive:
-			if string(c.state) != "active" {
-				t.Errorf("DunningActive value wrong: %s", c.state)
+	return f.currentState, time.Time{}, nil
+}
+
+func (f *fakeDunningQuerier) SetSubscriberDunningState(_ context.Context, _ int, state billing.DunningState, status string) error {
+	if f.setErr != nil {
+		return f.setErr
+	}
+	f.setCalls = append(f.setCalls, dunningSetCall{state: state, status: status})
+	return nil
+}
+
+// TestDunningTransition_ValidEdge verifies a permitted state machine
+// transition both succeeds and persists the correct target state.
+func TestDunningTransition_ValidEdge(t *testing.T) {
+	fake := &fakeDunningQuerier{currentState: billing.DunningActive}
+
+	if err := billing.TransitionDunning(context.Background(), fake, 1, billing.DunningRemind7d); err != nil {
+		t.Fatalf("TransitionDunning: %v", err)
+	}
+	if len(fake.setCalls) != 1 {
+		t.Fatalf("want 1 SetSubscriberDunningState call, got %d", len(fake.setCalls))
+	}
+	if fake.setCalls[0].state != billing.DunningRemind7d {
+		t.Errorf("state: want %s, got %s", billing.DunningRemind7d, fake.setCalls[0].state)
+	}
+}
+
+// TestDunningTransition_InvalidEdgeRejected verifies a transition with no
+// matching edge in validTransitions is rejected and never persisted —
+// active cannot jump straight to hard_suspended, skipping every reminder
+// and grace stage.
+func TestDunningTransition_InvalidEdgeRejected(t *testing.T) {
+	fake := &fakeDunningQuerier{currentState: billing.DunningActive}
+
+	err := billing.TransitionDunning(context.Background(), fake, 1, billing.DunningHardSuspended)
+	if err == nil {
+		t.Fatal("expected an error for an invalid transition, got nil")
+	}
+	if len(fake.setCalls) != 0 {
+		t.Error("no state change should be persisted for an invalid transition")
+	}
+}
+
+func TestDunningTransition_GetStateErrorPropagates(t *testing.T) {
+	fake := &fakeDunningQuerier{getErr: errors.New("db down")}
+	if err := billing.TransitionDunning(context.Background(), fake, 1, billing.DunningRemind7d); err == nil {
+		t.Fatal("expected the GetSubscriberDunningState error to propagate")
+	}
+}
+
+func TestDunningTransition_SetStateErrorPropagates(t *testing.T) {
+	fake := &fakeDunningQuerier{currentState: billing.DunningActive, setErr: errors.New("db down")}
+	if err := billing.TransitionDunning(context.Background(), fake, 1, billing.DunningRemind7d); err == nil {
+		t.Fatal("expected the SetSubscriberDunningState error to propagate")
+	}
+}
+
+// TestDunningToSubscriberStatus exercises every branch of the unexported
+// dunningToSubscriberStatus mapping — indirectly, through the status
+// TransitionDunning passes to SetSubscriberDunningState, since the mapping
+// function itself is unexported and this package's tests live in
+// billing_test (external), not billing. Covers every edge in
+// validTransitions, so every dunning state this codebase can actually reach
+// is exercised, not just a hand-picked few.
+func TestDunningToSubscriberStatus(t *testing.T) {
+	cases := []struct {
+		from, to   billing.DunningState
+		wantStatus string
+	}{
+		{billing.DunningActive, billing.DunningRemind7d, "active"},
+		{billing.DunningRemind7d, billing.DunningRemind3d, "active"},
+		{billing.DunningRemind3d, billing.DunningRemind1d, "active"},
+		{billing.DunningRemind1d, billing.DunningGracePeriod, "grace_period"},
+		{billing.DunningGracePeriod, billing.DunningSoftSuspended, "soft_suspended"},
+		{billing.DunningSoftSuspended, billing.DunningHardSuspended, "hard_suspended"},
+		{billing.DunningGracePeriod, billing.DunningActive, "active"},
+		{billing.DunningSoftSuspended, billing.DunningActive, "active"},
+		{billing.DunningHardSuspended, billing.DunningActive, "active"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.from)+"->"+string(tc.to), func(t *testing.T) {
+			fake := &fakeDunningQuerier{currentState: tc.from}
+			if err := billing.TransitionDunning(context.Background(), fake, 1, tc.to); err != nil {
+				t.Fatalf("TransitionDunning(%s -> %s): %v", tc.from, tc.to, err)
 			}
-		case billing.DunningGracePeriod:
-			if string(c.state) != "grace_period" {
-				t.Errorf("DunningGracePeriod value wrong: %s", c.state)
+			if len(fake.setCalls) != 1 {
+				t.Fatalf("want 1 SetSubscriberDunningState call, got %d", len(fake.setCalls))
 			}
-		case billing.DunningSoftSuspended:
-			if string(c.state) != "soft_suspended" {
-				t.Errorf("DunningSoftSuspended value wrong: %s", c.state)
+			if fake.setCalls[0].status != tc.wantStatus {
+				t.Errorf("status: want %s, got %s", tc.wantStatus, fake.setCalls[0].status)
 			}
-		case billing.DunningHardSuspended:
-			if string(c.state) != "hard_suspended" {
-				t.Errorf("DunningHardSuspended value wrong: %s", c.state)
-			}
-		}
-		_ = c.expect
+		})
 	}
 }
