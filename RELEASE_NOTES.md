@@ -17,8 +17,8 @@ Server-rendered self-service portal at `/ui`, 14 routes:
 | Area | Capability |
 |---|---|
 | Auth | Login / logout, session cookies, CSRF-protected forms |
-| Dashboard | Account status and live session state |
-| Usage | Consumption against the FUP quota |
+| Dashboard | Account status, wallet balance, and live session usage against quota |
+| Usage | Per-session history with volumes and durations |
 | Invoices | Invoice history and PDF download (Gotenberg) |
 | Renewal | Plan renewal via Razorpay, idempotent on `transaction_token` |
 | Support | Ticket raising and notification history |
@@ -81,6 +81,18 @@ All four critical findings from the opening audit are closed. Full detail in
 
 Reproduce with `./scripts/run_nfr_tests.sh` and `./scripts/verify_tls.sh`.
 
+## Trying the portal
+
+`./scripts/demo_up.sh` brings the whole stack up and seeds a demo account,
+then the portal is at `https://localhost/ui/login` — sign in as `test_user`
+with password `testpassword`. The browser will warn about the certificate,
+because the demo issues its own rather than buying a public one.
+
+The seed includes four past sessions and one live session, so the Dashboard
+and Usage screens show real figures rather than empty states. Usage sits at
+67% of quota — deliberately under the 80% mark that triggers a FUP warning,
+so nothing fires a notification nobody asked for.
+
 ## Security
 
 - Least-privilege `bss_app` Postgres role; LEA audit log genuinely append-only
@@ -111,6 +123,15 @@ defect that changing the timing target does not address.
 exists and is validated end to end on a 90-second run (9,000 requests, 0
 errors, goroutines and file descriptors flat), but 90 seconds is not evidence
 about an hour.
+
+**Renewal payments cannot be completed.** The Renew screen reports "Payment
+gateway is not configured" until `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET`
+are supplied. The screen and the form work; only the payment round trip is
+unavailable. Testers should log this as *blocked*, not failed.
+
+**There is no staff or admin web interface.** The portal is subscriber-facing
+only; staff operations (creating subscribers, issuing invoices, running
+reports) are available through the JSON API at `/api/v1/*` and have no screen.
 
 **Test coverage 60.4% against an 80% target.** `pkg/crypto` (93.5%) and
 `internal/middleware` (98.2%) meet their stricter 90% requirement. The
