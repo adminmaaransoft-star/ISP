@@ -498,22 +498,122 @@ func TestUpdateSubscriber_RequiresAdminRole(t *testing.T) {
 	}
 }
 
-func TestGetSubscriberHealth_NotImplemented(t *testing.T) {
+// itHealthProbe is a stand-in for internal/health's handler, which cannot be
+// imported here without an import cycle. It records whether it was reached, so
+// the tests below can tell "the request got through authorisation" apart from
+// "the request was answered by the placeholder".
+type itHealthProbe struct{ served bool }
+
+func (p *itHealthProbe) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	p.served = true
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"subscriber_id":1,"assigned_ip":"100.64.0.7"}`))
+}
+
+func itHealthMux(t *testing.T, probe http.Handler) *http.ServeMux {
+	t.Helper()
 	h := api.NewHandler(api.HandlerDeps{
-		DB: &itSubscriberStore{}, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}), KeyStore: itKeyStore(t, "v1", "v1"),
+		DB: &itSubscriberStore{}, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}),
+		KeyStore: itKeyStore(t, "v1", "v1"), Health: probe,
 	})
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux, itJWTSecret)
+	return mux
+}
+
+// TestFR_OBS_004_SubscriberHealth_ServedToStaff verifies the endpoint actually
+// answers rather than reporting itself unimplemented. It returned 501 until
+// 2026-08-10 while the working implementation sat on an undocumented route.
+func TestFR_OBS_004_SubscriberHealth_ServedToStaff(t *testing.T) {
+	probe := &itHealthProbe{}
+	mux := itHealthMux(t, probe)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/subscribers/1/health", nil) //nolint:noctx
 	req.Header.Set("Authorization", "Bearer "+itStaffToken(t, "technician"))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
-	// api.Handler only reserves this route; the real implementation is bound
-	// over it separately in cmd/api/main.go via health.Handler.
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("want 501 (route is a placeholder), got %d — %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", rec.Code, rec.Body.String())
+	}
+	if !probe.served {
+		t.Error("the request never reached the health implementation")
+	}
+}
+
+// TestFR_OBS_004_SubscriberHealth_RequiresAuth is the regression test for the
+// defect this endpoint actually shipped with: the real implementation was
+// registered straight onto the mux in cmd/api/main.go, after RegisterRoutes and
+// therefore outside its middleware, on an undocumented path. It answered 200
+// with the subscriber's username, wallet balance, session and assigned IP to
+// anyone who asked, with no token — the same IP-to-subscriber correlation that
+// lea_audit_log exists to keep access-controlled and auditable.
+//
+// The assertion that matters is not the status code but probe.served: a 401
+// that still ran the handler would mean the body had already been disclosed.
+func TestFR_OBS_004_SubscriberHealth_RequiresAuth(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		header string
+	}{
+		{"no Authorization header", ""},
+		{"malformed header", "Bearer not-a-jwt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := &itHealthProbe{}
+			mux := itHealthMux(t, probe)
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/subscribers/1/health", nil) //nolint:noctx
+			if tc.header != "" {
+				req.Header.Set("Authorization", tc.header)
+			}
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("want 401, got %d", rec.Code)
+			}
+			if probe.served {
+				t.Error("the health implementation ran for an unauthenticated request — subscriber data was disclosed")
+			}
+		})
+	}
+}
+
+// TestFR_OBS_004_SubscriberHealth_RejectsSubscriberRole — a subscriber token is
+// a valid JWT, so authentication alone does not make this endpoint safe. It is
+// a staff diagnostic and must refuse the subscriber role outright, otherwise
+// any signed-in customer could read every other customer's session and IP.
+func TestFR_OBS_004_SubscriberHealth_RejectsSubscriberRole(t *testing.T) {
+	probe := &itHealthProbe{}
+	mux := itHealthMux(t, probe)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/subscribers/1/health", nil) //nolint:noctx
+	req.Header.Set("Authorization", "Bearer "+itStaffToken(t, "subscriber"))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("want 403 for a subscriber token, got %d", rec.Code)
+	}
+	if probe.served {
+		t.Error("the health implementation ran for a subscriber token")
+	}
+}
+
+// TestFR_OBS_004_SubscriberHealth_UnconfiguredReturns503 covers the deployment
+// that has not wired the health package: the route must degrade like every
+// other optional dependency here rather than panicking on a nil handler.
+func TestFR_OBS_004_SubscriberHealth_UnconfiguredReturns503(t *testing.T) {
+	mux := itHealthMux(t, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/subscribers/1/health", nil) //nolint:noctx
+	req.Header.Set("Authorization", "Bearer "+itStaffToken(t, "technician"))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503 when unconfigured, got %d", rec.Code)
 	}
 }
 

@@ -82,6 +82,7 @@ type Handler struct {
 	tickets    TicketAdminQuerier
 	lea        LEAQuerier
 	leaAudit   LEAAuditRecorder
+	health     http.Handler
 
 	razorpayWebhookSecret string
 }
@@ -113,6 +114,17 @@ type HandlerDeps struct {
 	LEA        LEAQuerier
 	LEAAudit   LEAAuditRecorder
 
+	// Health serves GET /api/v1/subscribers/{id}/health (FR-OBS-004). The
+	// implementation lives in internal/health, which cannot be imported here
+	// without a cycle, so it is injected as a plain http.Handler and served
+	// through this package's staff-read authorisation like any other route.
+	//
+	// It must be passed here rather than registered directly on the mux by the
+	// caller: a route added to the mux afterwards carries no middleware, and
+	// binding it that way once left full subscriber diagnostics — including the
+	// assigned IP address — readable with no token at all.
+	Health http.Handler
+
 	RazorpayWebhookSecret string
 }
 
@@ -133,6 +145,7 @@ func NewHandler(deps HandlerDeps) *Handler {
 		tickets:    deps.Tickets,
 		lea:        deps.LEA,
 		leaAudit:   deps.LEAAudit,
+		health:     deps.Health,
 
 		razorpayWebhookSecret: deps.RazorpayWebhookSecret,
 	}
@@ -322,9 +335,19 @@ func (h *Handler) UpdateSubscriber(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, updated)
 }
 
-// GetSubscriberHealth handles GET /api/v1/subscribers/{id}/health — implemented in health package.
+// GetSubscriberHealth handles GET /api/v1/subscribers/{id}/health (FR-OBS-004).
+//
+// The response body is assembled by internal/health; this method exists so the
+// route is registered — and therefore authorised — in one place with the rest
+// of the API surface. 503 rather than 501 when unconfigured, matching every
+// other optional dependency here: the endpoint exists, its backing collaborator
+// is absent.
 func (h *Handler) GetSubscriberHealth(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "delegate to health.Handler.GetSubscriberHealth", http.StatusNotImplemented)
+	if h.health == nil {
+		http.Error(w, "subscriber health is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	h.health.ServeHTTP(w, r)
 }
 
 // ── Wallets ──────────────────────────────────────────────────────────────────

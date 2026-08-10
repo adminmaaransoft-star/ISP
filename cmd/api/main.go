@@ -117,6 +117,11 @@ func run() error {
 
 	walletSvc := billing.NewWalletService(database.Billing())
 
+	// Built before the API handler so it can be passed in as a dependency:
+	// registering it on the mux afterwards would place it outside the API's
+	// authorisation middleware.
+	healthHandler := health.NewHandler(database.Health(), sessions)
+
 	apiHandler := api.NewHandler(api.HandlerDeps{
 		DB:       database.API(),
 		KYC:      database.API(),
@@ -132,10 +137,10 @@ func run() error {
 		Tickets:    database.Tickets(),
 		LEA:        database.FUP(),
 		LEAAudit:   database.FUP(),
+		Health:     http.HandlerFunc(healthHandler.GetSubscriberHealth),
 
 		RazorpayWebhookSecret: cfg.RazorpayWebhookSecret,
 	})
-	healthHandler := health.NewHandler(database.Health(), sessions)
 
 	portalHandler := portal.NewHandler(
 		database.Portal(),
@@ -166,10 +171,6 @@ func run() error {
 	apiHandler.RegisterRoutes(mux, cfg.JWTSecret)
 	portalHandler.RegisterRoutes(mux)
 	portalUIHandler.RegisterRoutes(mux)
-
-	// The subscriber health endpoint lives in its own package; api.Handler only
-	// reserves the route, so bind the real implementation over it here.
-	mux.HandleFunc("GET /api/v1/subscribers/{id}/health-detail", healthHandler.GetSubscriberHealth)
 
 	// Meta delivery callbacks: GET is the subscription handshake, POST carries
 	// delivery statuses. Both are HMAC- or token-verified, never JWT.
