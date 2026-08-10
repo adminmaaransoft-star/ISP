@@ -1,7 +1,7 @@
 # Definition of Done — Status Report
 
 **Original audit:** 2026-08-08
-**Last revised:** 2026-08-10 (post-remediation, through commit `cb1d2bf`)
+**Last revised:** 2026-08-10 (post-remediation, through commit `297d3bb`)
 **Scope:** Whole-codebase audit against the 66-item DoD checklist in `bss_oss_dev_tracker_v3.xlsx` → sheet "✅ Definition of Done" (levels L0–L8).
 **Methodology:** Every check below was either (a) executed live against this repo/a real Postgres instance/the running demo stack, or (b) verified by direct code/config inspection with exact file:line evidence. Checks that genuinely require infrastructure not available are marked **NOT VERIFIED**, not silently assumed passing. See "Methodology & Limitations" at the end.
 
@@ -11,13 +11,13 @@ Of the 66 rows in the tracker, **65 carry an actual check**; row `L0-011` is an 
 
 | Result | Count | % of 65 | Was (2026-08-08) |
 |---|---|---|---|
-| ✅ PASS | 49 | 75% | 41 |
-| ❌ FAIL | 6 | 9% | 14 |
+| ✅ PASS | 50 | 77% | 41 |
+| ❌ FAIL | 5 | 8% | 14 |
 | 🟡 PARTIAL (spot-checked, not exhaustive) | 4 | 6% | 2 |
 | ⬜ NOT VERIFIED (needs infrastructure not available) | 2 | 3% | 4 |
 | ⬜ PENDING (manual tracker administration) | 4 | 6% | 4 |
 
-**All four of the original audit's critical findings are now closed**, and the entire L6 performance block is either measured-passing or explicitly scoped out. The six remaining failures are concentrated in test-process conventions (TDD commit ordering, `TestFR_` naming) and one coverage shortfall — not in functional or security correctness.
+**All four of the original audit's critical findings are now closed**, and the entire L6 performance block is either measured-passing or explicitly scoped out. The five remaining failures are concentrated in test-process conventions (TDD commit ordering, `TestFR_` naming) and one coverage shortfall — not in functional or security correctness.
 
 ### What changed since the original audit
 
@@ -30,7 +30,9 @@ Of the 66 rows in the tracker, **65 carry an actual check**; row `L0-011` is an 
 | L6-002 | API p99 ≤200ms @ 500 concurrent | ⬜ NOT VERIFIED | ✅ PASS | **Measured: p99 11.69ms** at 500 VUs |
 | L6-003 | Unbilled report ≤60s for 20k subscribers | ⬜ NOT VERIFIED | ✅ PASS | **Measured: 9.716ms** at 20,000 subscribers |
 | L7-003 | `go.mod`/`go.sum` committed | ❌ FAIL | ✅ PASS | Commit `ae75ee4` |
-| L0-010 / L7-001 | Conventional commit format | ❌ FAIL | 🟡 PARTIAL | 4 of 5 commits conform; the docs-only root commit predates the convention |
+| L0-010 / L7-001 | Conventional commit format | ❌ FAIL | 🟡 PARTIAL | 6 of 7 commits conform; the docs-only root commit predates the convention |
+| L0-009 | Pre-commit PII hook fires | ❌ FAIL | ✅ PASS | Installed and verified blocking a real commit (2026-08-10) |
+| L8-001..004 | Tracker Status / Notes populated | ⬜ PENDING | ⬜ PENDING (data now committed) | 96 tasks marked Done are now in git (commit `297d3bb`); NFR-PERF-001 corrected FAIL → PASS |
 
 ## Critical Findings (read this part first)
 
@@ -109,7 +111,7 @@ That reads as "RADIUS authentication is catastrophically slow." The daemon was n
 | L0-006 | `golangci-lint` clean | ✅ PASS | Fresh run this audit: "0 issues." |
 | L0-007 | No float64 for money | ✅ PASS | Literal grep (`float64\|math.Round\|Sprintf.*%.2f`) across all of `internal/`, `pkg/`, `cmd/`: 8 hits, all inspected — Prometheus metrics, percentage fields (`PctUsed`), latency histogram buckets, a load-test CLI's error-rate calc, and two comments *documenting* the no-float64-for-money rule. Zero money usage. |
 | L0-008 | No plaintext PII in log statements | ✅ PASS | Grep for aadhaar/pan/mobile_number piped through `log\.`: zero matches. |
-| L0-009 | Pre-commit hook passes on staged files | ❌ FAIL | `.githooks/pre-commit` exists and is well-written (verified it runs clean standalone), but is **not installed** — `.git/hooks/pre-commit` does not exist and `core.hooksPath` is unset. It would not fire on a real `git commit` today. One-line fix: `./scripts/install-hooks.sh`. |
+| L0-009 | Pre-commit hook passes on staged files | ✅ PASS | Installed 2026-08-10 via `./scripts/install-hooks.sh`. Verified two ways rather than assumed: `scripts/int_pii_001_precommit_hook.sh` passes all 8 sandbox cases (blocks raw aadhaar/pan/mobile/password in log calls, permits `*_encrypted`/`*_hash` and non-Go files), **and** a deliberate violation staged in this repo was blocked by the installed hook on a real `git commit`, leaving `HEAD` unmoved. |
 | L0-010 | Conventional commit format | 🟡 PARTIAL | 4 of the 5 commits now conform (`feat:`, `fix:`, `feat:`, `test:`). The sole exception is the original docs-only root commit `9d47cb6 "first commit"`, which predates the convention and cannot be reworded without rewriting published history. Every commit containing code conforms. |
 
 ## L1 · DB Migration (9 checks)
@@ -214,25 +216,24 @@ All L6 rows below were run at the levels the DoD itself specifies, against 20,00
 
 | ID | Check | Result | Evidence |
 |---|---|---|---|
-| L8-001 | Tracker Status column = Done | ⬜ PENDING | Manual tracker administration — outside code-audit scope. None of this session's Portal UI work (or anything else) has been marked in the tracker's module sheets yet. |
-| L8-002 | All prerequisite tasks also Done | ⬜ PENDING | Same — depends on L8-001 first. |
-| L8-003 | Notes column documents deviations | ⬜ PENDING | Same. |
-| L8-004 | Matching INT-* row marked Done in Integration Tests sheet | ⬜ PENDING | Same. |
+| L8-001 | Tracker Status column = Done | ⬜ PENDING | **Materially advanced.** The tracker now carries 96 tasks marked Done (vs 103 all-Todo in the previously committed copy), and that work is finally in git as of commit `297d3bb` — it had been sitting uncommitted in the working tree for the whole engagement. Still PENDING because 5 rows remain Todo and no row-by-row reconciliation against this report has been done. |
+| L8-002 | All prerequisite tasks also Done | ⬜ PENDING | Not audited row-by-row; depends on L8-001's remaining 5. |
+| L8-003 | Notes column documents deviations | ⬜ PENDING | Partially satisfied in practice — the NFR sheet carries substantive verification notes, and NFR-PERF-001's was rewritten to record how the bcrypt/cost-12 spec conflict was actually resolved. Not audited across all module sheets. |
+| L8-004 | Matching INT-* row marked Done in Integration Tests sheet | ⬜ PENDING | The Integration Tests sheet has the largest volume of uncommitted-until-now edits (68 changed lines); not reconciled against the INT-* rows in this report. |
 
 ---
 
 ## Gaps Requiring Explicit Attention — Ranked by Priority
 
-Items 1, 2, 4 and 6 from the original 2026-08-08 list are closed; see the resolution notes in Critical Findings. What remains:
+Items 1, 2, 3, 4 and 6 from the original 2026-08-08 list are closed; see the resolution notes in Critical Findings. What remains:
 
-1. **Install the pre-commit hook** (L0-009). Still the cheapest open item and still not done: `.githooks/pre-commit` exists and runs clean standalone, but `core.hooksPath` is unset and `.git/hooks/pre-commit` does not exist, so the PII-leak guard does not fire on a real commit. One command: `./scripts/install-hooks.sh`. Left undone deliberately — it changes how every future commit on this machine behaves, which is the user's call, not a side effect of a test run.
-2. **Test coverage below the ≥80% general bar** (L2-002) — 58.7% overall. The stricter ≥90% crypto/middleware requirement now passes (93.5% / 98.2%). The remaining shortfall is concentrated in `cmd/api` (5.3%), `internal/cache` (47.7%) and `internal/radius` (61.0%). Note that `internal/radius` is now security-relevant in a way it was not before: the fast-verifier cache is on the auth path, so that package is the highest-value coverage target of the three.
-3. **Redis Sentinel failover timing** (L6-004) — needs the full Sentinel stack stood up and a master killed under load. The config is verified correct; the 3-second recovery claim is not measured.
-4. **Goroutine-leak soak test** (L6-005) — needs an hour of sustained load at 20k sessions plus `pprof` sampling. Nothing structural blocks it; it is purely a time cost, and `run_nfr_tests.sh` already builds the stack it would need.
-5. **FR-traceable test naming** (L2-001) — a documentation/process convention, not a functional gap. Tests exist and pass; they just aren't named `TestFR_{ID}_...` the way the tracker's own verification command expects.
-6. **Dispatch-latency E2E test** (L5-008) — no test measures dequeue → `sent_at` against the 5s budget.
-7. **TDD commit ordering** (L0-001, L0-002) — permanently unachievable for existing code, since red-phase commits cannot be reconstructed after the fact. Worth deciding whether to enforce going forward or mark N/A in the tracker, rather than leaving it as a standing failure.
-8. **Tracker administration** (all of L8) — the spreadsheet's own Status/Notes columns are still unpopulated. See the last bullet under Methodology.
+1. **Test coverage below the ≥80% general bar** (L2-002) — 58.7% overall. The stricter ≥90% crypto/middleware requirement now passes (93.5% / 98.2%). The remaining shortfall is concentrated in `cmd/api` (5.3%), `internal/cache` (47.7%) and `internal/radius` (61.0%). Note that `internal/radius` is now security-relevant in a way it was not before: the fast-verifier cache is on the auth path, so that package is the highest-value coverage target of the three.
+2. **Redis Sentinel failover timing** (L6-004) — needs the full Sentinel stack stood up and a master killed under load. The config is verified correct; the 3-second recovery claim is not measured.
+3. **Goroutine-leak soak test** (L6-005) — needs an hour of sustained load at 20k sessions plus `pprof` sampling. Nothing structural blocks it; it is purely a time cost, and `run_nfr_tests.sh` already builds the stack it would need.
+4. **FR-traceable test naming** (L2-001) — a documentation/process convention, not a functional gap. Tests exist and pass; they just aren't named `TestFR_{ID}_...` the way the tracker's own verification command expects.
+5. **Dispatch-latency E2E test** (L5-008) — no test measures dequeue → `sent_at` against the 5s budget.
+6. **TDD commit ordering** (L0-001, L0-002) — permanently unachievable for existing code, since red-phase commits cannot be reconstructed after the fact. Worth deciding whether to enforce going forward or mark N/A in the tracker, rather than leaving it as a standing failure.
+7. **Tracker administration** (all of L8) — the spreadsheet's own Status/Notes columns are still unpopulated. See the last bullet under Methodology.
 
 ## Methodology & Limitations
 
