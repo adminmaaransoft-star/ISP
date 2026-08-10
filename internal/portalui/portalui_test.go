@@ -358,7 +358,7 @@ func TestDashboard_Unauthenticated_RedirectsToLogin(t *testing.T) {
 	}
 }
 
-func TestDashboard_Authenticated_RendersProfileAndSession(t *testing.T) {
+func TestFR_SUB_002_Dashboard_RendersPlanExpiryBalanceAndSession(t *testing.T) {
 	mux := newTestMux(t, &stubSessionsOnline{}, &stubSessionHistory{})
 	got := loginAndGetCookie(t, mux, "testuser", "testpass")
 	if got.Cookie == nil {
@@ -786,7 +786,7 @@ func TestTickets_Unauthenticated_RedirectsToLogin(t *testing.T) {
 	}
 }
 
-func TestTickets_Authenticated_ListsTickets(t *testing.T) {
+func TestFR_SUB_004_Tickets_ListsSubscribersOwnTickets(t *testing.T) {
 	deps := baseTestDeps()
 	deps.Tickets = &stubTickets{entries: []portal.TicketEntry{
 		{ID: 1, Category: "connectivity", Description: "No internet since morning", Status: "open", CreatedAt: time.Date(2026, 1, 10, 9, 0, 0, 0, time.UTC)},
@@ -814,7 +814,7 @@ func TestTickets_NoTickets_ShowsEmptyState(t *testing.T) {
 	}
 }
 
-func TestCreateTicket_ValidRequest_AddsTicketAndReturnsFragment(t *testing.T) {
+func TestFR_SUB_004_CreateTicket_AddsAndReturnsFragment(t *testing.T) {
 	stub := &stubTickets{}
 	deps := baseTestDeps()
 	deps.Tickets = stub

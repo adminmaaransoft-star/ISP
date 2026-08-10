@@ -42,11 +42,11 @@ func TestNewInvoicePDFClient(t *testing.T) {
 	}
 }
 
-// TestGeneratePDF_Success verifies GeneratePDF sends a multipart form to
+// TestFR_BIL_007_GeneratePDF_IncludesPlainLanguageUsageSummary verifies GeneratePDF sends a multipart form to
 // Gotenberg's convert endpoint containing the rendered invoice HTML (proving
 // the unexported renderInvoiceHTML worked — it has no exported entry point
 // of its own), and returns exactly the bytes Gotenberg responds with.
-func TestGeneratePDF_Success(t *testing.T) {
+func TestFR_BIL_007_GeneratePDF_IncludesPlainLanguageUsageSummary(t *testing.T) {
 	const fakePDFBytes = "%PDF-1.4 fake gotenberg output"
 	var gotPath, gotContentType string
 	var gotBody []byte

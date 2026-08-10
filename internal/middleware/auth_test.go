@@ -259,11 +259,11 @@ func withCapturedLog(t *testing.T, buf *bytes.Buffer) {
 	t.Cleanup(func() { log.Logger = orig })
 }
 
-// TestAudit_EmitsStructuredLogLine verifies Audit's log line carries actor
+// TestFR_OBS_002_Audit_EmitsStructuredJSONLogLine verifies Audit's log line carries actor
 // identity/role (from context), the action/target the caller passed, a
 // non-empty correlation_id, and the detail map — the full SecD §9.3 audit
 // record shape.
-func TestAudit_EmitsStructuredLogLine(t *testing.T) {
+func TestFR_OBS_002_Audit_EmitsStructuredJSONLogLine(t *testing.T) {
 	var buf bytes.Buffer
 	withCapturedLog(t, &buf)
 
