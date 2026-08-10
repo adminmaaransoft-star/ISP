@@ -146,7 +146,43 @@ if ! docker compose exec -T -e PGPASSWORD="${DB_SECURE_PASSWORD}" postgres_prima
     cat /tmp/seed_out.txt
     exit 1
 fi
-pass "demo data seeded (2 subscribers, 3 plans, 1 invoice)"
+pass "demo data seeded (2 subscribers, 3 plans, 1 invoice, 4 past sessions)"
+
+# ── Live session for the dashboard ───────────────────────────────────────────
+#
+# The dashboard's "Live Usage" panel reads the active session from Redis, not
+# PostgreSQL, so seeding the database alone leaves it showing "you appear to be
+# offline". A real session only appears when a router actually authenticates,
+# which a demo box has no way to do — so one is written here directly.
+#
+# This is demo scaffolding, not a fixture the application depends on: nothing
+# reads it except the dashboard, and it disappears on its own. The usage figure
+# is deliberately set to 67% of the plan quota — high enough that the panel
+# shows a meaningful bar, below the 80% mark that would trigger a genuine FUP
+# warning and hand testers a notification nobody sent on purpose.
+#
+# The TTL is 24h rather than the 30 minutes the application uses. In
+# production a shorter window is the point: a record older than that belongs to
+# a session whose stop message was lost. Here the only goal is that the panel
+# still has something to show when someone opens the demo tomorrow.
+SUB_ID=$(docker compose exec -T -e PGPASSWORD="${DB_SECURE_PASSWORD}" postgres_primary \
+    psql -U postgres -d isp_bss_oss -tAc \
+    "SELECT id FROM subscribers WHERE username='test_user';" 2>/dev/null | tr -d '[:space:]')
+
+if [ -n "$SUB_ID" ]; then
+    SESSION_JSON=$(printf '{"session_id":"demo-live-001","subscriber_id":%s,"nas_ip":"10.10.0.1","assigned_ip":"100.64.0.7","bytes_in":1800000000000,"bytes_out":600000000000,"bytes_total":3543348019200,"speed_profile":"100M/100M","fup_throttled":false,"started_at":"%s"}' \
+        "$SUB_ID" "$(date -u -d '3 hours ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')")
+
+    if docker compose exec -T redis_primary \
+            redis-cli SET "session:active:${SUB_ID}" "$SESSION_JSON" EX 86400 >/dev/null 2>&1; then
+        pass "live session seeded for test_user (dashboard shows 67% of quota used)"
+    else
+        # Not fatal: everything except one dashboard panel still works.
+        info "could not seed the live session — the dashboard will show the offline state"
+    fi
+else
+    info "test_user not found; skipping the live session"
+fi
 
 # ── Application services ─────────────────────────────────────────────────────
 

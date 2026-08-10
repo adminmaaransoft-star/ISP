@@ -70,6 +70,42 @@ WHERE s.username = 'test_user'
 ORDER BY g.id LIMIT 1
 ON CONFLICT DO NOTHING;
 
+-- ── Past sessions, so the Usage page has something to show ───────────────────
+--
+-- Without these the portal's Usage page renders its "no session history yet"
+-- empty state, which is correct but leaves testers unable to judge the screen
+-- that matters most to a subscriber. Four closed sessions give the page a
+-- realistic shape: a long overnight session, two short ones, and yesterday's.
+--
+-- start_time is clamped into the current month on purpose. This table is
+-- RANGE-partitioned by start_time and migration 011 creates the current month
+-- plus three future ones — a row dated into last month would fail to route to
+-- any partition and take the whole seed down with it on the 1st or 2nd of a
+-- month.
+INSERT INTO subscriber_session_history (
+    subscriber_id, session_id, nas_ip_address, assigned_ipv4,
+    start_time, stop_time, input_octets, output_octets, terminate_cause
+)
+SELECT
+    s.id,
+    'demo-sess-' || v.n,
+    '10.10.0.1'::inet,
+    ('100.64.0.' || (10 + v.n))::inet,
+    GREATEST(date_trunc('month', NOW()) + INTERVAL '1 hour', NOW() - (v.days_ago * INTERVAL '1 day')),
+    GREATEST(date_trunc('month', NOW()) + INTERVAL '1 hour', NOW() - (v.days_ago * INTERVAL '1 day')) + (v.hours * INTERVAL '1 hour'),
+    v.in_octets,
+    v.out_octets,
+    'User-Request'
+FROM subscribers s
+CROSS JOIN (VALUES
+    (1, 6, 9,  412000000000::bigint, 138000000000::bigint),
+    (2, 4, 3,   96000000000::bigint,  31000000000::bigint),
+    (3, 3, 2,   54000000000::bigint,  18000000000::bigint),
+    (4, 1, 7,  301000000000::bigint,  99000000000::bigint)
+) AS v(n, days_ago, hours, in_octets, out_octets)
+WHERE s.username = 'test_user'
+ON CONFLICT DO NOTHING;
+
 -- ── Verify seed counts ────────────────────────────────────────────────────────
 SELECT 'plans'                  AS table_name, COUNT(*) AS row_count FROM plans
 UNION ALL
@@ -81,4 +117,6 @@ SELECT 'notification_templates', COUNT(*) FROM notification_templates
 UNION ALL
 SELECT 'wallet_ledgers',         COUNT(*) FROM wallet_ledgers
 UNION ALL
-SELECT 'invoices',               COUNT(*) FROM invoices;
+SELECT 'invoices',               COUNT(*) FROM invoices
+UNION ALL
+SELECT 'session_history',        COUNT(*) FROM subscriber_session_history;
