@@ -30,3 +30,9 @@ Thumbs.db
 # Key material
 config/keys/*.json
 config/keys/*.pem
+
+# Playwright E2E (browsers and run artefacts are large and machine-specific)
+node_modules/
+e2e/test-results/
+e2e/playwright-report/
+e2e/.cache/

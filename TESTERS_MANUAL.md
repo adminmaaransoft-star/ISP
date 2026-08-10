@@ -217,7 +217,46 @@ if you are validating the compliance story.
 
 ---
 
-## 5. Reporting findings
+## 5. Automated browser tests
+
+The Go suite covers handlers but never renders anything. The Playwright suite
+covers the half that only exists in a browser: that the template produced
+readable markup, that the form posts what the handler expects, that the session
+cookie survives navigation, and that HTMX swapped a fragment in rather than
+replacing the page.
+
+```bash
+./scripts/demo_up.sh          # the suite runs against a stack already up
+npm install
+npx playwright install chromium
+npm run test:e2e
+```
+
+15 tests, about 23 seconds. `npm run test:e2e:headed` watches it drive a real
+browser; `npm run test:e2e:report` opens the HTML report after a run.
+
+| Area | Covered |
+|---|---|
+| Authentication | Form renders, valid sign-in, wrong password, all six pages redirect when signed out, logout ends the session |
+| Dashboard | Plan, balance, status and live usage figures; navigation to every section |
+| Invoices | List with amounts, PDF download verified by magic bytes, another subscriber's invoice refused |
+| Tickets | Submission appears via HTMX swap, missing CSRF token refused, wrong CSRF token refused |
+| Renewal | Form renders and degrades readably when the gateway is unconfigured |
+
+The suite runs against a stack you started, not one it starts itself — bringing
+up PostgreSQL, three Sentinels, RADIUS and the API takes minutes and reseeds
+the database, so owning that lifecycle would make the suite slow and would
+discard whatever state you were looking at.
+
+Two things it asserts that a weaker test would miss: the PDF check reads the
+`%PDF-` magic bytes rather than the status code, because a 200 carrying an HTML
+error page would satisfy a status assertion; and the wrong-password test
+asserts the page does **not** say which field was wrong, since naming it would
+turn the login form into an account enumerator.
+
+---
+
+## 6. Reporting findings
 
 Three things make a report actionable: **which page or endpoint**, **what you
 did**, and **what you saw instead of what this manual says to expect**. A

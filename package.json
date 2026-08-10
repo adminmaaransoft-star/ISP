@@ -1,0 +1,14 @@
+{
+  "name": "isp-bss-oss-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser end-to-end tests for the subscriber portal. The Go suite covers handlers; these cover what only a real browser can: rendered HTML, form submission, cookies and HTMX fragment swaps.",
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed",
+    "test:e2e:report": "playwright show-report e2e/playwright-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}
