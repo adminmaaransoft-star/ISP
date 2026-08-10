@@ -1,7 +1,7 @@
 # Definition of Done — Status Report
 
 **Original audit:** 2026-08-08
-**Last revised:** 2026-08-10 (post-remediation, through commit `297d3bb`)
+**Last revised:** 2026-08-10 (post-remediation, through commit `b426550`)
 **Scope:** Whole-codebase audit against the 66-item DoD checklist in `bss_oss_dev_tracker_v3.xlsx` → sheet "✅ Definition of Done" (levels L0–L8).
 **Methodology:** Every check below was either (a) executed live against this repo/a real Postgres instance/the running demo stack, or (b) verified by direct code/config inspection with exact file:line evidence. Checks that genuinely require infrastructure not available are marked **NOT VERIFIED**, not silently assumed passing. See "Methodology & Limitations" at the end.
 
@@ -11,13 +11,13 @@ Of the 66 rows in the tracker, **65 carry an actual check**; row `L0-011` is an 
 
 | Result | Count | % of 65 | Was (2026-08-08) |
 |---|---|---|---|
-| ✅ PASS | 50 | 77% | 41 |
-| ❌ FAIL | 5 | 8% | 14 |
+| ✅ PASS | 52 | 80% | 41 |
+| ❌ FAIL | 4 | 6% | 14 |
 | 🟡 PARTIAL (spot-checked, not exhaustive) | 4 | 6% | 2 |
-| ⬜ NOT VERIFIED (needs infrastructure not available) | 2 | 3% | 4 |
+| ⬜ NOT VERIFIED (needs infrastructure not available) | 1 | 2% | 4 |
 | ⬜ PENDING (manual tracker administration) | 4 | 6% | 4 |
 
-**All four of the original audit's critical findings are now closed**, and the entire L6 performance block is either measured-passing or explicitly scoped out. The five remaining failures are concentrated in test-process conventions (TDD commit ordering, `TestFR_` naming) and one coverage shortfall — not in functional or security correctness.
+**All four of the original audit's critical findings are now closed**, and every L6 row except the 1-hour soak has been measured rather than assumed. The four remaining failures are two permanently-unachievable TDD-ordering rows, one coverage shortfall, and one newly-measured infrastructure gap (Sentinel failover, Finding #6) — none in functional or security correctness.
 
 ### What changed since the original audit
 
@@ -32,14 +32,19 @@ Of the 66 rows in the tracker, **65 carry an actual check**; row `L0-011` is an 
 | L7-003 | `go.mod`/`go.sum` committed | ❌ FAIL | ✅ PASS | Commit `ae75ee4` |
 | L0-010 / L7-001 | Conventional commit format | ❌ FAIL | 🟡 PARTIAL | 6 of 7 commits conform; the docs-only root commit predates the convention |
 | L0-009 | Pre-commit PII hook fires | ❌ FAIL | ✅ PASS | Installed and verified blocking a real commit (2026-08-10) |
+| L2-001 | FR-traceable test names | ❌ FAIL | ✅ PASS | 102 tests renamed, all 30 FR IDs covered (commit `ac3ef26`) |
+| L5-008 | Dispatch latency ≤5s | ❌ FAIL | ✅ PASS | **Measured: 1.011s idle, 92ms worst case under backlog** |
+| L6-004 | Sentinel failover ≤3s | ⬜ NOT VERIFIED | ❌ **FAIL** | **Measured: 4955ms election, 7032ms auth recovery** — see Finding #6 |
+| L6-005 | No goroutine leak after 1h | ⬜ NOT VERIFIED | ⬜ NOT VERIFIED | Harness built and validated on 90s; the 1-hour hold has not been run |
 | L8-001..004 | Tracker Status / Notes populated | ⬜ PENDING | ⬜ PENDING (data now committed) | 96 tasks marked Done are now in git (commit `297d3bb`); NFR-PERF-001 corrected FAIL → PASS |
 
 ## Critical Findings (read this part first)
 
-> **All four findings below are RESOLVED as of 2026-08-10.** They are kept in
-> full rather than deleted, because each one records a real defect that was
-> live in this codebase, and the resolution notes are only meaningful next to
-> the original diagnosis. Each carries a ✅ **Resolved** note at its end.
+> **Findings 1-5 are RESOLVED as of 2026-08-10; Finding 6 is OPEN.** They are
+> kept in full rather than deleted, because each records a real defect that was
+> live in this codebase, and a resolution note is only meaningful next to the
+> diagnosis it resolves. Each resolved finding carries a ✅ **Resolved** note at
+> its end.
 
 ### 1. Nothing has ever been committed to git except documentation
 `git log` shows exactly one commit, `9d47cb6 "first commit"`, containing only `README.txt`, the three tracker `.xlsx` files, and `specification_docs_v2/*.md` — **18 files, zero lines of code**. Every single line of Go, every migration, every config file, every Dockerfile, `go.mod`/`go.sum` — the entire application, including all six months-worth-looking of module work and all six Portal UI phases built across this session — sits **untracked in the working directory**. `git status` currently shows 16 top-level untracked paths (`cmd/`, `internal/`, `migrations/`, `pkg/`, `scripts/`, `config/`, `go.mod`, `go.sum`, `docker-compose.yml`, both Dockerfiles, `.golangci.yml`, `.gitignore`, `.githooks/`, `.env.example`).
@@ -97,6 +102,25 @@ That reads as "RADIUS authentication is catastrophically slow." The daemon was n
 
 ✅ **Resolved** (commit `cb1d2bf`). All three fixes are in the committed harness, and the numbers in L6 below come from runs with them applied.
 
+### 6. Sentinel failover misses its budget, and hostname monitoring has a hard failure mode *(found 2026-08-10, OPEN)*
+
+The only finding here that is **not** resolved. Recorded because L6-004 moved from "never measured" to "measured and failing", which is a different and more actionable state.
+
+**The budget is missed by roughly 65%.** Master elected in 4955ms against a 3000ms budget; authentication resumed 7032ms after the fault against a 5000ms budget. Failover does work — a replica is promoted and service recovers — it is simply slower than the NFR allows.
+
+**Tuning detection does not close the gap.** `config/redis/sentinel.conf` sets `down-after-milliseconds 3000`, which alone consumes the entire election budget before Sentinel even begins. Lowering it to 1000 produced 4955ms; lowering it further to 500 produced 4490ms. A 500ms reduction in detection bought 465ms of election time, so detection is not the dominant cost — the remaining ~4s is Sentinel's own promotion and resync sequence (`failover-timeout` 10000ms, `parallel-syncs` 1). **This NFR is not reachable by configuration tweaks to `down-after-milliseconds`**, which is what the original plan assumed.
+
+**Separately: hostname monitoring cannot survive a vanished DNS name.** `sentinel.conf` monitors the master as `sentinel monitor bss_master redis_primary` with `resolve-hostnames yes` — which its own comments correctly note is mandatory under Docker Compose, since Redis 7.4+ treats a hostname in `sentinel monitor` as fatal without it. But when the master container is removed rather than merely stopped, the name stops resolving and Sentinel logs:
+
+```
+# Failed to resolve hostname 'redis_primary'
+# +tilt #tilt mode entered
+```
+
+It then never promotes a replica at all — 60 seconds later there is still no master and authentication has not recovered. Hostname monitoring survives a dead *process* but not a vanished *name*, and a node failure under an orchestrator is precisely the second case. `scripts/run_sentinel_failover_test.sh` reproduces this with `CHAOS_MODE=kill`; the default `pause` mode keeps the container in DNS so the script measures failover timing rather than re-demonstrating this each run.
+
+**Decision needed** (not a code fix): accept a longer recovery target, or address the promotion sequence and the DNS dependency — for example pinning IPs, or a DNS entry that outlives the container.
+
 ---
 
 ## L0 · Every Task (10 checks)
@@ -132,8 +156,8 @@ That reads as "RADIUS authentication is catastrophically slow." The daemon was n
 
 | ID | Check | Result | Evidence |
 |---|---|---|---|
-| L2-001 | Every FR has a `TestFR_{ID}_...`-named test | ❌ FAIL | 220 test functions exist repo-wide; **zero** use the literal `TestFR_` prefix (actual style is descriptive, e.g. `TestDashboard_ShowsUsage`, `TestRenewal_IdempotentCallback`). Functional coverage of FRs is generally strong; the literal naming/traceability convention is not followed anywhere. |
-| L2-002 | Coverage ≥80% (≥90% crypto/middleware) | ❌ FAIL (improved) | **The ≥90% sub-requirement now passes**: `pkg/crypto` 58.7% → **93.5%**, `internal/middleware` 69.6% → **98.2%**. The general ≥80% bar does not: overall 53.1% → **58.7%** (merged native + real-Postgres profiles). Largest movers: `internal/billing` 53.6% → **87.5%**, `internal/api` 55.4% → **69.3%**. Also passing: `pkg/validate` 100%, `internal/health` 100%, `internal/revenue` 80.7%. Still short: `internal/portalui` 79.6%, `internal/fup` 76.8%, `internal/notifications` 71.7%, `internal/portal` 63.0%, `internal/radius` 61.0%, `internal/cache` 47.7%, `cmd/api` 5.3%. |
+| L2-001 | Every FR has a `TestFR_{ID}_...`-named test | ✅ PASS | **102 tests** now carry the `TestFR_` prefix, covering **all 30 distinct FR IDs** referenced anywhere in the codebase. Renaming was scoped to tests whose doc comments already carried an FR ID, so every mapping has a source in the code rather than one invented to satisfy a count; the descriptive suffix is retained (`TestFR_BIL_003_WalletRecharge_DoubleLedger`). The remaining ~175 tests are deliberately left alone — a guessed FR ID is worse than an absent one. |
+| L2-002 | Coverage ≥80% (≥90% crypto/middleware) | ❌ FAIL (improved) | **The ≥90% sub-requirement now passes**: `pkg/crypto` 58.7% → **93.5%**, `internal/middleware` 69.6% → **98.2%**. The general ≥80% bar does not: overall 53.1% → **60.4%** (merged native + real-Postgres profiles). Movers across this remediation: `internal/cache` 47.7% → **88.4%**, `internal/billing` 53.6% → **87.5%**, `internal/db` **76.9%**, `internal/api` 55.4% → **69.3%**, `internal/radius` 55.5% → **68.3%**. Also passing: `pkg/validate` 100%, `internal/health` 100%, `internal/revenue` 80.7%. Still short: `internal/portalui` 79.6%, `internal/fup` 76.8%, `internal/notifications` 71.7%, `internal/portal` 63.0%, `cmd/api` 5.3%. |
 | L2-003 | Happy-path tests exist | ✅ PASS | Present throughout (not literally suffixed `_HappyPath`, but functionally covered — e.g. every new Phase 0–6 handler has a valid-input test). |
 | L2-004 | Error/rejection-path tests exist | ✅ PASS | Present throughout (e.g. `TestLogin_InvalidPassword_RerendersFormWithError`, `TestRenew_InvalidCSRFToken_Returns403`). |
 | L2-005 | Edge cases (nil/zero/empty) handled without panic | ✅ PASS | Verified pattern throughout this session's own work (e.g. `TestDashboard_OfflineSubscriber_ShowsEmptyState`, `TestUsage_NoHistory_ShowsEmptyState`) and pre-existing tests. |
@@ -186,7 +210,7 @@ All four are fixed in commit `cb1d2bf` (renamed where they were testing somethin
 | L5-005 | DND check fires before any channel API call | ✅ PASS | Direct code read of `Dispatcher.Dispatch`: DND check at line 38 unconditionally precedes both the WhatsApp branch (line 63) and SMS branch (line 75). |
 | L5-006 | All 8 templates (TMPL-001..008) registered | ✅ PASS | Confirmed in `scripts/seed_local.sql` — exactly 8, correctly numbered. |
 | L5-007 | E.164 phone format validated before SMS send | ✅ PASS | `pkg/validate/phone.go` (100% covered) enforces `^\+[1-9]\d{1,14}$` at three layers: `CreateSubscriber`, both the SMS and WhatsApp send paths, and a DB `CHECK` constraint in migration `020_phone_e164_constraint.sql`. |
-| L5-008 | Dispatch latency ≤5s (dequeue → `sent_at`) | ❌ FAIL / NOT VERIFIED | No dedicated E2E latency test exists (`TestFUPWarningTask_E2ELatency` or equivalent is not present). |
+| L5-008 | Dispatch latency ≤5s (dequeue → `sent_at`) | ✅ PASS | `internal/fup/dispatch_latency_integration_test.go` measures enqueue → `sent_at` through a real Asynq server on a real Redis, the real Dispatcher and the real WhatsApp client against a stub Meta endpoint, reading `sent_at` back from the `notification_log` row production code writes. **Single task: 1.011s. Worst case across 50 queued tasks: 92ms.** The backlog case exists because the idle-queue case cannot detect a pipeline that only meets the budget when idle; it asserts the worst task, not the average. Both confirmed to fail when the budget is lowered to 1ms, so the assertion is not vacuous. |
 
 ## L6 · Performance (6 checks)
 
@@ -197,8 +221,8 @@ All L6 rows below were run at the levels the DoD itself specifies, against 20,00
 | L6-001 | RADIUS auth p99 ≤15ms @ 5,000 req/s | ✅ PASS | **Measured at the full 5,000 req/s**: p99 **10.4ms**, p50 4.538ms, p95 7.934ms across 149,850 requests, 0 errors, 0 dropped to saturation. Server-side mean auth 3.211ms over 289,810 requests; 289,315 of them completed within 15ms. A capacity sweep confirms the budget holds at 3,000 and 4,000 req/s too, so 5,000 is not a cliff edge. |
 | L6-002 | API p99 ≤200ms @ 500 concurrent (k6) | ✅ PASS | **Measured at the full 500 VUs** for 30s via `scripts/k6_api_load.js`: p99 **11.69ms** against the 200ms budget, 286,386 checks, 100% succeeded, `http_req_failed` 0.00%. Both k6 thresholds (`health`, `subscriber_get`) passed independently. |
 | L6-003 | Unbilled report ≤60s for 20k subscribers | ✅ PASS | **9.716ms** against a 60,000ms budget, on a real 20,000-subscriber / 18,000-invoice dataset. The planner chooses a sequential scan at this row count rather than an index scan — expected, and ~6,000× inside budget regardless. |
-| L6-004 | Redis Sentinel failover ≤3s | ⬜ NOT VERIFIED | Unchanged. Sentinel topology/config verified correct (quorum, `resolve-hostnames`), but literal failover timing still needs the full Sentinel stack, which `run_nfr_tests.sh` deliberately does not stand up. |
-| L6-005 | No goroutine leak after 1h @ 20k sessions | ⬜ NOT VERIFIED | Unchanged. Needs an hour of sustained load; not run. |
+| L6-004 | Redis Sentinel failover ≤3s | ❌ **FAIL (now measured)** | `scripts/run_sentinel_failover_test.sh`. Failover **works** but is too slow: master elected in **4955ms** against the 3000ms budget, RADIUS auth resumed after **7032ms** against 5000ms. Not fixable by tuning detection alone — dropping `down-after-milliseconds` from 1000 to 500 moved election only 4955ms → 4490ms, so the remaining ~4s is Sentinel's own failover sequence (`failover-timeout` 10000ms, `parallel-syncs` 1). Moves from NOT VERIFIED to a characterised failure. See Finding #6. |
+| L6-005 | No goroutine leak after 1h @ 20k sessions | ⬜ NOT VERIFIED | Harness now exists and is validated: `scripts/run_soak_test.sh`, verified end to end on a 90s run (9,000 requests, 0 errors, p99 5.391ms, goroutines and FDs flat). **The 1-hour hold the DoD actually requires has not been run**, so this stays NOT VERIFIED rather than being extrapolated from 90 seconds. Detection needs no pprof — `go_goroutines`, `go_threads`, `go_memstats_heap_alloc_bytes` and `process_open_fds` are already exposed by the default Go collector; pprof (still absent from this codebase) would only be needed to locate a leak once detected. |
 | L6-006 | TLS 1.3 minimum, TLS 1.2 disabled | ✅ PASS | Now covered by a committed, repeatable script (`scripts/verify_tls.sh`) rather than a one-off `curl`, run against the **real** `config/caddy/Caddyfile`: TLS 1.3 connects (`TLS_AES_128_GCM_SHA256`), TLS 1.2 / 1.1 / 1.0 all refused, and an unpinned client negotiates 1.3. See the note below on why this test is trustworthy. |
 
 **On L6-006's trustworthiness.** The first version of this script passed TLS 1.3 and reported TLS 1.2 as *negotiated* — a false alarm caused by reading OpenSSL's `Protocol :` session line, which echoes the version the client *attempted* even when the server rejected it outright. A refused TLS 1.2 handshake still prints `Protocol : TLSv1.2` there. The script now keys off the `New, <version>, Cipher is <cipher>` line instead, since a version is only real if a cipher was agreed alongside it (`New, (NONE), Cipher is (NONE)` on failure). It was then checked against a deliberately weakened Caddyfile permitting `tls1.2 tls1.3`, and correctly failed — so the pass above reflects the server's actual behaviour, not an assertion that cannot fail.
@@ -225,15 +249,13 @@ All L6 rows below were run at the levels the DoD itself specifies, against 20,00
 
 ## Gaps Requiring Explicit Attention — Ranked by Priority
 
-Items 1, 2, 3, 4 and 6 from the original 2026-08-08 list are closed; see the resolution notes in Critical Findings. What remains:
+Items 1, 2, 3, 4, 6 and 7 from the original 2026-08-08 list are closed; see the resolution notes in Critical Findings. What remains, in priority order:
 
-1. **Test coverage below the ≥80% general bar** (L2-002) — 58.7% overall. The stricter ≥90% crypto/middleware requirement now passes (93.5% / 98.2%). The remaining shortfall is concentrated in `cmd/api` (5.3%), `internal/cache` (47.7%) and `internal/radius` (61.0%). Note that `internal/radius` is now security-relevant in a way it was not before: the fast-verifier cache is on the auth path, so that package is the highest-value coverage target of the three.
-2. **Redis Sentinel failover timing** (L6-004) — needs the full Sentinel stack stood up and a master killed under load. The config is verified correct; the 3-second recovery claim is not measured.
-3. **Goroutine-leak soak test** (L6-005) — needs an hour of sustained load at 20k sessions plus `pprof` sampling. Nothing structural blocks it; it is purely a time cost, and `run_nfr_tests.sh` already builds the stack it would need.
-4. **FR-traceable test naming** (L2-001) — a documentation/process convention, not a functional gap. Tests exist and pass; they just aren't named `TestFR_{ID}_...` the way the tracker's own verification command expects.
-5. **Dispatch-latency E2E test** (L5-008) — no test measures dequeue → `sent_at` against the 5s budget.
-6. **TDD commit ordering** (L0-001, L0-002) — permanently unachievable for existing code, since red-phase commits cannot be reconstructed after the fact. Worth deciding whether to enforce going forward or mark N/A in the tracker, rather than leaving it as a standing failure.
-7. **Tracker administration** (all of L8) — the spreadsheet's own Status/Notes columns are still unpopulated. See the last bullet under Methodology.
+1. **Sentinel failover misses its budget** (L6-004) — the only *newly discovered* open defect, and the only remaining item that is a real system limitation rather than a process convention or a time cost. Election at 4955ms against a 3000ms budget, and not closable by tuning `down-after-milliseconds`. Needs a decision on the target or on the promotion sequence, plus a view on the DNS failure mode. See Finding #6.
+2. **Test coverage below the ≥80% general bar** (L2-002) — 60.4% overall, up from 53.1%. The stricter ≥90% crypto/middleware requirement now passes (93.5% / 98.2%). The remaining shortfall is concentrated in `cmd/api` (5.3%, mostly wiring — extracting a testable `newServer()` from `main()` is the standard fix but is refactoring, not test-writing), `internal/portal` (63.0%) and `internal/notifications` (71.7%).
+3. **Goroutine-leak soak test** (L6-005) — purely a time cost now. The harness exists, is committed and is validated end to end; it needs one uninterrupted hour on a machine that will not sleep.
+4. **TDD commit ordering** (L0-001, L0-002) — permanently unachievable for existing code, since red-phase commits cannot be reconstructed after the fact. Worth deciding whether to enforce going forward or mark N/A in the tracker, rather than leaving two standing failures that can never clear.
+5. **Tracker administration** (all of L8) — 96 tasks are now marked Done and committed, but 5 rows remain Todo and no row-by-row reconciliation against this report has been done.
 
 ## Methodology & Limitations
 
