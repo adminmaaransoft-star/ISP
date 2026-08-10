@@ -103,6 +103,25 @@ so nothing fires a notification nobody asked for.
 - Brute-force lockout on the RADIUS auth path
 - TLS 1.3 floor at the edge, verified against a deliberately weakened config
 - Pre-commit hook blocking plaintext PII in log statements, verified against a real commit
+- Every `/api/v1/*` route confirmed to sit behind the API's authorisation middleware (see below)
+
+### Security fix during release preparation
+
+`GET /api/v1/subscribers/{id}/health-detail` returned a subscriber's username,
+status, wallet balance, live session, NAS address and **assigned IP** to any
+caller with no token, and was enumerable by subscriber id. The real handler had
+been registered directly on the mux *after* the API's route table, so it
+carried no middleware, on a path that was never in the OpenAPI contract.
+
+That is the same IP-to-subscriber correlation the LEA audit log and the
+least-privilege `bss_app` role exist to keep controlled and auditable, so it
+undercut a control this release otherwise adds.
+
+Fixed before tagging: the handler is now served behind staff authorisation at
+the documented `/api/v1/subscribers/{id}/health`, the undocumented route is
+removed, and four regression tests assert the handler is never *reached*
+without a valid staff token. The fix also implements **FR-OBS-004**, which had
+been answering 501 while a complete implementation sat unused.
 
 ## Known issues
 
