@@ -107,11 +107,11 @@ func (a *itAlerter) fired(event string) bool {
 
 // ── INT-REV-001 ─────────────────────────────────────────────────────────────
 
-// TestUnbilledReport verifies the reconciliation job records the seeded count of
+// TestFR_REV_001_UnbilledReport verifies the reconciliation job records the seeded count of
 // active subscribers missing an invoice.
 //
 // INT-REV-001 | FR-REV-001
-func TestUnbilledReport(t *testing.T) {
+func TestFR_REV_001_UnbilledReport(t *testing.T) {
 	// Seed: 2 active subscribers whose current period has no invoice.
 	store := &itRevenueStore{
 		unbilledCount: 2,
@@ -136,11 +136,11 @@ func TestUnbilledReport(t *testing.T) {
 	}
 }
 
-// TestUnbilledReport_CleanBooksRecordZero verifies a fully invoiced base records
+// TestFR_REV_001_UnbilledReport_CleanBooksRecordZero verifies a fully invoiced base records
 // a zero deficit rather than skipping the snapshot.
 //
 // INT-REV-001 (supporting) | FR-REV-001
-func TestUnbilledReport_CleanBooksRecordZero(t *testing.T) {
+func TestFR_REV_001_UnbilledReport_CleanBooksRecordZero(t *testing.T) {
 	store := &itRevenueStore{unbilledCount: 0, variance: decimal.Zero, totalBalance: decimal.Zero}
 	job := revenue.NewReconcileJob(store, &itAlerter{})
 
@@ -154,11 +154,11 @@ func TestUnbilledReport_CleanBooksRecordZero(t *testing.T) {
 
 // ── INT-REV-002 ─────────────────────────────────────────────────────────────
 
-// TestLedgerVariance verifies clean books produce a variance within tolerance
+// TestFR_REV_002_LedgerVariance verifies clean books produce a variance within tolerance
 // and raise no alert, while a real discrepancy alerts.
 //
 // INT-REV-002 | FR-REV-002
-func TestLedgerVariance(t *testing.T) {
+func TestFR_REV_002_LedgerVariance(t *testing.T) {
 	tolerance := decimal.RequireFromString("0.01")
 
 	cases := []struct {
@@ -201,11 +201,11 @@ func TestLedgerVariance(t *testing.T) {
 
 // ── INT-REV-003 ─────────────────────────────────────────────────────────────
 
-// TestCollectionsForecast verifies the 30-day forecast is persisted with both
+// TestFR_REV_004_CollectionsForecast verifies the 30-day forecast is persisted with both
 // the will-renew and at-risk segments populated, using exact decimal amounts.
 //
 // INT-REV-003 | FR-REV-004
-func TestCollectionsForecast(t *testing.T) {
+func TestFR_REV_004_CollectionsForecast(t *testing.T) {
 	forecastDate := time.Now().UTC().Truncate(24 * time.Hour)
 	store := &itRevenueStore{
 		variance:     decimal.Zero,
@@ -335,11 +335,11 @@ func intPtr(v int) *int { return &v }
 
 // ── INT-FRN-001 ─────────────────────────────────────────────────────────────
 
-// TestFranchiseIsolation_BlocksCrossLCOAccess verifies an LCO listing subscribers
+// TestFR_FRN_001_FranchiseIsolation_BlocksCrossLCOAccess verifies an LCO listing subscribers
 // sees only its own franchise's rows.
 //
 // INT-FRN-001 | FR-FRN-001
-func TestFranchiseIsolation_BlocksCrossLCOAccess(t *testing.T) {
+func TestFR_FRN_001_FranchiseIsolation_BlocksCrossLCOAccess(t *testing.T) {
 	// Seed: franchise 1 has one subscriber, franchise 2 has another.
 	store := &itFranchiseStore{
 		subscribers: []revenue.SubscriberRow{
@@ -377,11 +377,11 @@ func TestFranchiseIsolation_BlocksCrossLCOAccess(t *testing.T) {
 	}
 }
 
-// TestFranchiseIsolation_OwnerSeesEverything verifies ISP-wide roles are not
+// TestFR_FRN_001_FranchiseIsolation_OwnerSeesEverything verifies ISP-wide roles are not
 // narrowed by the franchise scope.
 //
 // INT-FRN-001 (supporting) | FR-FRN-001
-func TestFranchiseIsolation_OwnerSeesEverything(t *testing.T) {
+func TestFR_FRN_001_FranchiseIsolation_OwnerSeesEverything(t *testing.T) {
 	store := &itFranchiseStore{
 		subscribers: []revenue.SubscriberRow{
 			{ID: 101, Username: "f1-sub@isp", FranchiseID: intPtr(1)},
@@ -407,11 +407,11 @@ func TestFranchiseIsolation_OwnerSeesEverything(t *testing.T) {
 	}
 }
 
-// TestFranchiseIsolation_UnboundLCORefused verifies an LCO token with no
+// TestFR_FRN_001_FranchiseIsolation_UnboundLCORefused verifies an LCO token with no
 // franchise claim is refused rather than being granted ISP-wide visibility.
 //
 // INT-FRN-001 (supporting) | FR-FRN-001
-func TestFranchiseIsolation_UnboundLCORefused(t *testing.T) {
+func TestFR_FRN_001_FranchiseIsolation_UnboundLCORefused(t *testing.T) {
 	store := &itFranchiseStore{
 		subscribers: []revenue.SubscriberRow{
 			{ID: 101, Username: "f1-sub@isp", FranchiseID: intPtr(1)},
@@ -438,11 +438,11 @@ func TestFranchiseIsolation_UnboundLCORefused(t *testing.T) {
 
 // ── INT-FRN-002 ─────────────────────────────────────────────────────────────
 
-// TestCommission_CorrectAmount verifies a 10% commission on a ₹799.00 recharge
+// TestFR_FRN_002_Commission_CorrectAmount verifies a 10% commission on a ₹799.00 recharge
 // is 79.90 and is written to lco_ledger with that exact decimal amount.
 //
 // INT-FRN-002 | FR-FRN-002
-func TestCommission_CorrectAmount(t *testing.T) {
+func TestFR_FRN_002_Commission_CorrectAmount(t *testing.T) {
 	store := &itFranchiseStore{
 		franchises: map[int]*revenue.Franchise{
 			1: {ID: 1, Name: "Chennai LCO", CommissionRatePct: decimal.RequireFromString("10.00"), Status: "active"},
@@ -482,11 +482,11 @@ func TestCommission_CorrectAmount(t *testing.T) {
 	}
 }
 
-// TestCommission_RateVariants checks the rounding boundary across the rates the
+// TestFR_FRN_002_Commission_RateVariants checks the rounding boundary across the rates the
 // business actually uses.
 //
 // INT-FRN-002 (supporting) | FR-FRN-002
-func TestCommission_RateVariants(t *testing.T) {
+func TestFR_FRN_002_Commission_RateVariants(t *testing.T) {
 	cases := []struct {
 		recharge, rate, want string
 	}{
@@ -518,11 +518,11 @@ func TestCommission_RateVariants(t *testing.T) {
 	}
 }
 
-// TestCommission_InactiveFranchiseEarnsNothing verifies a suspended franchise
+// TestFR_FRN_002_Commission_InactiveFranchiseEarnsNothing verifies a suspended franchise
 // accrues no commission and writes no ledger row.
 //
 // INT-FRN-002 (supporting) | FR-FRN-002
-func TestCommission_InactiveFranchiseEarnsNothing(t *testing.T) {
+func TestFR_FRN_002_Commission_InactiveFranchiseEarnsNothing(t *testing.T) {
 	store := &itFranchiseStore{
 		franchises: map[int]*revenue.Franchise{
 			1: {ID: 1, CommissionRatePct: decimal.RequireFromString("10.00"), Status: "suspended"},

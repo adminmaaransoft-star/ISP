@@ -136,12 +136,12 @@ func itHistogramCount(t *testing.T, h prometheus.Histogram) uint64 {
 
 // ── INT-AAA-001 ─────────────────────────────────────────────────────────────
 
-// TestHandleAuth_ActiveSubscriberAccepted verifies an active subscriber with
+// TestFR_AAA_002_HandleAuth_ActiveSubscriberAccepted verifies an active subscriber with
 // correct credentials receives Access-Accept and that the latency histogram
 // records the request.
 //
 // INT-AAA-001 | FR-AAA-002
-func TestHandleAuth_ActiveSubscriberAccepted(t *testing.T) {
+func TestFR_AAA_002_HandleAuth_ActiveSubscriberAccepted(t *testing.T) {
 	d, _ := itNewDaemon(t, map[string]*Subscriber{
 		"alice@isp": {
 			ID:           1,
@@ -180,10 +180,10 @@ func TestHandleAuth_ActiveSubscriberAccepted(t *testing.T) {
 
 // ── INT-AAA-002 ─────────────────────────────────────────────────────────────
 
-// TestHandleAuth_InvalidPassword verifies a wrong password yields Access-Reject.
+// TestFR_AAA_002_HandleAuth_InvalidPassword verifies a wrong password yields Access-Reject.
 //
 // INT-AAA-002 | FR-AAA-002
-func TestHandleAuth_InvalidPassword(t *testing.T) {
+func TestFR_AAA_002_HandleAuth_InvalidPassword(t *testing.T) {
 	d, _ := itNewDaemon(t, map[string]*Subscriber{
 		"bob@isp": {
 			ID:           2,
@@ -213,12 +213,12 @@ func TestHandleAuth_InvalidPassword(t *testing.T) {
 
 // ── INT-AAA-003 ─────────────────────────────────────────────────────────────
 
-// TestHandleAuth_SuspendedSubscriber verifies hard-suspended and terminated
+// TestFR_AAA_002_HandleAuth_SuspendedSubscriber verifies hard-suspended and terminated
 // subscribers are rejected even with correct credentials, and that no session
 // state is cached for them.
 //
 // INT-AAA-003 | FR-AAA-002
-func TestHandleAuth_SuspendedSubscriber(t *testing.T) {
+func TestFR_AAA_002_HandleAuth_SuspendedSubscriber(t *testing.T) {
 	for _, status := range []string{"hard_suspended", "terminated"} {
 		t.Run(status, func(t *testing.T) {
 			d, mr := itNewDaemon(t, map[string]*Subscriber{
@@ -251,12 +251,12 @@ func TestHandleAuth_SuspendedSubscriber(t *testing.T) {
 
 // ── INT-AAA-004 ─────────────────────────────────────────────────────────────
 
-// TestBruteForce_BlocksAt10Failures verifies that after MaxFailedAttempts
+// TestFR_SEC_001_BruteForce_BlocksAt10Failures verifies that after MaxFailedAttempts
 // consecutive failures the next attempt is rejected by the guard, and that the
 // ban key carries the 15-minute lockout TTL.
 //
 // INT-AAA-004 | FR-SEC-001
-func TestBruteForce_BlocksAt10Failures(t *testing.T) {
+func TestFR_SEC_001_BruteForce_BlocksAt10Failures(t *testing.T) {
 	d, mr := itNewDaemon(t, map[string]*Subscriber{
 		"dave@isp": {
 			ID:           4,
@@ -316,11 +316,11 @@ func TestBruteForce_BlocksAt10Failures(t *testing.T) {
 	}
 }
 
-// TestBruteForce_ResetOnSuccessfulAuth verifies a successful login clears the
+// TestFR_SEC_001_BruteForce_ResetOnSuccessfulAuth verifies a successful login clears the
 // counter so unrelated later typos do not inherit old attempts.
 //
 // INT-AAA-004 (supporting) | FR-SEC-001
-func TestBruteForce_ResetOnSuccessfulAuth(t *testing.T) {
+func TestFR_SEC_001_BruteForce_ResetOnSuccessfulAuth(t *testing.T) {
 	d, mr := itNewDaemon(t, map[string]*Subscriber{
 		"erin@isp": {
 			ID:           5,
@@ -348,14 +348,14 @@ func TestBruteForce_ResetOnSuccessfulAuth(t *testing.T) {
 
 // ── INT-AAA-005 ─────────────────────────────────────────────────────────────
 
-// TestDedup_DuplicateInterimSkipped verifies a replayed Interim-Update with the
+// TestFR_AAA_003_Dedup_DuplicateInterimSkipped verifies a replayed Interim-Update with the
 // same session and octet count is counted once only.
 //
 // Run with -count=3 per the tracker; each run gets a fresh miniredis and the
 // assertions are on deltas, so repeats are independent.
 //
 // INT-AAA-005 | FR-AAA-003
-func TestDedup_DuplicateInterimSkipped(t *testing.T) {
+func TestFR_AAA_003_Dedup_DuplicateInterimSkipped(t *testing.T) {
 	d, mr := itNewDaemon(t, nil)
 	ctx := context.Background()
 

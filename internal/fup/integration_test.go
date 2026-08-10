@@ -225,12 +225,12 @@ func itStubNAS(t *testing.T, secret []byte, respondWith radius.Code) (int, <-cha
 
 // ── INT-FUP-001 ─────────────────────────────────────────────────────────────
 
-// TestFUPScanner_EnqueuesCoAOn100Pct verifies a session at or above its FUP
+// TestFR_FUP_001_FUPScanner_EnqueuesCoAOn100Pct verifies a session at or above its FUP
 // threshold enqueues exactly one CoA task on the network_commands queue and
 // flips fup_active.
 //
 // INT-FUP-001 | FR-FUP-001
-func TestFUPScanner_EnqueuesCoAOn100Pct(t *testing.T) {
+func TestFR_FUP_001_FUPScanner_EnqueuesCoAOn100Pct(t *testing.T) {
 	_, client, inspector := itRedis(t)
 
 	const threshold = int64(1_771_674_009_600) // 1.65 TB
@@ -272,11 +272,11 @@ func TestFUPScanner_EnqueuesCoAOn100Pct(t *testing.T) {
 	}
 }
 
-// TestFUPScanner_SkipsUnlimitedAndAlreadyThrottled verifies unlimited plans and
+// TestFR_FUP_001_FUPScanner_SkipsUnlimitedAndAlreadyThrottled verifies unlimited plans and
 // already-throttled sessions do not generate CoA traffic.
 //
 // INT-FUP-001 (supporting) | FR-FUP-001
-func TestFUPScanner_SkipsUnlimitedAndAlreadyThrottled(t *testing.T) {
+func TestFR_FUP_001_FUPScanner_SkipsUnlimitedAndAlreadyThrottled(t *testing.T) {
 	_, client, inspector := itRedis(t)
 
 	db := &itFUPDB{
@@ -298,11 +298,11 @@ func TestFUPScanner_SkipsUnlimitedAndAlreadyThrottled(t *testing.T) {
 
 // ── INT-FUP-002 ─────────────────────────────────────────────────────────────
 
-// TestFUPScanner_Warns80Pct verifies an 80%-of-quota session enqueues one
+// TestFR_FUP_004_FUPScanner_Warns80Pct verifies an 80%-of-quota session enqueues one
 // warning notification, and that a repeat scan does not enqueue a second.
 //
 // INT-FUP-002 | FR-FUP-004
-func TestFUPScanner_Warns80Pct(t *testing.T) {
+func TestFR_FUP_004_FUPScanner_Warns80Pct(t *testing.T) {
 	_, client, inspector := itRedis(t)
 
 	const threshold = int64(3_543_348_019_200) // 3.3 TB
@@ -358,11 +358,11 @@ func TestFUPScanner_Warns80Pct(t *testing.T) {
 	}
 }
 
-// TestFUPScanner_WarningTaskIDIsPerQuotaCycle verifies the idempotency key
+// TestFR_FUP_004_FUPScanner_WarningTaskIDIsPerQuotaCycle verifies the idempotency key
 // distinguishes subscribers and quota cycles.
 //
 // INT-FUP-002 (supporting) | FR-FUP-004
-func TestFUPScanner_WarningTaskIDIsPerQuotaCycle(t *testing.T) {
+func TestFR_FUP_004_FUPScanner_WarningTaskIDIsPerQuotaCycle(t *testing.T) {
 	if a, b := WarningTaskID(1, 100), WarningTaskID(2, 100); a == b {
 		t.Errorf("different subscribers must get different task IDs, both %q", a)
 	}
@@ -373,11 +373,11 @@ func TestFUPScanner_WarningTaskIDIsPerQuotaCycle(t *testing.T) {
 
 // ── INT-FUP-003 ─────────────────────────────────────────────────────────────
 
-// TestCoATask_RetriesOnNAK verifies a CoA-NAK from the NAS produces an error
+// TestFR_FUP_002_CoATask_RetriesOnNAK verifies a CoA-NAK from the NAS produces an error
 // from ProcessTask (which is what drives the Asynq retry) and counts a nak.
 //
 // INT-FUP-003 | FR-FUP-002
-func TestCoATask_RetriesOnNAK(t *testing.T) {
+func TestFR_FUP_002_CoATask_RetriesOnNAK(t *testing.T) {
 	secret := []byte("coa-secret")
 	port, received := itStubNAS(t, secret, radius.CodeCoANAK)
 
@@ -406,10 +406,10 @@ func TestCoATask_RetriesOnNAK(t *testing.T) {
 	}
 }
 
-// TestCoATask_SucceedsOnACK verifies a CoA-ACK completes the task without error.
+// TestFR_FUP_002_CoATask_SucceedsOnACK verifies a CoA-ACK completes the task without error.
 //
 // INT-FUP-003 (supporting) | FR-FUP-002
-func TestCoATask_SucceedsOnACK(t *testing.T) {
+func TestFR_FUP_002_CoATask_SucceedsOnACK(t *testing.T) {
 	secret := []byte("coa-secret")
 	port, _ := itStubNAS(t, secret, radius.CodeCoAACK)
 
@@ -431,11 +431,11 @@ func TestCoATask_SucceedsOnACK(t *testing.T) {
 	}
 }
 
-// TestCoATask_AsynqRetriesFailedTask drives the failure through a live Asynq
+// TestFR_FUP_002_CoATask_AsynqRetriesFailedTask drives the failure through a live Asynq
 // server and asserts the task is actually re-attempted rather than dropped.
 //
 // INT-FUP-003 | FR-FUP-002
-func TestCoATask_AsynqRetriesFailedTask(t *testing.T) {
+func TestFR_FUP_002_CoATask_AsynqRetriesFailedTask(t *testing.T) {
 	opt, client, inspector := itRedis(t)
 
 	secret := []byte("coa-secret")
@@ -490,11 +490,11 @@ func TestCoATask_AsynqRetriesFailedTask(t *testing.T) {
 
 // ── PoD (session-control disconnect) ────────────────────────────────────────
 
-// TestPoDTask_SucceedsOnACK verifies a Disconnect-ACK completes the task
+// TestFR_NET_002_PoDTask_SucceedsOnACK verifies a Disconnect-ACK completes the task
 // without error.
 //
 // FR-NET-002
-func TestPoDTask_SucceedsOnACK(t *testing.T) {
+func TestFR_NET_002_PoDTask_SucceedsOnACK(t *testing.T) {
 	secret := []byte("pod-secret")
 	port, received := itStubNAS(t, secret, radius.CodeDisconnectACK)
 
@@ -520,11 +520,11 @@ func TestPoDTask_SucceedsOnACK(t *testing.T) {
 	}
 }
 
-// TestPoDTask_RetriesOnNAK verifies a Disconnect-NAK produces an error so
+// TestFR_NET_002_PoDTask_RetriesOnNAK verifies a Disconnect-NAK produces an error so
 // Asynq retries, mirroring the CoA-NAK behaviour.
 //
 // FR-NET-002
-func TestPoDTask_RetriesOnNAK(t *testing.T) {
+func TestFR_NET_002_PoDTask_RetriesOnNAK(t *testing.T) {
 	secret := []byte("pod-secret")
 	port, _ := itStubNAS(t, secret, radius.CodeDisconnectNAK)
 
@@ -547,12 +547,12 @@ func TestPoDTask_RetriesOnNAK(t *testing.T) {
 	}
 }
 
-// TestPoDTask_NoLiveSessionSkipsRetry verifies that a subscriber with no open
+// TestFR_NET_002_PoDTask_NoLiveSessionSkipsRetry verifies that a subscriber with no open
 // session (already disconnected, or the task ran very late) is not retried:
 // there is nothing left to disconnect, so retrying can never succeed.
 //
 // FR-NET-002
-func TestPoDTask_NoLiveSessionSkipsRetry(t *testing.T) {
+func TestFR_NET_002_PoDTask_NoLiveSessionSkipsRetry(t *testing.T) {
 	handler := NewPoDHandler(&itNoSessionDB{}, []byte("pod-secret"))
 
 	payload, _ := json.Marshal(PoDPayload{SubscriberID: 22})
@@ -579,11 +579,11 @@ func (itNoSessionDB) GetSubscriberNASSession(context.Context, int) (string, stri
 
 // ── INT-FUP-004 ─────────────────────────────────────────────────────────────
 
-// TestDeadLetterMonitor_AlertsOnNonZero verifies an archived (dead-lettered)
+// TestFR_FUP_003_DeadLetterMonitor_AlertsOnNonZero verifies an archived (dead-lettered)
 // task raises the dead_letter_queue_non_empty alert.
 //
 // INT-FUP-004 | FR-FUP-003
-func TestDeadLetterMonitor_AlertsOnNonZero(t *testing.T) {
+func TestFR_FUP_003_DeadLetterMonitor_AlertsOnNonZero(t *testing.T) {
 	opt, client, inspector := itRedis(t)
 
 	payload, _ := json.Marshal(CoAPayload{SubscriberID: 12, NasIP: "10.0.0.9"})
@@ -609,10 +609,10 @@ func TestDeadLetterMonitor_AlertsOnNonZero(t *testing.T) {
 	}
 }
 
-// TestDeadLetterMonitor_SilentWhenEmpty verifies no alert fires on a clean queue.
+// TestFR_FUP_003_DeadLetterMonitor_SilentWhenEmpty verifies no alert fires on a clean queue.
 //
 // INT-FUP-004 (supporting) | FR-FUP-003
-func TestDeadLetterMonitor_SilentWhenEmpty(t *testing.T) {
+func TestFR_FUP_003_DeadLetterMonitor_SilentWhenEmpty(t *testing.T) {
 	opt, client, inspector := itRedis(t)
 
 	payload, _ := json.Marshal(CoAPayload{SubscriberID: 13, NasIP: "10.0.0.10"})
@@ -632,11 +632,11 @@ func TestDeadLetterMonitor_SilentWhenEmpty(t *testing.T) {
 	}
 }
 
-// TestDeadLetterMonitor_RunAlertsOnTick verifies the polling loop fires the
+// TestFR_FUP_003_DeadLetterMonitor_RunAlertsOnTick verifies the polling loop fires the
 // alert without needing the caller to drive checkOnce.
 //
 // INT-FUP-004 (supporting) | FR-FUP-003
-func TestDeadLetterMonitor_RunAlertsOnTick(t *testing.T) {
+func TestFR_FUP_003_DeadLetterMonitor_RunAlertsOnTick(t *testing.T) {
 	opt, client, inspector := itRedis(t)
 
 	payload, _ := json.Marshal(CoAPayload{SubscriberID: 14, NasIP: "10.0.0.11"})
@@ -667,11 +667,11 @@ func TestDeadLetterMonitor_RunAlertsOnTick(t *testing.T) {
 
 // ── INT-NOTIF-005 ───────────────────────────────────────────────────────────
 
-// TestFUPWarningTask_DispatchesWhatsApp verifies the warning task handler
+// TestFR_FUP_004_FUPWarningTask_DispatchesWhatsApp verifies the warning task handler
 // dispatches template TMPL-001 for the subscriber in the payload.
 //
 // INT-NOTIF-005 | FR-FUP-004
-func TestFUPWarningTask_DispatchesWhatsApp(t *testing.T) {
+func TestFR_FUP_004_FUPWarningTask_DispatchesWhatsApp(t *testing.T) {
 	notifier := &itNotifier{}
 	handler := NewWarningHandler(notifier)
 
@@ -695,11 +695,11 @@ func TestFUPWarningTask_DispatchesWhatsApp(t *testing.T) {
 	}
 }
 
-// TestFUPWarningTask_MalformedPayloadSkipsRetry verifies an undecodable payload
+// TestFR_FUP_004_FUPWarningTask_MalformedPayloadSkipsRetry verifies an undecodable payload
 // is not retried, since it can never succeed.
 //
 // INT-NOTIF-005 (supporting) | FR-FUP-004
-func TestFUPWarningTask_MalformedPayloadSkipsRetry(t *testing.T) {
+func TestFR_FUP_004_FUPWarningTask_MalformedPayloadSkipsRetry(t *testing.T) {
 	handler := NewWarningHandler(&itNotifier{})
 
 	err := handler.ProcessTask(context.Background(), asynq.NewTask(TaskTypeFUPWarning, []byte("{not json")))

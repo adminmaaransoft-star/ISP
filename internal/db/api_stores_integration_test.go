@@ -289,12 +289,12 @@ func TestFUPStore_ResolveSessionSubscriber(t *testing.T) {
 
 // ── LEA lookup ───────────────────────────────────────────────────────────────
 
-// TestFUPStore_LookupByPublicIP_DirectIP verifies the direct-IP path: a match
+// TestFR_OBS_003_FUPStore_LookupByPublicIP_DirectIP verifies the direct-IP path: a match
 // within the session's active window, and no match once the session has ended
 // or before it started.
 //
 // FR-OBS-003 | API §7 POST /api/v1/lea/lookup
-func TestFUPStore_LookupByPublicIP_DirectIP(t *testing.T) {
+func TestFR_OBS_003_FUPStore_LookupByPublicIP_DirectIP(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -365,11 +365,11 @@ func TestFUPStore_LookupByPublicIP_DirectIP(t *testing.T) {
 	})
 }
 
-// TestFUPStore_LookupByPublicIP_CGNAT verifies the CGNAT path: a match
+// TestFR_OBS_003_FUPStore_LookupByPublicIP_CGNAT verifies the CGNAT path: a match
 // requires the port to fall inside the allocated block, not just the IP.
 //
 // FR-OBS-003 | API §7 POST /api/v1/lea/lookup
-func TestFUPStore_LookupByPublicIP_CGNAT(t *testing.T) {
+func TestFR_OBS_003_FUPStore_LookupByPublicIP_CGNAT(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -428,9 +428,9 @@ func TestFUPStore_LookupByPublicIP_CGNAT(t *testing.T) {
 	})
 }
 
-// TestFUPStore_RecordLEAAudit verifies the append-only audit row is written
+// TestFR_OBS_003_FUPStore_RecordLEAAudit verifies the append-only audit row is written
 // for both a hit and a miss, matching FR-OBS-003's "every invocation" requirement.
-func TestFUPStore_RecordLEAAudit(t *testing.T) {
+func TestFR_OBS_003_FUPStore_RecordLEAAudit(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -483,14 +483,14 @@ func TestFUPStore_RecordLEAAudit(t *testing.T) {
 
 // ── Usage history (portal UI Phase 2) ───────────────────────────────────────
 
-// TestPortalStore_ListSessionHistory verifies newest-first ordering, that
+// TestFR_SUB_001_PortalStore_ListSessionHistory verifies newest-first ordering, that
 // GB is computed from input+output octets using the same 1024^3 divisor
 // internal/cache.SessionStore.PortalSession uses for live sessions, that a
 // currently-active session (stop_time NULL) is included with a nil StopTime,
 // and that another subscriber's sessions never leak into the result.
 //
 // FR-SUB-001 | MDS §4.9
-func TestPortalStore_ListSessionHistory(t *testing.T) {
+func TestFR_SUB_001_PortalStore_ListSessionHistory(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -499,7 +499,7 @@ func TestPortalStore_ListSessionHistory(t *testing.T) {
 	seedSubscriber(ctx, t, pool, 2, seedOpts{Username: "other-subscriber@isp"})
 
 	// Relative to now, not a fixed calendar date — see the identical comment
-	// on TestFUPStore_LookupByPublicIP_DirectIP above: subscriber_session_history
+	// on TestFR_OBS_003_FUPStore_LookupByPublicIP_DirectIP above: subscriber_session_history
 	// is partitioned monthly and only has partitions for the current month
 	// plus three ahead.
 	older := time.Now().UTC().Add(-6 * time.Hour)

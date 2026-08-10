@@ -15,11 +15,11 @@ const (
 	quota3TB = int64(3_543_348_019_200)
 )
 
-// TestFUPStore_BreachDetection verifies the scanner query selects exactly the
+// TestFR_FUP_001_FUPStore_BreachDetection verifies the scanner query selects exactly the
 // subscribers who have breached quota and are not already throttled.
 //
 // FR-FUP-001 | INT-FUP-001
-func TestFUPStore_BreachDetection(t *testing.T) {
+func TestFR_FUP_001_FUPStore_BreachDetection(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -76,11 +76,11 @@ func TestFUPStore_BreachDetection(t *testing.T) {
 	}
 }
 
-// TestFUPStore_WarningBand verifies the 80% warning query selects only
+// TestFR_FUP_004_FUPStore_WarningBand verifies the 80% warning query selects only
 // subscribers between the warning threshold and their quota.
 //
 // FR-FUP-004 | INT-FUP-002
-func TestFUPStore_WarningBand(t *testing.T) {
+func TestFR_FUP_004_FUPStore_WarningBand(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -112,11 +112,11 @@ func TestFUPStore_WarningBand(t *testing.T) {
 	}
 }
 
-// TestFUPStore_SetFUPActive verifies the throttle flag persists and removes the
+// TestFR_FUP_001_FUPStore_SetFUPActive verifies the throttle flag persists and removes the
 // subscriber from the next breach scan.
 //
 // FR-FUP-001
-func TestFUPStore_SetFUPActive(t *testing.T) {
+func TestFR_FUP_001_FUPStore_SetFUPActive(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -166,12 +166,12 @@ func TestFUPStore_SetFUPActive(t *testing.T) {
 	})
 }
 
-// TestFUPStore_GetSubscriberNASSession verifies the CoA lookup returns the
+// TestFR_FUP_002_FUPStore_GetSubscriberNASSession verifies the CoA lookup returns the
 // throttled profile once the subscriber is flagged, which is what makes the CoA
 // actually reduce their speed.
 //
 // FR-FUP-002 | INT-FUP-003
-func TestFUPStore_GetSubscriberNASSession(t *testing.T) {
+func TestFR_FUP_002_FUPStore_GetSubscriberNASSession(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -214,11 +214,11 @@ func TestFUPStore_GetSubscriberNASSession(t *testing.T) {
 	})
 }
 
-// TestFUPStore_SessionLifecycle verifies accounting start, interim update and
+// TestFR_AAA_003_FUPStore_SessionLifecycle verifies accounting start, interim update and
 // stop move a session through the partitioned history table.
 //
 // FR-AAA-003, FR-NET-001
-func TestFUPStore_SessionLifecycle(t *testing.T) {
+func TestFR_AAA_003_FUPStore_SessionLifecycle(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -264,11 +264,11 @@ func TestFUPStore_SessionLifecycle(t *testing.T) {
 	})
 }
 
-// TestNotificationStore verifies dispatch logging and forward-only delivery
+// TestFR_NOTIF_009_NotificationStore verifies dispatch logging and forward-only delivery
 // status transitions.
 //
 // FR-NOTIF-009, FR-NOTIF-011 | INT-NOTIF-002, INT-NOTIF-003
-func TestNotificationStore(t *testing.T) {
+func TestFR_NOTIF_009_NotificationStore(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 

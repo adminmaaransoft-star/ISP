@@ -11,11 +11,11 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// TestRevenueStore_UnbilledSubscribers verifies only active subscribers with no
+// TestFR_REV_001_RevenueStore_UnbilledSubscribers verifies only active subscribers with no
 // invoice this period are counted.
 //
 // FR-REV-001 | INT-REV-001
-func TestRevenueStore_UnbilledSubscribers(t *testing.T) {
+func TestFR_REV_001_RevenueStore_UnbilledSubscribers(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -46,11 +46,11 @@ func TestRevenueStore_UnbilledSubscribers(t *testing.T) {
 	}
 }
 
-// TestRevenueStore_LedgerVariance verifies the reconciliation detects drift
+// TestFR_REV_002_RevenueStore_LedgerVariance verifies the reconciliation detects drift
 // between the ledger and the denormalised wallet balance.
 //
 // FR-REV-002 | INT-REV-002
-func TestRevenueStore_LedgerVariance(t *testing.T) {
+func TestFR_REV_002_RevenueStore_LedgerVariance(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -114,11 +114,11 @@ func TestRevenueStore_LedgerVariance(t *testing.T) {
 	})
 }
 
-// TestRevenueStore_SnapshotAndForecast verifies the nightly job's writes,
+// TestFR_REV_001_RevenueStore_SnapshotAndForecast verifies the nightly job's writes,
 // including that a re-run replaces rather than doubles.
 //
 // FR-REV-001, FR-REV-004 | INT-REV-003
-func TestRevenueStore_SnapshotAndForecast(t *testing.T) {
+func TestFR_REV_001_RevenueStore_SnapshotAndForecast(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -202,11 +202,11 @@ func TestRevenueStore_SnapshotAndForecast(t *testing.T) {
 	})
 }
 
-// TestRevenueStore_FranchiseIsolation verifies the subscriber list is confined
+// TestFR_FRN_001_RevenueStore_FranchiseIsolation verifies the subscriber list is confined
 // to a franchise when one is supplied, and unrestricted when it is not.
 //
 // FR-FRN-001 | INT-FRN-001
-func TestRevenueStore_FranchiseIsolation(t *testing.T) {
+func TestFR_FRN_001_RevenueStore_FranchiseIsolation(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -237,11 +237,11 @@ func TestRevenueStore_FranchiseIsolation(t *testing.T) {
 	}
 }
 
-// TestRevenueStore_LCOCommission verifies the commission is persisted with the
+// TestFR_FRN_002_RevenueStore_LCOCommission verifies the commission is persisted with the
 // exact decimal the calculator produced.
 //
 // FR-FRN-002 | INT-FRN-002
-func TestRevenueStore_LCOCommission(t *testing.T) {
+func TestFR_FRN_002_RevenueStore_LCOCommission(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 

@@ -109,12 +109,12 @@ func itSeedSession() *health.SessionSummary {
 
 // ── INT-HEALTH-001 ──────────────────────────────────────────────────────────
 
-// TestSubscriberHealth_SingleCallAssembly verifies one request returns 200 with
+// TestFR_OBS_004_SubscriberHealth_SingleCallAssembly verifies one request returns 200 with
 // the live session assembled from the cache and the account state from the DB,
 // within the 200ms response budget.
 //
 // INT-HEALTH-001 | FR-OBS-004, NFR-PERF-002
-func TestSubscriberHealth_SingleCallAssembly(t *testing.T) {
+func TestFR_OBS_004_SubscriberHealth_SingleCallAssembly(t *testing.T) {
 	db := &itHealthDB{records: map[int]*health.SubscriberRecord{501: itSeedSubscriber()}}
 	cache := &itSessionCache{sessions: map[int]*health.SessionSummary{501: itSeedSession()}}
 
@@ -212,11 +212,11 @@ func TestSubscriberHealth_FanOutIsConcurrent(t *testing.T) {
 	}
 }
 
-// TestSubscriberHealth_FupStatusThresholds verifies the FUP banding reported to
+// TestFR_OBS_004_SubscriberHealth_FupStatusThresholds verifies the FUP banding reported to
 // support staff.
 //
 // INT-HEALTH-001 (supporting) | FR-OBS-004
-func TestSubscriberHealth_FupStatusThresholds(t *testing.T) {
+func TestFR_OBS_004_SubscriberHealth_FupStatusThresholds(t *testing.T) {
 	cases := []struct {
 		pctUsed int
 		want    string
@@ -252,11 +252,11 @@ func TestSubscriberHealth_FupStatusThresholds(t *testing.T) {
 	}
 }
 
-// TestSubscriberHealth_OfflineSubscriber verifies a subscriber with no live
+// TestFR_OBS_004_SubscriberHealth_OfflineSubscriber verifies a subscriber with no live
 // session still returns their account state, with a null active_session.
 //
 // INT-HEALTH-001 (supporting) | FR-OBS-004
-func TestSubscriberHealth_OfflineSubscriber(t *testing.T) {
+func TestFR_OBS_004_SubscriberHealth_OfflineSubscriber(t *testing.T) {
 	handler := health.NewHandler(
 		&itHealthDB{records: map[int]*health.SubscriberRecord{501: itSeedSubscriber()}},
 		&itSessionCache{sessions: map[int]*health.SessionSummary{}}, // nobody online
@@ -283,12 +283,12 @@ func TestSubscriberHealth_OfflineSubscriber(t *testing.T) {
 	}
 }
 
-// TestSubscriberHealth_CacheFailureDoesNotFailRequest verifies a Redis outage
+// TestFR_OBS_004_SubscriberHealth_CacheFailureDoesNotFailRequest verifies a Redis outage
 // degrades the response rather than breaking the diagnostic endpoint, which is
 // exactly when support needs it.
 //
 // INT-HEALTH-001 (supporting) | FR-OBS-004
-func TestSubscriberHealth_CacheFailureDoesNotFailRequest(t *testing.T) {
+func TestFR_OBS_004_SubscriberHealth_CacheFailureDoesNotFailRequest(t *testing.T) {
 	handler := health.NewHandler(
 		&itHealthDB{records: map[int]*health.SubscriberRecord{501: itSeedSubscriber()}},
 		&itSessionCache{err: fmt.Errorf("redis: connection refused")},
@@ -312,11 +312,11 @@ func TestSubscriberHealth_CacheFailureDoesNotFailRequest(t *testing.T) {
 	}
 }
 
-// TestSubscriberHealth_UnknownSubscriber verifies a missing subscriber returns
+// TestFR_OBS_004_SubscriberHealth_UnknownSubscriber verifies a missing subscriber returns
 // 404 rather than an empty 200.
 //
 // INT-HEALTH-001 (supporting) | FR-OBS-004
-func TestSubscriberHealth_UnknownSubscriber(t *testing.T) {
+func TestFR_OBS_004_SubscriberHealth_UnknownSubscriber(t *testing.T) {
 	handler := health.NewHandler(
 		&itHealthDB{records: map[int]*health.SubscriberRecord{}},
 		&itSessionCache{sessions: map[int]*health.SessionSummary{}},
@@ -330,10 +330,10 @@ func TestSubscriberHealth_UnknownSubscriber(t *testing.T) {
 	}
 }
 
-// TestSubscriberHealth_InvalidID verifies a non-numeric id is rejected.
+// TestFR_OBS_004_SubscriberHealth_InvalidID verifies a non-numeric id is rejected.
 //
 // INT-HEALTH-001 (supporting) | FR-OBS-004
-func TestSubscriberHealth_InvalidID(t *testing.T) {
+func TestFR_OBS_004_SubscriberHealth_InvalidID(t *testing.T) {
 	handler := health.NewHandler(
 		&itHealthDB{records: map[int]*health.SubscriberRecord{}},
 		&itSessionCache{sessions: map[int]*health.SessionSummary{}},

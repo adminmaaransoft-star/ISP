@@ -14,11 +14,11 @@ import (
 
 // ── RadiusStore ─────────────────────────────────────────────────────────────
 
-// TestRadiusStore_GetSubscriberByUsername verifies the AAA lookup returns the
+// TestFR_AAA_002_RadiusStore_GetSubscriberByUsername verifies the AAA lookup returns the
 // plan's rate limit and the subscriber's throttle state.
 //
 // FR-AAA-002
-func TestRadiusStore_GetSubscriberByUsername(t *testing.T) {
+func TestFR_AAA_002_RadiusStore_GetSubscriberByUsername(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -93,10 +93,10 @@ func TestRadiusStore_GetSubscriberByUsername(t *testing.T) {
 
 // ── APIStore ────────────────────────────────────────────────────────────────
 
-// TestAPIStore_SubscriberLifecycle verifies create, read and partial update.
+// TestFR_SUB_001_APIStore_SubscriberLifecycle verifies create, read and partial update.
 //
 // FR-SUB-001
-func TestAPIStore_SubscriberLifecycle(t *testing.T) {
+func TestFR_SUB_001_APIStore_SubscriberLifecycle(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -210,11 +210,11 @@ func TestAPIStore_SubscriberLifecycle(t *testing.T) {
 	})
 }
 
-// TestAPIStore_UpsertKYC verifies encrypted PII is stored once per subscriber
+// TestFR_SEC_002_APIStore_UpsertKYC verifies encrypted PII is stored once per subscriber
 // and replaced rather than duplicated on re-submission.
 //
 // FR-SEC-002
-func TestAPIStore_UpsertKYC(t *testing.T) {
+func TestFR_SEC_002_APIStore_UpsertKYC(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -262,11 +262,11 @@ func TestAPIStore_UpsertKYC(t *testing.T) {
 
 // ── HealthStore ─────────────────────────────────────────────────────────────
 
-// TestHealthStore_GetSubscriberWithMeta verifies the diagnostic view assembles
+// TestFR_OBS_004_HealthStore_GetSubscriberWithMeta verifies the diagnostic view assembles
 // account state, open-ticket count and last notification in one query.
 //
 // FR-OBS-004
-func TestHealthStore_GetSubscriberWithMeta(t *testing.T) {
+func TestFR_OBS_004_HealthStore_GetSubscriberWithMeta(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -327,11 +327,11 @@ func TestHealthStore_GetSubscriberWithMeta(t *testing.T) {
 
 // ── PortalStore ─────────────────────────────────────────────────────────────
 
-// TestPortalStore_ScopingAndProfile verifies portal reads are confined to one
+// TestFR_SUB_001_PortalStore_ScopingAndProfile verifies portal reads are confined to one
 // subscriber and expose only self-service fields.
 //
 // FR-SUB-001, FR-SUB-005
-func TestPortalStore_ScopingAndProfile(t *testing.T) {
+func TestFR_SUB_001_PortalStore_ScopingAndProfile(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -452,12 +452,12 @@ func TestPortalStore_ScopingAndProfile(t *testing.T) {
 	})
 }
 
-// TestPortalStore_GetPlanRenewalInfo verifies the join that
+// TestFR_SUB_003_PortalStore_GetPlanRenewalInfo verifies the join that
 // renewalProcessor.ApplyRenewal (cmd/api/main.go) uses to compute where a
 // renewal should extend plan_expiry to.
 //
 // FR-SUB-003 | MDS §4.9 — portal one-tap renewal
-func TestPortalStore_GetPlanRenewalInfo(t *testing.T) {
+func TestFR_SUB_003_PortalStore_GetPlanRenewalInfo(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 

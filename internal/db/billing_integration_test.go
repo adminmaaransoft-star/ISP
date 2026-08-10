@@ -45,11 +45,11 @@ func posting(subscriberID int, amount, newBalance, token string, franchiseID *in
 	}
 }
 
-// TestBillingStore_RecordRecharge verifies both ledger legs and the wallet
+// TestFR_BIL_003_BillingStore_RecordRecharge verifies both ledger legs and the wallet
 // balance are written, and that only the credit leg carries the token.
 //
 // FR-BIL-003 | INT-BIL-001
-func TestBillingStore_RecordRecharge(t *testing.T) {
+func TestFR_BIL_003_BillingStore_RecordRecharge(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -118,11 +118,11 @@ func TestBillingStore_RecordRecharge(t *testing.T) {
 	})
 }
 
-// TestBillingStore_RecordRechargeIsAtomic verifies a duplicate token rolls the
+// TestFR_BIL_005_BillingStore_RecordRechargeIsAtomic verifies a duplicate token rolls the
 // whole posting back, leaving neither ledger rows nor a changed balance.
 //
 // FR-BIL-005 | INT-BIL-002
-func TestBillingStore_RecordRechargeIsAtomic(t *testing.T) {
+func TestFR_BIL_005_BillingStore_RecordRechargeIsAtomic(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -151,11 +151,11 @@ func TestBillingStore_RecordRechargeIsAtomic(t *testing.T) {
 	}
 }
 
-// TestBillingStore_DecimalPrecision verifies money survives the round trip
+// TestFR_BIL_002_BillingStore_DecimalPrecision verifies money survives the round trip
 // exactly, including values binary floating point cannot represent.
 //
 // FR-BIL-002 | DoD L0-007
-func TestBillingStore_DecimalPrecision(t *testing.T) {
+func TestFR_BIL_002_BillingStore_DecimalPrecision(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -180,11 +180,11 @@ func TestBillingStore_DecimalPrecision(t *testing.T) {
 	}
 }
 
-// TestBillingStore_Dunning verifies the dunning stage and the derived
+// TestFR_BIL_004_BillingStore_Dunning verifies the dunning stage and the derived
 // subscriber status move together.
 //
 // FR-BIL-004
-func TestBillingStore_Dunning(t *testing.T) {
+func TestFR_BIL_004_BillingStore_Dunning(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 
@@ -259,11 +259,11 @@ func TestBillingStore_Dunning(t *testing.T) {
 	})
 }
 
-// TestBillingStore_Invoices verifies invoice persistence and that the schema
+// TestFR_BIL_001_BillingStore_Invoices verifies invoice persistence and that the schema
 // rejects an invoice carrying both intrastate and interstate tax.
 //
 // FR-BIL-001 | INT-BIL-006
-func TestBillingStore_Invoices(t *testing.T) {
+func TestFR_BIL_001_BillingStore_Invoices(t *testing.T) {
 	database, pool := newTestDB(t)
 	ctx := context.Background()
 

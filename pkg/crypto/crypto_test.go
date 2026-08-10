@@ -142,12 +142,12 @@ func TestDecryptMalformedCiphertext(t *testing.T) {
 	}
 }
 
-// TestDecrypt_CrossKeyVersion verifies that ciphertext sealed under any retired
+// TestFR_SEC_003_Decrypt_CrossKeyVersion verifies that ciphertext sealed under any retired
 // key version still decrypts after the active key has rotated forward, and that
 // new writes use the current active version.
 //
 // INT-SEC-004 | FR-SEC-003
-func TestDecrypt_CrossKeyVersion(t *testing.T) {
+func TestFR_SEC_003_Decrypt_CrossKeyVersion(t *testing.T) {
 	// Seal one secret under each of three successive key versions.
 	versions := []string{"v1", "v2", "v3"}
 	keyBytes := map[string][]byte{

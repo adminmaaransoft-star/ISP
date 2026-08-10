@@ -296,11 +296,11 @@ func (p *itPortal) do(t *testing.T, method, path, token, body string) *httptest.
 
 // ── INT-SUB-001 ─────────────────────────────────────────────────────────────
 
-// TestDashboard_ShowsUsage verifies the dashboard returns the subscriber's live
+// TestFR_SUB_001_Dashboard_ShowsUsage verifies the dashboard returns the subscriber's live
 // session usage alongside wallet and plan state.
 //
 // INT-SUB-001 | FR-SUB-001
-func TestDashboard_ShowsUsage(t *testing.T) {
+func TestFR_SUB_001_Dashboard_ShowsUsage(t *testing.T) {
 	session := &portal.ActiveSession{
 		SessionID:    "sess-live-001",
 		NASIP:        "10.10.0.1",
@@ -359,11 +359,11 @@ func TestDashboard_ShowsUsage(t *testing.T) {
 	}
 }
 
-// TestDashboard_ThrottledSessionReported verifies a throttled session surfaces
+// TestFR_SUB_001_Dashboard_ThrottledSessionReported verifies a throttled session surfaces
 // its FUP state so the subscriber can see why speeds dropped.
 //
 // INT-SUB-001 (supporting) | FR-SUB-001
-func TestDashboard_ThrottledSessionReported(t *testing.T) {
+func TestFR_SUB_001_Dashboard_ThrottledSessionReported(t *testing.T) {
 	p := itNewPortal(t, &itSubscriberSeed{
 		ID: 1, Username: "throttled@isp", Password: "pw",
 		PlanName: "Basic", Balance: decimal.Zero, Status: "active",
@@ -385,11 +385,11 @@ func TestDashboard_ThrottledSessionReported(t *testing.T) {
 	}
 }
 
-// TestDashboard_RequiresSubscriberToken verifies the dashboard is closed to
+// TestFR_SUB_001_Dashboard_RequiresSubscriberToken verifies the dashboard is closed to
 // anonymous callers.
 //
 // INT-SUB-001 (supporting) | FR-SUB-001
-func TestDashboard_RequiresSubscriberToken(t *testing.T) {
+func TestFR_SUB_001_Dashboard_RequiresSubscriberToken(t *testing.T) {
 	p := itNewPortal(t, &itSubscriberSeed{ID: 1, Username: "a@isp", Password: "pw", Status: "active"})
 
 	rec := p.do(t, http.MethodGet, "/portal/dashboard", "", "")
@@ -400,12 +400,12 @@ func TestDashboard_RequiresSubscriberToken(t *testing.T) {
 
 // ── INT-SUB-002 ─────────────────────────────────────────────────────────────
 
-// TestRenewal_IdempotentCallback verifies a replayed renewal callback credits
+// TestFR_SUB_003_Renewal_IdempotentCallback verifies a replayed renewal callback credits
 // the wallet once: the balance stays at a single plan price and the second call
 // returns the original transaction.
 //
 // INT-SUB-002 | FR-SUB-003
-func TestRenewal_IdempotentCallback(t *testing.T) {
+func TestFR_SUB_003_Renewal_IdempotentCallback(t *testing.T) {
 	const planPrice = "799.00"
 
 	p := itNewPortal(t, &itSubscriberSeed{
@@ -450,11 +450,11 @@ func TestRenewal_IdempotentCallback(t *testing.T) {
 	}
 }
 
-// TestRenewal_DistinctPaymentsBothCredit guards against the idempotency key
+// TestFR_SUB_003_Renewal_DistinctPaymentsBothCredit guards against the idempotency key
 // swallowing a genuine second renewal.
 //
 // INT-SUB-002 (supporting) | FR-SUB-003
-func TestRenewal_DistinctPaymentsBothCredit(t *testing.T) {
+func TestFR_SUB_003_Renewal_DistinctPaymentsBothCredit(t *testing.T) {
 	p := itNewPortal(t, &itSubscriberSeed{
 		ID: 1, Username: "renew2@isp", Password: "pw", Balance: decimal.Zero, Status: "active",
 	})
@@ -474,11 +474,11 @@ func TestRenewal_DistinctPaymentsBothCredit(t *testing.T) {
 	}
 }
 
-// TestRenewal_CallbackValidation verifies malformed callbacks are refused before
+// TestFR_SUB_003_Renewal_CallbackValidation verifies malformed callbacks are refused before
 // any money moves.
 //
 // INT-SUB-002 (supporting) | FR-SUB-003
-func TestRenewal_CallbackValidation(t *testing.T) {
+func TestFR_SUB_003_Renewal_CallbackValidation(t *testing.T) {
 	p := itNewPortal(t, &itSubscriberSeed{
 		ID: 1, Username: "renew3@isp", Password: "pw", Balance: decimal.Zero, Status: "active",
 	})
@@ -511,11 +511,11 @@ func TestRenewal_CallbackValidation(t *testing.T) {
 	}
 }
 
-// TestRenewal_CallbackRequiresAuth verifies an anonymous caller cannot credit a
+// TestFR_SUB_003_Renewal_CallbackRequiresAuth verifies an anonymous caller cannot credit a
 // wallet.
 //
 // INT-SUB-002 (supporting) | FR-SUB-003
-func TestRenewal_CallbackRequiresAuth(t *testing.T) {
+func TestFR_SUB_003_Renewal_CallbackRequiresAuth(t *testing.T) {
 	p := itNewPortal(t, &itSubscriberSeed{
 		ID: 1, Username: "renew4@isp", Password: "pw", Balance: decimal.Zero, Status: "active",
 	})
@@ -534,11 +534,11 @@ func TestRenewal_CallbackRequiresAuth(t *testing.T) {
 
 // ── INT-SUB-003 ─────────────────────────────────────────────────────────────
 
-// TestNotificationHistory_ScopedToSubscriber verifies each subscriber sees only
+// TestFR_SUB_005_NotificationHistory_ScopedToSubscriber verifies each subscriber sees only
 // their own notification_log rows.
 //
 // INT-SUB-003 | FR-SUB-005
-func TestNotificationHistory_ScopedToSubscriber(t *testing.T) {
+func TestFR_SUB_005_NotificationHistory_ScopedToSubscriber(t *testing.T) {
 	p := itNewPortal(t,
 		&itSubscriberSeed{
 			ID: 1, Username: "alice@isp", Password: "pw-alice", Status: "active",
@@ -588,11 +588,11 @@ func TestNotificationHistory_ScopedToSubscriber(t *testing.T) {
 	}
 }
 
-// TestTicketHistory_ScopedToSubscriber verifies ticket history is scoped the
+// TestFR_SUB_005_TicketHistory_ScopedToSubscriber verifies ticket history is scoped the
 // same way, and that a created ticket is attributed to the caller.
 //
 // INT-SUB-003 (supporting) | FR-SUB-005
-func TestTicketHistory_ScopedToSubscriber(t *testing.T) {
+func TestFR_SUB_005_TicketHistory_ScopedToSubscriber(t *testing.T) {
 	p := itNewPortal(t,
 		&itSubscriberSeed{
 			ID: 1, Username: "alice@isp", Password: "pw-alice", Status: "active",
@@ -638,11 +638,11 @@ func TestTicketHistory_ScopedToSubscriber(t *testing.T) {
 	}
 }
 
-// TestPortalMe_ScopedToSubscriber verifies the profile endpoint returns the
+// TestFR_SUB_005_PortalMe_ScopedToSubscriber verifies the profile endpoint returns the
 // caller's own record.
 //
 // INT-SUB-003 (supporting) | FR-SUB-005
-func TestPortalMe_ScopedToSubscriber(t *testing.T) {
+func TestFR_SUB_005_PortalMe_ScopedToSubscriber(t *testing.T) {
 	p := itNewPortal(t,
 		&itSubscriberSeed{ID: 1, Username: "alice@isp", Password: "pw-alice", Status: "active", PlanName: "Plan A"},
 		&itSubscriberSeed{ID: 2, Username: "bob@isp", Password: "pw-bob", Status: "active", PlanName: "Plan B"},

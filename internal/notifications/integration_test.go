@@ -151,11 +151,11 @@ func itDeliveryCallback(messageID, status string) []byte {
 
 // ── INT-NOTIF-001 ───────────────────────────────────────────────────────────
 
-// TestDispatcher_DND_SuppressesMarketing verifies a DND subscriber receives no
+// TestFR_NOTIF_008_Dispatcher_DND_SuppressesMarketing verifies a DND subscriber receives no
 // marketing message and that the suppression is recorded in notification_log.
 //
 // INT-NOTIF-001 | FR-NOTIF-008
-func TestDispatcher_DND_SuppressesMarketing(t *testing.T) {
+func TestFR_NOTIF_008_Dispatcher_DND_SuppressesMarketing(t *testing.T) {
 	meta := itNewMetaServer(t, "wamid.should_not_be_used", http.StatusOK)
 	store := &itNotifStore{subscriber: &notifications.Subscriber{
 		ID: 1, MobileNumber: "+919876543210", DndOptOut: true,
@@ -198,11 +198,11 @@ func TestDispatcher_DND_SuppressesMarketing(t *testing.T) {
 	}
 }
 
-// TestDispatcher_DND_AllowsTransactional verifies service-critical messages are
+// TestFR_NOTIF_008_Dispatcher_DND_AllowsTransactional verifies service-critical messages are
 // still delivered to a DND subscriber.
 //
 // INT-NOTIF-001 (supporting) | FR-NOTIF-008
-func TestDispatcher_DND_AllowsTransactional(t *testing.T) {
+func TestFR_NOTIF_008_Dispatcher_DND_AllowsTransactional(t *testing.T) {
 	meta := itNewMetaServer(t, "wamid.transactional", http.StatusOK)
 	store := &itNotifStore{subscriber: &notifications.Subscriber{
 		ID: 1, MobileNumber: "+919876543210", DndOptOut: true,
@@ -235,11 +235,11 @@ func TestDispatcher_DND_AllowsTransactional(t *testing.T) {
 
 // ── INT-NOTIF-002 ───────────────────────────────────────────────────────────
 
-// TestWhatsApp_SendTemplate_LogsProviderID verifies the Meta message ID is
+// TestFR_NOTIF_009_WhatsApp_SendTemplate_LogsProviderID verifies the Meta message ID is
 // persisted to notification_log against the whatsapp channel.
 //
 // INT-NOTIF-002 | FR-NOTIF-009
-func TestWhatsApp_SendTemplate_LogsProviderID(t *testing.T) {
+func TestFR_NOTIF_009_WhatsApp_SendTemplate_LogsProviderID(t *testing.T) {
 	const wantID = "wamid.HBgMOTE5ODc2NTQzMjEwFQIAERgSN0"
 	meta := itNewMetaServer(t, wantID, http.StatusOK)
 	store := &itNotifStore{subscriber: &notifications.Subscriber{ID: 2, MobileNumber: "+919876543210"}}
@@ -289,11 +289,11 @@ func TestWhatsApp_SendTemplate_LogsProviderID(t *testing.T) {
 	}
 }
 
-// TestWhatsApp_SendTemplate_APIErrorNotLoggedAsSent verifies a rejected send is
+// TestFR_NOTIF_009_WhatsApp_SendTemplate_APIErrorNotLoggedAsSent verifies a rejected send is
 // reported as an error rather than recorded as delivered.
 //
 // INT-NOTIF-002 (supporting) | FR-NOTIF-009
-func TestWhatsApp_SendTemplate_APIErrorNotLoggedAsSent(t *testing.T) {
+func TestFR_NOTIF_009_WhatsApp_SendTemplate_APIErrorNotLoggedAsSent(t *testing.T) {
 	meta := itNewMetaServer(t, "", http.StatusUnauthorized)
 	store := &itNotifStore{subscriber: &notifications.Subscriber{ID: 3}}
 
@@ -317,11 +317,11 @@ func TestWhatsApp_SendTemplate_APIErrorNotLoggedAsSent(t *testing.T) {
 
 // ── INT-NOTIF-003 ───────────────────────────────────────────────────────────
 
-// TestWhatsAppWebhook_UpdatesDeliveryStatus verifies a signed Meta callback
+// TestFR_NOTIF_011_WhatsAppWebhook_UpdatesDeliveryStatus verifies a signed Meta callback
 // advances the logged notification from sent to delivered.
 //
 // INT-NOTIF-003 | FR-NOTIF-011
-func TestWhatsAppWebhook_UpdatesDeliveryStatus(t *testing.T) {
+func TestFR_NOTIF_011_WhatsAppWebhook_UpdatesDeliveryStatus(t *testing.T) {
 	const appSecret = "meta_app_secret"
 	const messageID = "wamid.delivery_test"
 
@@ -363,11 +363,11 @@ func TestWhatsAppWebhook_UpdatesDeliveryStatus(t *testing.T) {
 	}
 }
 
-// TestWhatsAppWebhook_StatusProgression verifies successive callbacks advance
+// TestFR_NOTIF_011_WhatsAppWebhook_StatusProgression verifies successive callbacks advance
 // the same row through the delivery lifecycle.
 //
 // INT-NOTIF-003 (supporting) | FR-NOTIF-011
-func TestWhatsAppWebhook_StatusProgression(t *testing.T) {
+func TestFR_NOTIF_011_WhatsAppWebhook_StatusProgression(t *testing.T) {
 	const appSecret = "meta_app_secret"
 	const messageID = "wamid.progression"
 
@@ -403,11 +403,11 @@ func TestWhatsAppWebhook_StatusProgression(t *testing.T) {
 
 // ── INT-NOTIF-004 ───────────────────────────────────────────────────────────
 
-// TestWhatsAppWebhook_InvalidHMAC verifies unsigned, wrongly signed and tampered
+// TestFR_NOTIF_011_WhatsAppWebhook_InvalidHMAC verifies unsigned, wrongly signed and tampered
 // callbacks are rejected with 400 and leave notification_log untouched.
 //
 // INT-NOTIF-004 | FR-NOTIF-011
-func TestWhatsAppWebhook_InvalidHMAC(t *testing.T) {
+func TestFR_NOTIF_011_WhatsAppWebhook_InvalidHMAC(t *testing.T) {
 	const appSecret = "meta_app_secret"
 	const messageID = "wamid.hmac_test"
 
@@ -460,11 +460,11 @@ func TestWhatsAppWebhook_InvalidHMAC(t *testing.T) {
 	}
 }
 
-// TestWhatsAppWebhook_TamperedBodyRejected verifies a body altered after signing
+// TestFR_NOTIF_011_WhatsAppWebhook_TamperedBodyRejected verifies a body altered after signing
 // fails validation.
 //
 // INT-NOTIF-004 (supporting) | FR-NOTIF-011
-func TestWhatsAppWebhook_TamperedBodyRejected(t *testing.T) {
+func TestFR_NOTIF_011_WhatsAppWebhook_TamperedBodyRejected(t *testing.T) {
 	const appSecret = "meta_app_secret"
 	store := &itNotifStore{subscriber: &notifications.Subscriber{ID: 7}}
 	handler := notifications.NewWebhookHandler(store, appSecret, "verify-token")
@@ -483,11 +483,11 @@ func TestWhatsAppWebhook_TamperedBodyRejected(t *testing.T) {
 	}
 }
 
-// TestWhatsAppWebhook_VerifyHandshake verifies Meta's subscription handshake
+// TestFR_NOTIF_011_WhatsAppWebhook_VerifyHandshake verifies Meta's subscription handshake
 // echoes the challenge only when the verify token matches.
 //
 // INT-NOTIF-004 (supporting) | FR-NOTIF-011
-func TestWhatsAppWebhook_VerifyHandshake(t *testing.T) {
+func TestFR_NOTIF_011_WhatsAppWebhook_VerifyHandshake(t *testing.T) {
 	handler := notifications.NewWebhookHandler(&itNotifStore{}, "secret", "the-verify-token")
 
 	t.Run("correct token echoes challenge", func(t *testing.T) {

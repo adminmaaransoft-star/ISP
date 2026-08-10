@@ -50,11 +50,11 @@ func itClaimsToken(t *testing.T, claims middleware.Claims) string {
 
 // ── INT-SEC-001 ─────────────────────────────────────────────────────────────
 
-// TestRequireRole_NoToken verifies an unauthenticated request to an admin route
+// TestFR_SEC_005_RequireRole_NoToken verifies an unauthenticated request to an admin route
 // is rejected with 401 and never reaches the handler.
 //
 // INT-SEC-001 | FR-SEC-005
-func TestRequireRole_NoToken(t *testing.T) {
+func TestFR_SEC_005_RequireRole_NoToken(t *testing.T) {
 	cases := []struct {
 		name   string
 		header string
@@ -91,10 +91,10 @@ func TestRequireRole_NoToken(t *testing.T) {
 	}
 }
 
-// TestRequireRole_TokenSignedWithWrongSecret verifies a forged token is refused.
+// TestFR_SEC_005_RequireRole_TokenSignedWithWrongSecret verifies a forged token is refused.
 //
 // INT-SEC-001 (supporting) | FR-SEC-005
-func TestRequireRole_TokenSignedWithWrongSecret(t *testing.T) {
+func TestFR_SEC_005_RequireRole_TokenSignedWithWrongSecret(t *testing.T) {
 	forged, err := jwt.NewWithClaims(jwt.SigningMethodHS256, middleware.Claims{
 		Role:             "isp_owner",
 		RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour))},
@@ -118,11 +118,11 @@ func TestRequireRole_TokenSignedWithWrongSecret(t *testing.T) {
 	}
 }
 
-// TestRequireRole_AlgNoneRejected verifies an unsigned "alg: none" token, the
+// TestFR_SEC_005_RequireRole_AlgNoneRejected verifies an unsigned "alg: none" token, the
 // classic JWT bypass, is refused.
 //
 // INT-SEC-001 (supporting) | FR-SEC-005
-func TestRequireRole_AlgNoneRejected(t *testing.T) {
+func TestFR_SEC_005_RequireRole_AlgNoneRejected(t *testing.T) {
 	unsigned, err := jwt.NewWithClaims(jwt.SigningMethodNone, middleware.Claims{
 		Role:             "isp_owner",
 		RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour))},
@@ -148,11 +148,11 @@ func TestRequireRole_AlgNoneRejected(t *testing.T) {
 
 // ── INT-SEC-002 ─────────────────────────────────────────────────────────────
 
-// TestRequireRole_WrongRoleReturns403 verifies an authenticated CSR cannot reach
+// TestFR_SEC_005_RequireRole_WrongRoleReturns403 verifies an authenticated CSR cannot reach
 // a billing_admin route.
 //
 // INT-SEC-002 | FR-SEC-005
-func TestRequireRole_WrongRoleReturns403(t *testing.T) {
+func TestFR_SEC_005_RequireRole_WrongRoleReturns403(t *testing.T) {
 	handler, reached := itProtectedRoute("billing_admin", "isp_owner")
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/recharge", nil)
@@ -169,11 +169,11 @@ func TestRequireRole_WrongRoleReturns403(t *testing.T) {
 	}
 }
 
-// TestRequireRole_RoleMatrix walks the roles the API grants and denies, so a
+// TestFR_SEC_005_RequireRole_RoleMatrix walks the roles the API grants and denies, so a
 // future change to a route's role list cannot silently widen access.
 //
 // INT-SEC-002 | FR-SEC-005
-func TestRequireRole_RoleMatrix(t *testing.T) {
+func TestFR_SEC_005_RequireRole_RoleMatrix(t *testing.T) {
 	const (
 		allowed = http.StatusOK
 		denied  = http.StatusForbidden
@@ -214,11 +214,11 @@ func TestRequireRole_RoleMatrix(t *testing.T) {
 	}
 }
 
-// TestClaims_FranchiseIDPropagates verifies the franchise binding survives the
+// TestFR_FRN_001_Claims_FranchiseIDPropagates verifies the franchise binding survives the
 // JWT round-trip so downstream row-level scoping can rely on it.
 //
 // INT-SEC-002 (supporting) | FR-FRN-001
-func TestClaims_FranchiseIDPropagates(t *testing.T) {
+func TestFR_FRN_001_Claims_FranchiseIDPropagates(t *testing.T) {
 	var gotRole string
 	var gotFranchise, gotSubscriber int
 

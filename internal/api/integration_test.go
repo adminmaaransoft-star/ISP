@@ -142,12 +142,12 @@ func itKeyStore(t *testing.T, active string, versions ...string) crypto.KeyStore
 
 // ── INT-SEC-003 ─────────────────────────────────────────────────────────────
 
-// TestCreateSubscriber_EncryptsPII verifies Aadhaar and PAN submitted through
+// TestFR_SEC_002_CreateSubscriber_EncryptsPII verifies Aadhaar and PAN submitted through
 // the API are stored as version-prefixed ciphertext, decrypt back to the
 // original values, and never appear in plaintext in persisted state.
 //
 // INT-SEC-003 | FR-SEC-002
-func TestCreateSubscriber_EncryptsPII(t *testing.T) {
+func TestFR_SEC_002_CreateSubscriber_EncryptsPII(t *testing.T) {
 	const (
 		aadhaar = "123456789012"
 		pan     = "ABCDE1234F"
@@ -232,11 +232,11 @@ func TestCreateSubscriber_EncryptsPII(t *testing.T) {
 	}
 }
 
-// TestCreateSubscriber_PasswordNeverStoredInClear verifies the submitted
+// TestFR_SEC_002_CreateSubscriber_PasswordNeverStoredInClear verifies the submitted
 // password is bcrypt-hashed before it reaches the store.
 //
 // INT-SEC-003 (supporting) | FR-SEC-002
-func TestCreateSubscriber_PasswordNeverStoredInClear(t *testing.T) {
+func TestFR_SEC_002_CreateSubscriber_PasswordNeverStoredInClear(t *testing.T) {
 	const password = "sup3r-s3cret-pw"
 
 	subs := &itSubscriberStore{}
@@ -271,11 +271,11 @@ func TestCreateSubscriber_PasswordNeverStoredInClear(t *testing.T) {
 	}
 }
 
-// TestCreateSubscriber_RequiresAdminRole verifies subscriber creation is closed
+// TestFR_SEC_005_CreateSubscriber_RequiresAdminRole verifies subscriber creation is closed
 // to non-admin roles.
 //
 // INT-SEC-003 (supporting) | FR-SEC-005
-func TestCreateSubscriber_RequiresAdminRole(t *testing.T) {
+func TestFR_SEC_005_CreateSubscriber_RequiresAdminRole(t *testing.T) {
 	subs := &itSubscriberStore{}
 	h := api.NewHandler(api.HandlerDeps{
 		DB: subs, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}), KeyStore: itKeyStore(t, "v1", "v1"),

@@ -121,11 +121,11 @@ func (l *itLedger) rowsFor(subscriberID int) []billing.WalletEntry {
 
 // ── INT-BIL-001 ─────────────────────────────────────────────────────────────
 
-// TestWalletRecharge_DoubleLedger verifies a recharge posts both ledger legs and
+// TestFR_BIL_003_WalletRecharge_DoubleLedger verifies a recharge posts both ledger legs and
 // updates the subscriber balance.
 //
 // INT-BIL-001 | FR-BIL-003
-func TestWalletRecharge_DoubleLedger(t *testing.T) {
+func TestFR_BIL_003_WalletRecharge_DoubleLedger(t *testing.T) {
 	ledger := newITLedger()
 	svc := billing.NewWalletService(ledger)
 
@@ -180,11 +180,11 @@ func TestWalletRecharge_DoubleLedger(t *testing.T) {
 	}
 }
 
-// TestWalletRecharge_FailedPostingLeavesNoPartialState verifies a failure while
+// TestFR_BIL_003_WalletRecharge_FailedPostingLeavesNoPartialState verifies a failure while
 // posting leaves neither ledger rows nor a changed balance behind.
 //
 // INT-BIL-001 (supporting) | FR-BIL-003
-func TestWalletRecharge_FailedPostingLeavesNoPartialState(t *testing.T) {
+func TestFR_BIL_003_WalletRecharge_FailedPostingLeavesNoPartialState(t *testing.T) {
 	ledger := newITLedger()
 	ledger.failPosting = true
 	svc := billing.NewWalletService(ledger)
@@ -208,11 +208,11 @@ func TestWalletRecharge_FailedPostingLeavesNoPartialState(t *testing.T) {
 
 // ── INT-BIL-002 ─────────────────────────────────────────────────────────────
 
-// TestWalletRecharge_Idempotent verifies a replayed transaction_token returns
+// TestFR_BIL_005_WalletRecharge_Idempotent verifies a replayed transaction_token returns
 // the original transaction and does not credit the wallet twice.
 //
 // INT-BIL-002 | FR-BIL-005
-func TestWalletRecharge_Idempotent(t *testing.T) {
+func TestFR_BIL_005_WalletRecharge_Idempotent(t *testing.T) {
 	ledger := newITLedger()
 	svc := billing.NewWalletService(ledger)
 	ctx := context.Background()
@@ -245,11 +245,11 @@ func TestWalletRecharge_Idempotent(t *testing.T) {
 	}
 }
 
-// TestWalletRecharge_DistinctTokensBothApply guards against the idempotency
+// TestFR_BIL_005_WalletRecharge_DistinctTokensBothApply guards against the idempotency
 // check being too broad and swallowing genuine second payments.
 //
 // INT-BIL-002 (supporting) | FR-BIL-005
-func TestWalletRecharge_DistinctTokensBothApply(t *testing.T) {
+func TestFR_BIL_005_WalletRecharge_DistinctTokensBothApply(t *testing.T) {
 	ledger := newITLedger()
 	svc := billing.NewWalletService(ledger)
 	ctx := context.Background()
@@ -336,11 +336,11 @@ func itWebhookBody(subscriberID int, paymentID string, paise int64) []byte {
 	return b
 }
 
-// TestWebhookHMAC_ValidSignatureAccepted verifies a correctly signed Razorpay
+// TestFR_SEC_004_WebhookHMAC_ValidSignatureAccepted verifies a correctly signed Razorpay
 // callback is accepted and credits the wallet.
 //
 // INT-BIL-003 | FR-SEC-004
-func TestWebhookHMAC_ValidSignatureAccepted(t *testing.T) {
+func TestFR_SEC_004_WebhookHMAC_ValidSignatureAccepted(t *testing.T) {
 	const secret = "razorpay_webhook_secret"
 	ledger := newITLedger()
 	handler := itRazorpayWebhook(billing.NewWalletService(ledger), secret)
@@ -365,11 +365,11 @@ func TestWebhookHMAC_ValidSignatureAccepted(t *testing.T) {
 	}
 }
 
-// TestWebhookHMAC_InvalidSignatureRejected verifies a tampered callback is
+// TestFR_SEC_004_WebhookHMAC_InvalidSignatureRejected verifies a tampered callback is
 // rejected with 400 and leaves the wallet untouched.
 //
 // INT-BIL-004 | FR-SEC-004
-func TestWebhookHMAC_InvalidSignatureRejected(t *testing.T) {
+func TestFR_SEC_004_WebhookHMAC_InvalidSignatureRejected(t *testing.T) {
 	const secret = "razorpay_webhook_secret"
 	ledger := newITLedger()
 	handler := itRazorpayWebhook(billing.NewWalletService(ledger), secret)
@@ -408,11 +408,11 @@ func TestWebhookHMAC_InvalidSignatureRejected(t *testing.T) {
 	}
 }
 
-// TestWebhookHMAC_TamperedBodyRejected verifies that altering the body after
+// TestFR_SEC_004_WebhookHMAC_TamperedBodyRejected verifies that altering the body after
 // signing invalidates the signature.
 //
 // INT-BIL-004 (supporting) | FR-SEC-004
-func TestWebhookHMAC_TamperedBodyRejected(t *testing.T) {
+func TestFR_SEC_004_WebhookHMAC_TamperedBodyRejected(t *testing.T) {
 	const secret = "razorpay_webhook_secret"
 	ledger := newITLedger()
 	handler := itRazorpayWebhook(billing.NewWalletService(ledger), secret)
@@ -437,11 +437,11 @@ func TestWebhookHMAC_TamperedBodyRejected(t *testing.T) {
 
 // ── INT-BIL-005 ─────────────────────────────────────────────────────────────
 
-// TestCalculateGstInvoice_TN verifies the exact CGST/SGST/IGST split and total
+// TestFR_BIL_001_CalculateGstInvoice_TN verifies the exact CGST/SGST/IGST split and total
 // for a Tamil Nadu intrastate invoice on a ₹799.00 base.
 //
 // INT-BIL-005 | FR-BIL-001
-func TestCalculateGstInvoice_TN(t *testing.T) {
+func TestFR_BIL_001_CalculateGstInvoice_TN(t *testing.T) {
 	rate := billing.GstRate{
 		ID:       1,
 		CgstRate: decimal.RequireFromString("9.00"),
