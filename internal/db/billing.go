@@ -154,6 +154,51 @@ func (s *BillingStore) GetSubscriberDunningState(ctx context.Context, subscriber
 	return billing.DunningState(state), expiry, nil
 }
 
+// ListDunningCandidates returns every subscriber whose dunning stage may need
+// to advance, newest expiry first.
+//
+// The filter is deliberately broad — anything with a plan expiry inside the
+// dunning window, plus anything already mid-dunning regardless of date. Which
+// stage a subscriber actually belongs in is decided in one place,
+// billing.NextDunningState, rather than being split between a SQL predicate
+// here and Go there; two copies of that rule would drift.
+//
+// Terminated subscribers are excluded: they have left, and re-suspending them
+// every hour would be noise.
+func (s *BillingStore) ListDunningCandidates(ctx context.Context) ([]billing.DunningCandidate, error) {
+	const q = `
+		SELECT id, username, COALESCE(mobile_number, ''), dunning_state, plan_expiry
+		  FROM subscribers
+		 WHERE plan_expiry IS NOT NULL
+		   AND status <> 'terminated'
+		   AND (plan_expiry <= NOW() + INTERVAL '7 days'
+		        OR dunning_state <> 'active')
+		 ORDER BY plan_expiry DESC`
+
+	rows, err := s.pool.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("db: list dunning candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var out []billing.DunningCandidate
+	for rows.Next() {
+		var (
+			c     billing.DunningCandidate
+			state string
+		)
+		if err := rows.Scan(&c.SubscriberID, &c.Username, &c.MobileNumber, &state, &c.PlanExpiry); err != nil {
+			return nil, fmt.Errorf("db: scan dunning candidate: %w", err)
+		}
+		c.State = billing.DunningState(state)
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterate dunning candidates: %w", err)
+	}
+	return out, nil
+}
+
 // SetSubscriberDunningState advances the dunning stage and the derived
 // subscribers.status that RADIUS enforces on the next Access-Request.
 //

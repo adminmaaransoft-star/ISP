@@ -84,3 +84,42 @@ func TestFR_NOTIF_010_SendTemplate_UsesApprovedNameOnTheWire(t *testing.T) {
 		t.Error("the internal template id leaked to Meta; it expects the approved name")
 	}
 }
+
+// TestFR_NOTIF_009_SendTemplate_LogsFailedDispatch — a provider rejection must
+// leave a row behind. Without one, notification_log cannot distinguish "we
+// never tried to warn this subscriber" from "we tried and Meta refused", and
+// those are very different answers when a customer was suspended without
+// warning. This path wrote nothing until 2026-08-11, while the DoD recorded
+// the requirement as passing on the strength of a code read.
+func TestFR_NOTIF_009_SendTemplate_LogsFailedDispatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized) // what an unconfigured deployment gets
+	}))
+	defer srv.Close()
+
+	db := &stubNotifDB{subscriber: &notifications.Subscriber{ID: 1, MobileNumber: "+919876543210"}}
+	c := notifications.NewWhatsAppClient("phone-id", "token", db)
+	c.SetBaseURL(srv.URL)
+
+	err := c.SendTemplate(context.Background(), notifications.TemplateMessage{
+		SubscriberID: 1,
+		ToPhoneE164:  "+919876543210",
+		TemplateName: "payment_reminder",
+		TemplateID:   "TMPL-003",
+		TriggerEvent: "dunning_remind_3d",
+	})
+	if err == nil {
+		t.Fatal("a 401 from the provider must surface as an error")
+	}
+
+	if len(db.loggedEntries) != 1 {
+		t.Fatalf("want 1 notification_log row for the failed attempt, got %d", len(db.loggedEntries))
+	}
+	entry := db.loggedEntries[0]
+	if entry.DeliveryStatus != "failed" {
+		t.Errorf("delivery_status: want \"failed\", got %q", entry.DeliveryStatus)
+	}
+	if entry.TemplateID != "TMPL-003" || entry.TriggeredByEvent != "dunning_remind_3d" {
+		t.Errorf("the row must say which message failed and why it was sent: %+v", entry)
+	}
+}

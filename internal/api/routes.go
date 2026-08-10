@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/hibiken/asynq"
 	"github.com/maaransoft/isp-bss-oss/internal/billing"
 	"github.com/maaransoft/isp-bss-oss/internal/middleware"
 	"github.com/maaransoft/isp-bss-oss/pkg/crypto"
@@ -382,7 +383,55 @@ func (h *Handler) WalletRecharge(w http.ResponseWriter, r *http.Request) {
 	middleware.Audit(r.Context(), "wallet.recharge", strconv.Itoa(req.SubscriberID), map[string]any{
 		"amount": req.Amount, "method": req.PaymentMethod,
 	})
+	h.enqueuePaymentReceipt(r.Context(), req.SubscriberID, req.Amount, tx.BalanceAfter.String())
 	writeJSON(w, http.StatusOK, tx)
+}
+
+// enqueuePaymentReceipt tells the subscriber their money arrived
+// (FR-NOTIF-004), and where the payment lifted a suspension, that they are
+// back online (FR-NOTIF-006).
+//
+// Failures are logged, never returned: the money is already banked and the
+// ledger already written by this point, so failing the request over an
+// undelivered receipt would tell the caller their payment did not go through
+// when it did.
+func (h *Handler) enqueuePaymentReceipt(ctx context.Context, subscriberID int, amount, newBalance string) {
+	if h.tasks == nil || h.db == nil {
+		return
+	}
+
+	sub, err := h.db.GetSubscriberByID(ctx, subscriberID)
+	if err != nil || sub == nil {
+		log.Warn().Err(err).Int("subscriber_id", subscriberID).
+			Msg("api: payment receipt skipped — subscriber lookup failed")
+		return
+	}
+
+	// Only call it a restoration if service was actually restricted. Telling a
+	// subscriber who was never cut off that they have been reconnected is worse
+	// than saying nothing.
+	restored := sub.Status == "grace_period" || sub.Status == "soft_suspended" || sub.Status == "hard_suspended"
+
+	payload, err := json.Marshal(billing.PaymentReceiptPayload{
+		SubscriberID: subscriberID,
+		Username:     sub.Username,
+		Amount:       amount,
+		NewBalance:   newBalance,
+		Restored:     restored,
+	})
+	if err != nil {
+		log.Warn().Err(err).Msg("api: payment receipt payload marshal failed")
+		return
+	}
+
+	task := asynq.NewTask(billing.TaskTypePaymentReceipt, payload,
+		asynq.Queue(billing.QueueNotifications),
+		asynq.MaxRetry(3),
+		asynq.Retention(24*time.Hour))
+	if _, err := h.tasks.Enqueue(task); err != nil {
+		log.Warn().Err(err).Int("subscriber_id", subscriberID).
+			Msg("api: payment receipt enqueue failed")
+	}
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

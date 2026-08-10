@@ -25,6 +25,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"github.com/maaransoft/isp-bss-oss/internal/billing"
 	"github.com/maaransoft/isp-bss-oss/internal/cache"
 	"github.com/maaransoft/isp-bss-oss/internal/config"
 	"github.com/maaransoft/isp-bss-oss/internal/db"
@@ -111,12 +112,29 @@ func run() error {
 		log.Info().Msg("radiusd: FUP scanner stopped")
 	}()
 
+	// ── Dunning scanner ─────────────────────────────────────────────────────
+
+	// Advances subscribers through remind_7d → … → hard_suspended and sends the
+	// notice for each stage. The state machine it drives shipped complete and
+	// tested but with no caller, so until this was wired nobody was reminded to
+	// pay and nobody was suspended for not paying.
+	dunningScanner := billing.NewDunningScanner(database.Billing(), asynqClient)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Info().Msg("radiusd: dunning scanner started")
+		dunningScanner.Run(ctx)
+		log.Info().Msg("radiusd: dunning scanner stopped")
+	}()
+
 	// ── Asynq workers ───────────────────────────────────────────────────────
 
 	dispatcher := newDispatcher(cfg, database)
 	coaHandler := fup.NewCoAHandler(database.FUP(), []byte(cfg.RadiusSecret))
 	podHandler := fup.NewPoDHandler(database.FUP(), []byte(cfg.RadiusSecret))
 	warningHandler := fup.NewWarningHandler(dispatcher)
+	dunningNoticeHandler := billing.NewDunningNoticeHandler(dispatcher)
+	paymentReceiptHandler := billing.NewPaymentReceiptHandler(dispatcher)
 
 	workerServer := asynq.NewServer(asynqRedis, asynq.Config{
 		Concurrency: workerConcurrency,
@@ -136,6 +154,8 @@ func run() error {
 	workerMux.Handle(fup.TaskTypeCoA, coaHandler)
 	workerMux.Handle(fup.TaskTypePoD, podHandler)
 	workerMux.Handle(fup.TaskTypeFUPWarning, warningHandler)
+	workerMux.Handle(billing.TaskTypeDunningNotice, dunningNoticeHandler)
+	workerMux.Handle(billing.TaskTypePaymentReceipt, paymentReceiptHandler)
 
 	if err := workerServer.Start(workerMux); err != nil {
 		return fmt.Errorf("start Asynq workers: %w", err)

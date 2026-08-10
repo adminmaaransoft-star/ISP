@@ -166,6 +166,23 @@ func (c *WhatsAppClient) SendTemplate(ctx context.Context, req TemplateMessage) 
 
 	if resp.StatusCode >= http.StatusBadRequest {
 		notificationDispatchTotal.WithLabelValues("whatsapp", req.TemplateID, "failed").Inc()
+
+		// Log the attempt, not just the successes. FR-NOTIF-009 asks for a row
+		// per dispatch attempt, and until this was added a provider rejection
+		// left no trace at all: an operator reading notification_log could not
+		// tell "we never tried to warn this subscriber" from "we tried and Meta
+		// refused", which are very different answers when someone was suspended
+		// without warning.
+		if err := c.db.CreateNotificationLog(ctx, NotificationLog{
+			SubscriberID:     req.SubscriberID,
+			Channel:          "whatsapp",
+			TemplateID:       req.TemplateID,
+			TriggeredByEvent: req.TriggerEvent,
+			DeliveryStatus:   "failed",
+			SentAt:           time.Now(),
+		}); err != nil {
+			log.Warn().Err(err).Msg("notifications: failed to persist failed-dispatch notification_log")
+		}
 		return fmt.Errorf("notifications: whatsapp API returned HTTP %d", resp.StatusCode)
 	}
 

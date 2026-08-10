@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/hibiken/asynq"
 	"github.com/maaransoft/isp-bss-oss/internal/api"
 	"github.com/maaransoft/isp-bss-oss/internal/billing"
 	"github.com/maaransoft/isp-bss-oss/internal/middleware"
@@ -670,5 +672,137 @@ func TestWalletRecharge_InvalidAmount(t *testing.T) {
 
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("want 422 for an unparseable amount, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── Payment receipt (FR-NOTIF-004 / FR-NOTIF-006) ───────────────────────────
+
+// itTaskRecorder captures enqueued Asynq tasks.
+type itTaskRecorder struct {
+	mu    sync.Mutex
+	tasks []*asynq.Task
+	err   error
+}
+
+func (r *itTaskRecorder) Enqueue(task *asynq.Task, _ ...asynq.Option) (*asynq.TaskInfo, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return nil, r.err
+	}
+	r.tasks = append(r.tasks, task)
+	return &asynq.TaskInfo{}, nil
+}
+
+func (r *itTaskRecorder) receipts(t *testing.T) []billing.PaymentReceiptPayload {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []billing.PaymentReceiptPayload
+	for _, task := range r.tasks {
+		if task.Type() != billing.TaskTypePaymentReceipt {
+			continue
+		}
+		var p billing.PaymentReceiptPayload
+		if err := json.Unmarshal(task.Payload(), &p); err != nil {
+			t.Fatalf("decode receipt payload: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func itRechargeWithStatus(t *testing.T, status string) *itTaskRecorder {
+	t.Helper()
+	store := &itSubscriberStore{
+		rows:   []api.SubscriberRecord{{ID: 1, Username: "sub1", Status: status}},
+		nextID: 1,
+	}
+	tasks := &itTaskRecorder{}
+	h := api.NewHandler(api.HandlerDeps{
+		DB: store, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}),
+		KeyStore: itKeyStore(t, "v1", "v1"), Tasks: tasks,
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, itJWTSecret)
+
+	body, _ := json.Marshal(map[string]any{
+		"subscriber_id": 1, "amount": "500.00", "payment_method": "razorpay",
+		"transaction_token": "tok_receipt_" + status,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/recharge", bytes.NewReader(body)) //nolint:noctx
+	req.Header.Set("Authorization", "Bearer "+itAdminToken(t))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recharge: want 200, got %d — %s", rec.Code, rec.Body.String())
+	}
+	return tasks
+}
+
+// TestFR_NOTIF_004_Recharge_EnqueuesPaymentReceipt — a subscriber who pays must
+// be told the money arrived. Nothing sent one before this was wired.
+func TestFR_NOTIF_004_Recharge_EnqueuesPaymentReceipt(t *testing.T) {
+	receipts := itRechargeWithStatus(t, "active").receipts(t)
+
+	if len(receipts) != 1 {
+		t.Fatalf("want exactly 1 payment receipt, got %d", len(receipts))
+	}
+	if receipts[0].SubscriberID != 1 || receipts[0].Amount != "500.00" {
+		t.Errorf("receipt does not describe the payment made: %+v", receipts[0])
+	}
+	// An account that was never cut off must not be told it has been restored.
+	if receipts[0].Restored {
+		t.Error("an active subscriber's receipt must not claim service was restored")
+	}
+}
+
+// TestFR_NOTIF_006_Recharge_FlagsRestorationForSuspended covers the other half:
+// paying while suspended is the event a subscriber most wants confirmed, and it
+// is a different message from an ordinary receipt.
+func TestFR_NOTIF_006_Recharge_FlagsRestorationForSuspended(t *testing.T) {
+	for _, status := range []string{"grace_period", "soft_suspended", "hard_suspended"} {
+		t.Run(status, func(t *testing.T) {
+			receipts := itRechargeWithStatus(t, status).receipts(t)
+			if len(receipts) != 1 {
+				t.Fatalf("want 1 receipt, got %d", len(receipts))
+			}
+			if !receipts[0].Restored {
+				t.Errorf("a payment from %s must be flagged as a restoration", status)
+			}
+		})
+	}
+}
+
+// TestFR_NOTIF_004_Recharge_SucceedsWhenReceiptCannotBeQueued — the money is
+// banked and the ledger written before the receipt is enqueued, so a queue
+// failure must not fail the request. Telling a caller their payment did not go
+// through when it did is worse than a missing message.
+func TestFR_NOTIF_004_Recharge_SucceedsWhenReceiptCannotBeQueued(t *testing.T) {
+	store := &itSubscriberStore{
+		rows:   []api.SubscriberRecord{{ID: 1, Username: "sub1", Status: "active"}},
+		nextID: 1,
+	}
+	tasks := &itTaskRecorder{err: errors.New("redis down")}
+	h := api.NewHandler(api.HandlerDeps{
+		DB: store, KYC: &itKYCStore{}, Wallet: billing.NewWalletService(&stubWallet{}),
+		KeyStore: itKeyStore(t, "v1", "v1"), Tasks: tasks,
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, itJWTSecret)
+
+	body, _ := json.Marshal(map[string]any{
+		"subscriber_id": 1, "amount": "500.00", "payment_method": "razorpay", "transaction_token": "tok_qfail",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/wallets/recharge", bytes.NewReader(body)) //nolint:noctx
+	req.Header.Set("Authorization", "Bearer "+itAdminToken(t))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recharge must still succeed when the receipt cannot be queued, got %d", rec.Code)
 	}
 }
