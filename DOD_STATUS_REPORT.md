@@ -1,7 +1,7 @@
 # Definition of Done — Status Report
 
 **Original audit:** 2026-08-08
-**Last revised:** 2026-08-10 (post-remediation; L6-004 numbers corrected — see Finding #6)
+**Last revised:** 2026-08-10 (post-remediation; see Finding #7 — an unauthenticated endpoint found and closed after tagging)
 **Scope:** Whole-codebase audit against the 66-item DoD checklist in `bss_oss_dev_tracker_v3.xlsx` → sheet "✅ Definition of Done" (levels L0–L8).
 **Methodology:** Every check below was either (a) executed live against this repo/a real Postgres instance/the running demo stack, or (b) verified by direct code/config inspection with exact file:line evidence. Checks that genuinely require infrastructure not available are marked **NOT VERIFIED**, not silently assumed passing. See "Methodology & Limitations" at the end.
 
@@ -17,7 +17,9 @@ Of the 66 rows in the tracker, **65 carry an actual check**; row `L0-011` is an 
 | ⬜ NOT VERIFIED (needs infrastructure not available) | 1 | 2% | 4 |
 | ⬜ PENDING (manual tracker administration) | 4 | 6% | 4 |
 
-**All four of the original audit's critical findings are now closed**, and every L6 row except the 1-hour soak has been measured rather than assumed. The four remaining failures are two permanently-unachievable TDD-ordering rows, one coverage shortfall, and one newly-measured infrastructure gap (Sentinel failover, Finding #6) — none in functional or security correctness.
+**All four of the original audit's critical findings are now closed**, and every L6 row except the 1-hour soak has been measured rather than assumed. The four remaining failures are two permanently-unachievable TDD-ordering rows, one coverage shortfall, and one newly-measured infrastructure gap (Sentinel failover, Finding #6).
+
+**One caveat on reading this scorecard.** Finding #7 — an unauthenticated endpoint disclosing subscriber IPs — was live while every row below already read PASS, and was found by a stakeholder question rather than by any check on this list. The L4 authorisation rows were not wrong; the leaking route simply never reached the middleware they test. Treat 52/65 as a floor, not a clean bill of health.
 
 ### What changed since the original audit
 
@@ -40,7 +42,7 @@ Of the 66 rows in the tracker, **65 carry an actual check**; row `L0-011` is an 
 
 ## Critical Findings (read this part first)
 
-> **Findings 1-5 are RESOLVED as of 2026-08-10; Finding 6 is OPEN.** They are
+> **Findings 1-5 and 7 are RESOLVED as of 2026-08-10; Finding 6 is OPEN.** They are
 > kept in full rather than deleted, because each records a real defect that was
 > live in this codebase, and a resolution note is only meaningful next to the
 > diagnosis it resolves. Each resolved finding carries a ✅ **Resolved** note at
@@ -136,6 +138,29 @@ It then never promotes a replica at all — 60 seconds later there is still no m
 
 **Decision needed** (not a code fix). The recommendation recorded for the tracker is: **lower `down-after-milliseconds` to 500 and move the target from 3s to 8s.** Rationale — 3s was never met even in principle by the shipped config, the tuned configuration lands at ~3.1s with run-to-run variance of ±100ms so a 3s target would be permanently flaky, and 8s leaves headroom for the promotion sequence's observed 0.9–2.2s spread while still being far inside any realistic subscriber-visible tolerance for a re-auth. The DNS/tilt behaviour is a separate defect that a target change does not address and should be tracked as its own item.
 
+### 7. An unauthenticated endpoint leaked subscriber diagnostics *(found 2026-08-10, RESOLVED)*
+
+Found while answering a stakeholder question about whether an admin UI existed — not by any check on this list, which is the part worth dwelling on.
+
+`GET /api/v1/subscribers/{id}/health-detail` returned a subscriber's username, account status, wallet balance, live session, NAS address and **assigned IP** to any caller, with no token, through the public reverse proxy:
+
+```
+$ curl -k https://host/api/v1/subscribers/1/health-detail
+{"subscriber_id":1,"username":"test_user","status":"active",
+ "wallet_balance":"799","active_session":{"assigned_ip":"100.64.0.7",
+ "nas_ip":"10.10.0.1",...},"open_tickets":0}
+```
+
+It was enumerable — `1` and `2` returned data, `3` returned 404, so account existence was discoverable too — and nothing was written to `lea_audit_log`.
+
+**The leaked field that matters is `assigned_ip`.** Migration 014, the `bss_app` least-privilege role and `POST /api/v1/lea/lookup` exist specifically to keep IP-to-subscriber correlation access-controlled and tamper-evident. This route handed out the same correlation with no authentication and no audit trail, routing around the control Finding #2 was spent building. Fixing the database layer did not matter while an HTTP route gave the answer away for free.
+
+**Cause.** `cmd/api/main.go` registered the real handler with `mux.HandleFunc` *after* `apiHandler.RegisterRoutes`. A route added to the mux that way carries no middleware. Its comment read "api.Handler only reserves the route, so bind the real implementation over it here" — but it bound a *different* path, so nothing was overridden: the documented route answered 501 while an undocumented one answered 200 with the data. The intent was right; the path was wrong, and the mistake was invisible because both routes existed and only one was ever tested.
+
+**Why no check caught it.** L4-005 and L4-006 both pass and always did — the middleware was never broken. Every test aimed at this endpoint asserted the *placeholder's* 501, so the suite confirmed the documented route behaved as designed while the real data left by a door nobody had written a test for. A checklist that verifies middleware behaviour cannot catch a route that never reaches the middleware.
+
+✅ **Resolved** (commit `4b6c2f8`). The handler is now injected through `api.HandlerDeps` and served behind the same `staffRead` authorisation as its neighbours; the `health-detail` registration is deleted. This also implements **FR-OBS-004**, which had been returning 501 while a complete, fully-covered implementation sat unused in `internal/health`. Four regression tests were added — the significant one asserts the handler is never *reached* without a token, since a 401 returned after the body was written would still be a disclosure. The three remaining raw mux registrations were audited: both WhatsApp webhooks self-verify and `/readyz` is a deliberately public probe.
+
 ---
 
 ## L0 · Every Task (10 checks)
@@ -208,7 +233,7 @@ All four are fixed in commit `cb1d2bf` (renamed where they were testing somethin
 | L4-003 | AES ciphertext non-deterministic | ✅ PASS | `TestEncryptNonDeterministic` exists in `pkg/crypto`. |
 | L4-004 | Cross-rotation decryption works | ✅ PASS | `TestCrossRotationDecrypt`, `TestDecrypt_CrossKeyVersion` exist. |
 | L4-005 | Expired JWT → 401 | ✅ PASS | `TestJWTMiddleware_ExpiredToken` exists. |
-| L4-006 | Wrong role → 403 | ✅ PASS | `TestRequireRole_WrongRoleReturns403`, `TestRequireRole_RoleMatrix` exist. |
+| L4-006 | Wrong role → 403 | ✅ PASS | `TestRequireRole_WrongRoleReturns403`, `TestRequireRole_RoleMatrix` exist. **Re-verified 2026-08-10** after Finding #7: middleware coverage was never the problem, a route registered outside it was. Every `/api/v1/*` route is now confirmed to sit behind `RegisterRoutes`. |
 | L4-007 | `hmac.Equal` (timing-safe), not `==` | ✅ PASS | Confirmed at all 3 HMAC comparison sites: `internal/billing/webhook.go`, `internal/notifications/webhook.go`, and this session's own `internal/portalui/auth.go` CSRF check. |
 | L4-008 | HMAC validated before `json.Unmarshal` | ✅ PASS | `internal/api/webhook_razorpay.go`: `ValidateRazorpaySignature` at line 61, `json.Unmarshal` at line 68 — correct order. |
 | L4-009 | `gosec` clean | ✅ PASS | `gosec` is enabled in `.golangci.yml`'s linter set; fresh `golangci-lint run` this audit: 0 issues. |
