@@ -32,6 +32,7 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/fup"
 	"github.com/maaransoft/isp-bss-oss/internal/notifications"
 	"github.com/maaransoft/isp-bss-oss/internal/radius"
+	"github.com/maaransoft/isp-bss-oss/internal/revenue"
 )
 
 const (
@@ -125,6 +126,23 @@ func run() error {
 		log.Info().Msg("radiusd: dunning scanner started")
 		dunningScanner.Run(ctx)
 		log.Info().Msg("radiusd: dunning scanner stopped")
+	}()
+
+	// ── Nightly revenue reconciliation ──────────────────────────────────────
+
+	// ReconcileJob shipped complete, tested, and documented as running nightly
+	// at 02:00 IST — and was never constructed. No snapshot was ever written,
+	// no ledger variance ever compared. logAlerter is shared with the
+	// dead-letter monitor so a variance surfaces the same way as any other
+	// alert while PagerDuty delivery remains unimplemented.
+	reconcileScheduler := revenue.NewReconcileScheduler(
+		revenue.NewReconcileJob(database.Revenue(), logAlerter{}))
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Info().Msg("radiusd: revenue reconciliation scheduler started")
+		reconcileScheduler.Run(ctx)
+		log.Info().Msg("radiusd: revenue reconciliation scheduler stopped")
 	}()
 
 	// ── Asynq workers ───────────────────────────────────────────────────────
