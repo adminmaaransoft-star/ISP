@@ -75,6 +75,12 @@ export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
 
 DOWN_AFTER_MS="${DOWN_AFTER_MS:-1000}"
+# parallel-syncs controls how many replicas Sentinel reconfigures at once after
+# a promotion. The committed config uses 1, which makes reconfiguration serial;
+# the event log shows each replica costing ~1s, so with two replicas that is
+# ~2s of the failover. Exposed here so the trade-off can be measured rather
+# than argued about. Empty leaves the committed value untouched.
+PARALLEL_SYNCS="${PARALLEL_SYNCS:-}"
 ELECTION_BUDGET_MS="${ELECTION_BUDGET_MS:-3000}"
 AUTH_RESUME_BUDGET_MS="${AUTH_RESUME_BUDGET_MS:-5000}"
 MASTER_NAME="${REDIS_MASTER_NAME:-bss_master}"
@@ -83,6 +89,11 @@ LOAD_DURATION="${LOAD_DURATION:-90s}"
 SUBSCRIBERS="${SUBSCRIBERS:-500}"
 SKIP_LOAD="${SKIP_LOAD:-0}"
 CHAOS_MODE="${CHAOS_MODE:-pause}"   # pause | kill — see the header
+# The sentinel whose log the timeline is read from. Any of the three records
+# the same +sdown/+switch-master events; one is picked so the numbers all come
+# from a single clock.
+SENTINEL_LEADER="${SENTINEL_LEADER:-bss_redis_sentinel_1}"
+SENTINEL_LEADER_SVC="${SENTINEL_LEADER_SVC:-redis_sentinel_1}"
 
 # Must match the project name scripts/demo_up.sh exports, or every container
 # and the compose network resolve under a different prefix.
@@ -125,8 +136,36 @@ sentinel_cli() {
 # current_master echoes the master's host as Sentinel currently sees it. This
 # may be a hostname (redis_primary) or a bare IP, depending on whether the node
 # was configured by name or promoted during an earlier failover.
+#
+# Used only as a completion gate, never as the measurement: each call costs a
+# `docker compose exec` round trip (~390ms measured on Docker Desktop), so a
+# poll loop built on it reports its own latency, not Sentinel's. An earlier
+# version of this script did exactly that and reported a 4955ms failover that
+# Sentinel's own log showed completing in under 1.5s.
+# Queries the same node the timeline is read from: sentinels switch a fraction
+# of a second apart, so polling one and reading another's log races — the poll
+# can report the new master before that node has written +switch-master.
 current_master() {
-    sentinel_cli redis_sentinel_2 sentinel get-master-addr-by-name "$MASTER_NAME" | head -1 | tr -d '\r'
+    sentinel_cli "$SENTINEL_LEADER_SVC" sentinel get-master-addr-by-name "$MASTER_NAME" | head -1 | tr -d '\r'
+}
+
+# sentinel_event_ms echoes the epoch-milliseconds of the last Sentinel log line
+# matching a pattern, or nothing if it never appeared.
+#
+# Sentinel timestamps its own events to the millisecond, and the container
+# clock matches the host's, so this is both more accurate and more honest than
+# timing from outside: it measures what Sentinel did, not how fast this script
+# noticed. Log times are UTC and must be parsed as such — `date -d` would
+# otherwise read them in the host's local zone.
+sentinel_event_ms() {
+    local pattern="$1"
+    local line
+    line=$(docker logs "$SENTINEL_LEADER" 2>&1 | grep -E "$pattern" | tail -1)
+    [ -z "$line" ] && return 1
+    local ts
+    ts=$(echo "$line" | sed -E 's/^[0-9]+:X ([0-9]+ [A-Za-z]+ [0-9]+ [0-9:]+\.[0-9]+) .*/\1/')
+    [ -z "$ts" ] && return 1
+    date -u -d "$ts UTC" +%s%3N 2>/dev/null
 }
 
 # master_container maps whatever current_master reports to the container the
@@ -139,7 +178,16 @@ current_master() {
 # fail over.
 master_container() {
     local addr="$1"
-    # A hostname resolves straight to a container name under compose.
+    # Sentinel reports the compose *service* name (redis_primary), which is not
+    # the container name (bss_redis_primary) — docker inspect on it fails. Ask
+    # compose to resolve the service to a container id first.
+    local cid
+    cid=$(docker compose ps -q "$addr" 2>/dev/null | head -1 | tr -d '\r')
+    if [ -n "$cid" ]; then
+        docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##' | tr -d '\r'
+        return
+    fi
+    # A literal container name also works.
     if docker inspect "$addr" >/dev/null 2>&1; then
         echo "$addr"
         return
@@ -179,6 +227,11 @@ if ! grep -q "down-after-milliseconds ${MASTER_NAME} ${DOWN_AFTER_MS}" "$SCRATCH
     exit 1
 fi
 
+if [ -n "$PARALLEL_SYNCS" ]; then
+    info "sentinel parallel-syncs: ${PARALLEL_SYNCS} (committed config uses $(grep -oE 'parallel-syncs [a-z_]+ [0-9]+' config/redis/sentinel.conf | grep -oE '[0-9]+$'))"
+    sed -i -E "s/(parallel-syncs ${MASTER_NAME}) [0-9]+/\1 ${PARALLEL_SYNCS}/" "$SCRATCH/redis/sentinel.conf"
+fi
+
 SCRATCH_MOUNT="$(cd "$SCRATCH" && { pwd -W 2>/dev/null || pwd; })"
 
 # A compose override is cleaner than editing docker-compose.yml: it is additive,
@@ -216,8 +269,28 @@ fi
 # actually started (the NFR harness once diverged that way and silently stopped
 # setting RADIUS_VERIFIER_SECRET).
 info "restarting sentinels with down-after-milliseconds=${DOWN_AFTER_MS}"
-docker compose -f docker-compose.yml -f "$SCRATCH/override.yml" up -d --force-recreate \
-    redis_sentinel_1 redis_sentinel_2 redis_sentinel_3 >/dev/null 2>&1
+# The -f path must be the Windows form: MSYS_NO_PATHCONV=1 (needed elsewhere for
+# docker arguments) stops the shell rewriting /tmp/... , and the Docker Desktop
+# binary then resolves that raw POSIX path against the current drive as
+# D:\tmp\... and cannot find it. Output is NOT silenced: when this failed
+# quietly, every run below reported timings for the committed 3000ms threshold
+# while claiming to measure the overridden one.
+if ! docker compose -f docker-compose.yml -f "${SCRATCH_MOUNT}/override.yml" up -d --force-recreate \
+        redis_sentinel_1 redis_sentinel_2 redis_sentinel_3 2>&1 | tail -3; then
+    fail "could not restart the sentinels with the overridden config"
+    exit 1
+fi
+
+# Prove the override actually landed. A silently-ignored override produces
+# plausible numbers for the wrong configuration, which is worse than an error.
+sleep 3
+EFFECTIVE=$(sentinel_cli "$SENTINEL_LEADER_SVC" sentinel master "$MASTER_NAME" \
+    | tr -d '\r' | grep -A1 '^down-after-milliseconds$' | tail -1)
+if [ -n "$EFFECTIVE" ] && [ "$EFFECTIVE" != "$DOWN_AFTER_MS" ]; then
+    fail "sentinel is running with down-after-milliseconds=${EFFECTIVE}, not the requested ${DOWN_AFTER_MS} — the override did not take effect"
+    exit 1
+fi
+info "verified sentinel is running with down-after-milliseconds=${EFFECTIVE:-unknown}"
 
 info "waiting for the sentinels to agree on a master"
 ORIGINAL_MASTER=""
@@ -314,10 +387,9 @@ case "$CHAOS_MODE" in
         ;;
 esac
 
-# Poll hard: the resolution of this measurement is the poll interval, so it is
-# deliberately tight rather than a 1s sleep loop.
+# Wait for the switch to land. This loop is only a completion gate — its own
+# latency does not enter the result, which comes from Sentinel's log below.
 NEW_MASTER=""
-ELECTED_MS=0
 DEADLINE=$(( KILL_MS + 60000 ))
 while :; do
     NOW_MS=$(date +%s%3N)
@@ -325,17 +397,45 @@ while :; do
     CANDIDATE="$(current_master)"
     if [ -n "$CANDIDATE" ] && [ "$CANDIDATE" != "$ORIGINAL_MASTER" ]; then
         NEW_MASTER="$CANDIDATE"
-        ELECTED_MS=$(( $(date +%s%3N) - KILL_MS ))
         break
     fi
-    sleep 0.05
+    sleep 0.2
 done
 
 if [ -z "$NEW_MASTER" ]; then
     fail "NFR-AVAIL-001: no new master elected within 60s"
-    docker compose logs --tail 40 redis_sentinel_1
+    docker compose logs --tail 40 "$SENTINEL_LEADER"
 else
     info "new master: ${NEW_MASTER} (was ${ORIGINAL_MASTER})"
+
+    # Take the numbers from Sentinel's own event log rather than from the poll
+    # loop above. Detection and failover are reported separately because they
+    # are tuned by different knobs and only one of them is under Sentinel's
+    # control once down-after-milliseconds is set.
+    # The log line can lag the address change by a fraction of a second, so
+    # retry briefly for an event newer than the fault rather than accepting a
+    # stale one from a previous run.
+    SDOWN_MS=""; SWITCH_MS=""
+    for _ in $(seq 1 25); do
+        SDOWN_MS=$(sentinel_event_ms '\+sdown master')
+        SWITCH_MS=$(sentinel_event_ms '\+switch-master')
+        if [ -n "$SWITCH_MS" ] && [ "$SWITCH_MS" -ge "$KILL_MS" ]; then
+            break
+        fi
+        sleep 0.2
+    done
+
+    if [ -z "$SDOWN_MS" ] || [ -z "$SWITCH_MS" ] || [ "$SWITCH_MS" -lt "$KILL_MS" ]; then
+        skip "NFR-AVAIL-001: could not read the failover timeline from ${SENTINEL_LEADER}'s log; falling back to the poll loop, which overstates by its own latency"
+        ELECTED_MS=$(( $(date +%s%3N) - KILL_MS ))
+    else
+        DETECT_MS=$(( SDOWN_MS - KILL_MS ))
+        FAILOVER_MS=$(( SWITCH_MS - SDOWN_MS ))
+        ELECTED_MS=$(( SWITCH_MS - KILL_MS ))
+        info "fault -> +sdown (detection, bounded by down-after-milliseconds=${DOWN_AFTER_MS}): ${DETECT_MS}ms"
+        info "+sdown -> +switch-master (Sentinel's own failover sequence): ${FAILOVER_MS}ms"
+    fi
+
     if [ "$ELECTED_MS" -le "$ELECTION_BUDGET_MS" ]; then
         pass "NFR-AVAIL-001: master elected in ${ELECTED_MS}ms (budget ${ELECTION_BUDGET_MS}ms)"
     else

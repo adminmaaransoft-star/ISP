@@ -1,7 +1,7 @@
 # Definition of Done — Status Report
 
 **Original audit:** 2026-08-08
-**Last revised:** 2026-08-10 (post-remediation, through commit `b426550`)
+**Last revised:** 2026-08-10 (post-remediation; L6-004 numbers corrected — see Finding #6)
 **Scope:** Whole-codebase audit against the 66-item DoD checklist in `bss_oss_dev_tracker_v3.xlsx` → sheet "✅ Definition of Done" (levels L0–L8).
 **Methodology:** Every check below was either (a) executed live against this repo/a real Postgres instance/the running demo stack, or (b) verified by direct code/config inspection with exact file:line evidence. Checks that genuinely require infrastructure not available are marked **NOT VERIFIED**, not silently assumed passing. See "Methodology & Limitations" at the end.
 
@@ -34,7 +34,7 @@ Of the 66 rows in the tracker, **65 carry an actual check**; row `L0-011` is an 
 | L0-009 | Pre-commit PII hook fires | ❌ FAIL | ✅ PASS | Installed and verified blocking a real commit (2026-08-10) |
 | L2-001 | FR-traceable test names | ❌ FAIL | ✅ PASS | 102 tests renamed, all 30 FR IDs covered (commit `ac3ef26`) |
 | L5-008 | Dispatch latency ≤5s | ❌ FAIL | ✅ PASS | **Measured: 1.011s idle, 92ms worst case under backlog** |
-| L6-004 | Sentinel failover ≤3s | ⬜ NOT VERIFIED | ❌ **FAIL** | **Measured: 4955ms election, 7032ms auth recovery** — see Finding #6 |
+| L6-004 | Sentinel failover ≤3s | ⬜ NOT VERIFIED | ❌ **FAIL** | **Measured: 5055ms on the committed config, 3086ms tuned** — see Finding #6 |
 | L6-005 | No goroutine leak after 1h | ⬜ NOT VERIFIED | ⬜ NOT VERIFIED | Harness built and validated on 90s; the 1-hour hold has not been run |
 | L8-001..004 | Tracker Status / Notes populated | ⬜ PENDING | ⬜ PENDING (data now committed) | 96 tasks marked Done are now in git (commit `297d3bb`); NFR-PERF-001 corrected FAIL → PASS |
 
@@ -106,9 +106,24 @@ That reads as "RADIUS authentication is catastrophically slow." The daemon was n
 
 The only finding here that is **not** resolved. Recorded because L6-004 moved from "never measured" to "measured and failing", which is a different and more actionable state.
 
-**The budget is missed by roughly 65%.** Master elected in 4955ms against a 3000ms budget; authentication resumed 7032ms after the fault against a 5000ms budget. Failover does work — a replica is promoted and service recovers — it is simply slower than the NFR allows.
+> ⚠️ **Correction (same day).** The first published version of this finding said the budget was "not reachable by tuning `down-after-milliseconds`". **That conclusion was wrong**, and it was wrong because of two defects in the measuring instrument, not because of anything Sentinel did. Both are fixed and the numbers below are the corrected ones. The two defects are written up under "How the first measurement lied" because they are the more transferable lesson.
 
-**Tuning detection does not close the gap.** `config/redis/sentinel.conf` sets `down-after-milliseconds 3000`, which alone consumes the entire election budget before Sentinel even begins. Lowering it to 1000 produced 4955ms; lowering it further to 500 produced 4490ms. A 500ms reduction in detection bought 465ms of election time, so detection is not the dominant cost — the remaining ~4s is Sentinel's own promotion and resync sequence (`failover-timeout` 10000ms, `parallel-syncs` 1). **This NFR is not reachable by configuration tweaks to `down-after-milliseconds`**, which is what the original plan assumed.
+**The budget is missed, but narrowly, and detection dominates.** Measured from Sentinel's own event log on a clean stack:
+
+| `down-after-milliseconds` | Detection (fault → `+sdown`) | Failover (`+sdown` → `+switch-master`) | **Total** |
+|---|---|---|---|
+| 3000 (committed) | 4110ms | 945ms | **5055ms** |
+| 500 (verified applied) | 964ms | 2228ms | **3192ms** |
+| 500 (repeat) | 883ms | 2203ms | **3086ms** |
+
+Detection scales with the knob almost exactly as expected, and tuning it takes the total from **~5.1s to ~3.1s** — still over a 3000ms budget, but by roughly 100–200ms rather than by 2 seconds. Sentinel's own promotion sequence is 0.9–2.2s and varies run to run.
+
+**How the first measurement lied.** Worth recording, because both defects produced confident, plausible, wrong numbers:
+
+1. *The instrument was slower than the thing it measured.* Election time was taken from a poll loop calling `docker compose exec … redis-cli`, at a measured **~390ms per call** — while the event being timed completes in under a second. The loop was reporting its own latency. It now reads Sentinel's millisecond-resolution event log instead, which is authoritative and free of observer cost.
+2. *The config override never took effect.* The compose override file was passed as `/tmp/…`, and with `MSYS_NO_PATHCONV=1` set (needed for other Docker arguments) the Docker Desktop binary resolved that raw POSIX path against the current drive as `D:\tmp\…` and could not find it. The command's output was silenced, so it failed quietly. **Every "tuned" run was actually running the committed 3000ms threshold** — which is precisely why detection appeared not to respond to the knob. The script now passes a Windows path, does not silence the command, and afterwards queries `SENTINEL MASTER` to confirm the value actually in force before measuring anything.
+
+The second one is the sharper lesson: a silently-ignored override does not fail, it produces credible numbers for a configuration you are not running.
 
 **Separately: hostname monitoring cannot survive a vanished DNS name.** `sentinel.conf` monitors the master as `sentinel monitor bss_master redis_primary` with `resolve-hostnames yes` — which its own comments correctly note is mandatory under Docker Compose, since Redis 7.4+ treats a hostname in `sentinel monitor` as fatal without it. But when the master container is removed rather than merely stopped, the name stops resolving and Sentinel logs:
 
@@ -119,7 +134,7 @@ The only finding here that is **not** resolved. Recorded because L6-004 moved fr
 
 It then never promotes a replica at all — 60 seconds later there is still no master and authentication has not recovered. Hostname monitoring survives a dead *process* but not a vanished *name*, and a node failure under an orchestrator is precisely the second case. `scripts/run_sentinel_failover_test.sh` reproduces this with `CHAOS_MODE=kill`; the default `pause` mode keeps the container in DNS so the script measures failover timing rather than re-demonstrating this each run.
 
-**Decision needed** (not a code fix): accept a longer recovery target, or address the promotion sequence and the DNS dependency — for example pinning IPs, or a DNS entry that outlives the container.
+**Decision needed** (not a code fix). The recommendation recorded for the tracker is: **lower `down-after-milliseconds` to 500 and move the target from 3s to 8s.** Rationale — 3s was never met even in principle by the shipped config, the tuned configuration lands at ~3.1s with run-to-run variance of ±100ms so a 3s target would be permanently flaky, and 8s leaves headroom for the promotion sequence's observed 0.9–2.2s spread while still being far inside any realistic subscriber-visible tolerance for a re-auth. The DNS/tilt behaviour is a separate defect that a target change does not address and should be tracked as its own item.
 
 ---
 
@@ -221,7 +236,7 @@ All L6 rows below were run at the levels the DoD itself specifies, against 20,00
 | L6-001 | RADIUS auth p99 ≤15ms @ 5,000 req/s | ✅ PASS | **Measured at the full 5,000 req/s**: p99 **10.4ms**, p50 4.538ms, p95 7.934ms across 149,850 requests, 0 errors, 0 dropped to saturation. Server-side mean auth 3.211ms over 289,810 requests; 289,315 of them completed within 15ms. A capacity sweep confirms the budget holds at 3,000 and 4,000 req/s too, so 5,000 is not a cliff edge. |
 | L6-002 | API p99 ≤200ms @ 500 concurrent (k6) | ✅ PASS | **Measured at the full 500 VUs** for 30s via `scripts/k6_api_load.js`: p99 **11.69ms** against the 200ms budget, 286,386 checks, 100% succeeded, `http_req_failed` 0.00%. Both k6 thresholds (`health`, `subscriber_get`) passed independently. |
 | L6-003 | Unbilled report ≤60s for 20k subscribers | ✅ PASS | **9.716ms** against a 60,000ms budget, on a real 20,000-subscriber / 18,000-invoice dataset. The planner chooses a sequential scan at this row count rather than an index scan — expected, and ~6,000× inside budget regardless. |
-| L6-004 | Redis Sentinel failover ≤3s | ❌ **FAIL (now measured)** | `scripts/run_sentinel_failover_test.sh`. Failover **works** but is too slow: master elected in **4955ms** against the 3000ms budget, RADIUS auth resumed after **7032ms** against 5000ms. Not fixable by tuning detection alone — dropping `down-after-milliseconds` from 1000 to 500 moved election only 4955ms → 4490ms, so the remaining ~4s is Sentinel's own failover sequence (`failover-timeout` 10000ms, `parallel-syncs` 1). Moves from NOT VERIFIED to a characterised failure. See Finding #6. |
+| L6-004 | Redis Sentinel failover ≤3s | ❌ **FAIL (now measured)** | `scripts/run_sentinel_failover_test.sh`, timed from Sentinel's own event log. Failover **works**; it is narrowly too slow. On the committed config (`down-after-milliseconds 3000`): **5055ms** (detection 4110ms + failover 945ms). With detection lowered to 500ms and the override verified in force: **3086–3192ms**, i.e. ~100–200ms over budget. Recommendation is to set detection to 500 and move the target to 8s — see Finding #6, which also corrects an earlier, wrong version of this row. |
 | L6-005 | No goroutine leak after 1h @ 20k sessions | ⬜ NOT VERIFIED | Harness now exists and is validated: `scripts/run_soak_test.sh`, verified end to end on a 90s run (9,000 requests, 0 errors, p99 5.391ms, goroutines and FDs flat). **The 1-hour hold the DoD actually requires has not been run**, so this stays NOT VERIFIED rather than being extrapolated from 90 seconds. Detection needs no pprof — `go_goroutines`, `go_threads`, `go_memstats_heap_alloc_bytes` and `process_open_fds` are already exposed by the default Go collector; pprof (still absent from this codebase) would only be needed to locate a leak once detected. |
 | L6-006 | TLS 1.3 minimum, TLS 1.2 disabled | ✅ PASS | Now covered by a committed, repeatable script (`scripts/verify_tls.sh`) rather than a one-off `curl`, run against the **real** `config/caddy/Caddyfile`: TLS 1.3 connects (`TLS_AES_128_GCM_SHA256`), TLS 1.2 / 1.1 / 1.0 all refused, and an unpinned client negotiates 1.3. See the note below on why this test is trustworthy. |
 
@@ -251,7 +266,7 @@ All L6 rows below were run at the levels the DoD itself specifies, against 20,00
 
 Items 1, 2, 3, 4, 6 and 7 from the original 2026-08-08 list are closed; see the resolution notes in Critical Findings. What remains, in priority order:
 
-1. **Sentinel failover misses its budget** (L6-004) — the only *newly discovered* open defect, and the only remaining item that is a real system limitation rather than a process convention or a time cost. Election at 4955ms against a 3000ms budget, and not closable by tuning `down-after-milliseconds`. Needs a decision on the target or on the promotion sequence, plus a view on the DNS failure mode. See Finding #6.
+1. **Sentinel failover misses its budget** (L6-004) — the only *newly discovered* open defect. 5055ms on the committed config, 3086-3192ms with detection lowered to 500ms, against a 3000ms budget. The recommendation is to adopt detection=500 and move the target to 8s; the DNS/tilt behaviour is a separate item. See Finding #6.
 2. **Test coverage below the ≥80% general bar** (L2-002) — 60.4% overall, up from 53.1%. The stricter ≥90% crypto/middleware requirement now passes (93.5% / 98.2%). The remaining shortfall is concentrated in `cmd/api` (5.3%, mostly wiring — extracting a testable `newServer()` from `main()` is the standard fix but is refactoring, not test-writing), `internal/portal` (63.0%) and `internal/notifications` (71.7%).
 3. **Goroutine-leak soak test** (L6-005) — purely a time cost now. The harness exists, is committed and is validated end to end; it needs one uninterrupted hour on a machine that will not sleep.
 4. **TDD commit ordering** (L0-001, L0-002) — permanently unachievable for existing code, since red-phase commits cannot be reconstructed after the fact. Worth deciding whether to enforce going forward or mark N/A in the tracker, rather than leaving two standing failures that can never clear.
