@@ -46,21 +46,22 @@ so testing does not generate notifications nobody asked for.
 
 ## 2. The six personas
 
-The CRD defines six personas. **Only one of them has a screen.**
+The CRD defines six personas. All six now have a screen: subscribers use the
+portal at `/ui`, staff use the operations console at `/staff`.
 
 | ID | Persona | How they reach the system |
 |---|---|---|
-| PER-001 | ISP Owner | JSON API, role `isp_owner` |
-| PER-002 | NOC Engineer | JSON API, role `noc_engineer` |
-| PER-003 | Billing / Finance Admin | JSON API, role `billing_admin` |
-| PER-004 | CSR | JSON API, role `csr` |
-| PER-005 | Ground Technician | JSON API, role `technician` |
-| PER-006 | End Subscriber | **Web portal** at `/ui` |
+| PER-001 | ISP Owner | Console at `/staff`, role `isp_owner` |
+| PER-002 | NOC Engineer | Console at `/staff`, role `noc_engineer` |
+| PER-003 | Billing / Finance Admin | Console at `/staff`, role `billing_admin` |
+| PER-004 | CSR | Console at `/staff`, role `csr` |
+| PER-005 | Ground Technician | Console at `/staff`, role `technician` |
+| PER-006 | End Subscriber | Portal at `/ui` |
 
-There is no admin or staff web interface, and none was specified — the CRD
-scopes the web UI as subscriber self-service, and staff needs are specified as
-APIs. If a stakeholder is expecting an admin console, that expectation needs
-correcting before a demo, not during one.
+The console was not in the original specification — the CRD scopes the web UI
+as subscriber self-service and specifies staff needs as APIs. It was added
+because driving the JSON API with hand-minted tokens is workable for a load
+test and unusable as a day job. Everything it does, the API could already do.
 
 ### PER-006 — End Subscriber (the portal)
 
@@ -73,7 +74,27 @@ Usage → Invoices → download a PDF → Renew → file a support ticket → ch
 Notifications → sign out. Then confirm that typing a portal address while
 signed out returns you to the sign-in page.
 
-### PER-001..005 — staff personas (API)
+### PER-001..005 — the operations console
+
+All five staff personas now have a web console at **`https://localhost/staff/login`**.
+Seeded accounts, all with password `staffpassword`:
+
+| Username | Persona | Sections |
+|---|---|---|
+| `owner` | ISP Owner | Subscribers, Billing, Support, Revenue, LEA |
+| `noc` | NOC Engineer | Subscribers, LEA |
+| `billing` | Billing Admin | Subscribers, Billing |
+| `csr` | CSR | Subscribers, Billing, Support |
+| `tech` | Ground Technician | Subscribers, Support |
+
+The console issues the same JWT the JSON API validates, so it can never grant
+reach the API would refuse. Every handler re-checks the role — hiding a nav
+link is a convenience, not a control, and typing the URL directly returns 403.
+
+Worth testing: sign in as `tech`, open a subscriber, and confirm no wallet or
+ledger appears; then sign in as `csr` and confirm it does.
+
+### PER-001..005 — the same personas via the API
 
 Mint a token, then call the API with it:
 

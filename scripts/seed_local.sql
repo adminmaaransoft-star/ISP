@@ -106,6 +106,23 @@ CROSS JOIN (VALUES
 WHERE s.username = 'test_user'
 ON CONFLICT DO NOTHING;
 
+-- ── Console operators, one per CRD persona ───────────────────────────────────
+--
+-- All five share the password 'staffpassword' for the demo. Real deployments
+-- create these through an administrator, not a seed file — this exists so the
+-- operations console can be opened and used immediately after demo_up.sh.
+--
+-- lea_access is granted only to the NOC engineer and the owner, and is a
+-- separate column from the role on purpose (SecD 9.3): reach over
+-- law-enforcement lookups must never arrive as a side effect of a job title.
+INSERT INTO staff_users (username, password_hash, full_name, role, lea_access) VALUES
+    ('owner',   '$2a$12$Lbf0AtykY18fe1C5QMX7B.RtijYgxeBX.iqh5UKTWdPbIRTIUpyP2', 'Priya Raman (ISP Owner)',      'isp_owner',     TRUE),
+    ('noc',     '$2a$12$Lbf0AtykY18fe1C5QMX7B.RtijYgxeBX.iqh5UKTWdPbIRTIUpyP2', 'Arun Kumar (NOC Engineer)',    'noc_engineer',  TRUE),
+    ('billing', '$2a$12$Lbf0AtykY18fe1C5QMX7B.RtijYgxeBX.iqh5UKTWdPbIRTIUpyP2', 'Meena Iyer (Billing Admin)',   'billing_admin', FALSE),
+    ('csr',     '$2a$12$Lbf0AtykY18fe1C5QMX7B.RtijYgxeBX.iqh5UKTWdPbIRTIUpyP2', 'Divya Nair (CSR)',             'csr',           FALSE),
+    ('tech',    '$2a$12$Lbf0AtykY18fe1C5QMX7B.RtijYgxeBX.iqh5UKTWdPbIRTIUpyP2', 'Suresh Babu (Ground Tech)',    'technician',    FALSE)
+ON CONFLICT (username) DO NOTHING;
+
 -- ── Verify seed counts ────────────────────────────────────────────────────────
 SELECT 'plans'                  AS table_name, COUNT(*) AS row_count FROM plans
 UNION ALL
@@ -119,4 +136,6 @@ SELECT 'wallet_ledgers',         COUNT(*) FROM wallet_ledgers
 UNION ALL
 SELECT 'invoices',               COUNT(*) FROM invoices
 UNION ALL
-SELECT 'session_history',        COUNT(*) FROM subscriber_session_history;
+SELECT 'session_history',        COUNT(*) FROM subscriber_session_history
+UNION ALL
+SELECT 'staff_users',            COUNT(*) FROM staff_users;

@@ -1,0 +1,27 @@
+{{define "content"}}
+{{$d := .Data}}
+<h1>Law-enforcement lookup</h1>
+<div class="alert warn">Every lookup is recorded against your name in an append-only audit log, whether or not it finds a subscriber.</div>
+<div class="card">
+  <form method="post" action="/staff/lea" class="stack">
+    <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+    <label for="public_ip">Public IP address</label>
+    <input id="public_ip" name="public_ip" value="{{$d.PublicIP}}" placeholder="100.64.0.14" required>
+    <label for="timestamp">At (UTC)</label>
+    <input id="timestamp" name="timestamp" value="{{$d.Timestamp}}" placeholder="2026-08-09T18:00" required>
+    <button class="primary" type="submit">Look up</button>
+  </form>
+</div>
+{{with $d.Result}}
+<div class="card"><h3>Match</h3>
+  <dl>
+    <dt>Subscriber</dt><dd>{{.Username}} <span class="num">(id {{.SubscriberID}})</span></dd>
+    <dt>CAF number</dt><dd>{{.CAFNumber}}</dd>
+    <dt>Mobile</dt><dd>{{.MobileNumber}}</dd>
+    <dt>Registered state</dt><dd>{{.RegisteredState}}</dd>
+    <dt>Session</dt><dd class="num">{{.SessionID}}</dd>
+    <dt>Started</dt><dd>{{datetime .SessionStart}}</dd>
+  </dl>
+</div>
+{{end}}
+{{end}}

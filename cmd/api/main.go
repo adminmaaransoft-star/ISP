@@ -32,6 +32,7 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/notifications"
 	"github.com/maaransoft/isp-bss-oss/internal/portal"
 	"github.com/maaransoft/isp-bss-oss/internal/portalui"
+	"github.com/maaransoft/isp-bss-oss/internal/staffui"
 	"github.com/maaransoft/isp-bss-oss/pkg/crypto"
 	"github.com/shopspring/decimal"
 )
@@ -164,6 +165,21 @@ func run() error {
 		JWTSecret:      cfg.PortalJWTSecret,
 	})
 
+	// Operations console. It signs sessions with the API JWT secret, not the
+	// portal one, so the token it issues is exactly what the JSON API validates
+	// — the console cannot grant reach the API would refuse.
+	staffUIHandler := staffui.NewHandler(staffui.HandlerDeps{
+		Staff:       database.Staff(),
+		Subscribers: database.API(),
+		Health:      database.Health(),
+		Sessions:    sessions.Portal(),
+		Billing:     database.Billing(),
+		Tickets:     staffTicketStore{portal: database.Portal(), admin: database.Tickets()},
+		LEA:         database.FUP(),
+		Revenue:     database.Revenue(),
+		JWTSecret:   cfg.JWTSecret,
+	})
+
 	notificationWebhook := notifications.NewWebhookHandler(
 		database.Notifications(), cfg.WhatsAppAppSecret, cfg.WhatsAppWebhookVerifyToken)
 
@@ -171,6 +187,7 @@ func run() error {
 	apiHandler.RegisterRoutes(mux, cfg.JWTSecret)
 	portalHandler.RegisterRoutes(mux)
 	portalUIHandler.RegisterRoutes(mux)
+	staffUIHandler.RegisterRoutes(mux)
 
 	// Meta delivery callbacks: GET is the subscription handshake, POST carries
 	// delivery statuses. Both are HMAC- or token-verified, never JWT.
@@ -390,4 +407,21 @@ func configureLogging(cfg *config.Config) {
 	if cfg.LogFormat != "json" {
 		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339})
 	}
+}
+
+// staffTicketStore joins the two halves of ticket access the console needs:
+// listing lives on PortalStore (it is the subscriber-scoped read) and the
+// admin update lives on TicketStore. Adapting here keeps internal/staffui
+// depending on one small interface rather than on two concrete stores.
+type staffTicketStore struct {
+	portal *db.PortalStore
+	admin  *db.TicketStore
+}
+
+func (s staffTicketStore) ListTickets(ctx context.Context, subscriberID int) ([]portal.TicketEntry, error) {
+	return s.portal.ListTickets(ctx, subscriberID)
+}
+
+func (s staffTicketStore) UpdateTicketAdmin(ctx context.Context, ticketID int, status *string, assignedTo *int) (*api.TicketRecord, error) {
+	return s.admin.UpdateTicketAdmin(ctx, ticketID, status, assignedTo)
 }

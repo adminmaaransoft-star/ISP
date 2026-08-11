@@ -1,0 +1,15 @@
+{{define "content"}}
+{{$d := .Data}}
+<h1>Revenue</h1>
+<div class="grid3">
+  <div class="card"><h3>Unbilled active subscribers</h3><p class="big num">{{$d.Unbilled}}</p>
+    <p class="muted">Active accounts with no invoice this period.</p></div>
+  <div class="card"><h3>Ledger variance</h3>
+    <p class="big num">₹{{money $d.Variance}}</p>
+    <p>{{if $d.VarianceOK}}<span class="pill ok">balanced</span>{{else}}<span class="pill bad">investigate</span>{{end}}
+       <span class="muted">alert threshold ₹0.01</span></p></div>
+  <div class="card"><h3>Total wallet balance</h3><p class="big num">₹{{money $d.TotalBalance}}</p>
+    <p class="muted">Across {{$d.Subscribers}} subscribers.</p></div>
+</div>
+<p class="muted">These are read live. The same figures are written to a snapshot nightly at 02:00 IST.</p>
+{{end}}
