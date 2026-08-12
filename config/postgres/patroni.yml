@@ -1,0 +1,91 @@
+# Patroni bootstrap config — NFR-AVAIL-002, IDD §8.2a, MDS §4.12.
+#
+# The exact same file is mounted into all three postgres_node_N containers.
+# `name`, `restapi.connect_address`, `postgresql.connect_address`, and both
+# passwords are deliberately absent here — Patroni reads them from the
+# PATRONI_NAME / PATRONI_RESTAPI_CONNECT_ADDRESS /
+# PATRONI_POSTGRESQL_CONNECT_ADDRESS / PATRONI_SUPERUSER_PASSWORD /
+# PATRONI_REPLICATION_PASSWORD environment variables (Patroni's own
+# documented override mechanism), set per-container in
+# docker-compose.pg-ha.yml. That environment-variable difference is what
+# makes three copies of one image three distinct, addressable nodes —
+# not three separate YAML files to keep in sync.
+
+scope: bss-postgres
+namespace: /bss/
+
+restapi:
+  listen: 0.0.0.0:8008
+  # connect_address supplied by PATRONI_RESTAPI_CONNECT_ADDRESS
+
+etcd3:
+  hosts:
+    - etcd_1:2379
+    - etcd_2:2379
+    - etcd_3:2379
+
+bootstrap:
+  # Patroni's own initdb bootstrap only creates the default `postgres`
+  # database — unlike the base docker-compose.yml's official postgres image,
+  # which creates isp_bss_oss automatically via POSTGRES_DB. Found by
+  # actually running the migration step against a freshly bootstrapped
+  # cluster (it failed with "database isp_bss_oss does not exist") rather
+  # than assumed from reading Patroni's docs.
+  post_bootstrap: psql -U postgres -c "CREATE DATABASE isp_bss_oss"
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    # A standby more than 1 MiB of WAL behind its last known position is not
+    # eligible for promotion — Patroni will pick a fresher standby instead
+    # of one that would silently lose more committed data.
+    maximum_lag_on_failover: 1048576
+    synchronous_mode: true
+    # Degrade to async rather than stall every write when the synchronous
+    # standby is unreachable. Without this, one dead standby turns into a
+    # full write outage on an otherwise-healthy primary — the same failure
+    # mode a naive "always require the standby" setting would recreate for
+    # Postgres that Sentinel's quorum design already avoids for Redis.
+    synchronous_mode_strict: false
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_wal_senders: 5
+        max_replication_slots: 5
+        wal_keep_size: 1GB
+        # DBD §6.6: ack once the standby has received the WAL over the
+        # network, not once it has fsynced it to its own disk — durable
+        # against a primary crash, without paying a second disk-flush RTT
+        # on every commit.
+        synchronous_commit: remote_write
+        synchronous_standby_names: '*'
+
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+
+  pg_hba:
+    - host replication replicator 0.0.0.0/0 md5
+    - host all all 0.0.0.0/0 md5
+
+postgresql:
+  listen: 0.0.0.0:5432
+  data_dir: /var/lib/postgresql/data/pgdata
+  # connect_address supplied by PATRONI_POSTGRESQL_CONNECT_ADDRESS
+  authentication:
+    replication:
+      username: replicator
+      # password supplied by PATRONI_REPLICATION_PASSWORD
+    superuser:
+      username: postgres
+      # password supplied by PATRONI_SUPERUSER_PASSWORD
+  parameters:
+    unix_socket_directories: /var/run/postgresql
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false

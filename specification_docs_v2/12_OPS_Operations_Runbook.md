@@ -1,5 +1,5 @@
 # Document 12: Operations & Incident Response Runbook
-**Version:** 2.0 | **Status:** Draft | **Date:** 2025-06-01
+**Version:** 2.1 | **Status:** Draft | **Date:** 2026-08-12 — §12.3.2 rewritten for automated Patroni failover (NFR-AVAIL-002); rest unchanged from v2.0
 **Document ID:** OPS
 **Traces From:** [IDD](08_IDD_Infrastructure_Design.md) → [SAD](03_SAD_System_Architecture.md)
 **Traces To:** —
@@ -134,28 +134,70 @@ curl -X PATCH https://api.yourdomain.com/api/v1/subscribers/{id} \
 
 **Symptoms:** API 500 errors; Grafana `pg_up` = 0.
 
-**Response:**
+**This procedure assumes `docker-compose.pg-ha.yml` is deployed (IDD §8.2a,
+NFR-AVAIL-002).** A deployment running only the base `docker-compose.yml`
+has one Postgres container with no automated failover at all — restart is
+the only lever, and an unrecoverable primary there means restore-from-backup
+(§12.4), not promotion. Confirm which topology is actually running
+(`docker compose ps | grep postgres`; three `postgres_*` containers means
+the overlay is applied) before assuming automation exists.
 
-1. Check if the primary container is restarting:
+**With the pg-ha overlay — automated path (try first):**
+
+Patroni promotes a synchronous standby automatically, typically within
+`ttl` (30s, `config/postgres/patroni.yml`) of the primary becoming
+unreachable — no operator action needed for the promotion itself.
+
+1. Confirm a promotion already happened rather than assuming one is needed:
    ```bash
-   docker-compose ps postgres_primary
-   docker-compose logs --tail 50 postgres_primary
+   curl -s bss_postgres_standby_1:8008/primary   # 200 = this node is now primary
+   curl -s bss_postgres_standby_2:8008/primary
    ```
-2. If container is crash-looping, attempt restart:
+2. If a standby has already been promoted, the applications need no DSN
+   change — `DB_DSN` already lists all three hosts with
+   `target_session_attrs=read-write` (IDD §8.2a), so `pgx` finds the new
+   primary on its own for any *new* connection. Watch for a burst of
+   `db_connection_retry_total` / `nas_...` — actually watch
+   `radius_auth_duration_seconds` and API error rate — as pooled
+   connections still pointed at the old primary hit SQLSTATE `25006` and
+   get recycled; this should self-resolve within one pool cycle, not
+   require a restart.
+3. If self-resolution is not visible within a few minutes, restart the
+   application containers to force a clean pool:
    ```bash
-   docker-compose restart postgres_primary
+   docker compose -f docker-compose.yml -f docker-compose.pg-ha.yml \
+     up -d --force-recreate aaa_core_daemon api_service
    ```
-3. If primary is unrecoverable, promote the replica:
-   ```bash
-   # On replica host
-   docker exec bss_postgres_replica psql -U postgres \
-     -c "SELECT pg_promote();"
-   # Update DB_DSN on aaa_core_daemon and api_service to point to replica
-   docker-compose up -d --force-recreate aaa_core_daemon api_service
-   ```
-4. Update DNS / load balancer to route to the promoted replica.
-5. RPO = 0 (synchronous replication). No data loss expected.
-6. Target RTO: 5 minutes for automated restart; 15 minutes for manual promotion.
+4. Once the failed node recovers, Patroni rejoins it as a standby
+   automatically (`use_pg_rewind: true`) — no manual `pg_basebackup` needed
+   in the common case.
+
+**Escalate to manual promotion if:** Patroni has not promoted anything
+within 2 minutes (check `docker logs bss_postgres_primary` and
+`bss_postgres_standby_1/2` for etcd connectivity — a lost etcd quorum, not
+just a lost primary, is the failure mode that leaves Patroni unable to act).
+
+**Manual fallback (automation itself is degraded, or no HA overlay is
+deployed with a replica you provisioned by hand):**
+
+```bash
+# On the healthiest standby
+docker exec bss_postgres_standby_1 patroni ctl -c /etc/patroni/patroni.yml \
+  failover --candidate postgres_standby_1 --force
+# or, if Patroni itself is unreachable, the raw promotion it would have run:
+docker exec bss_postgres_standby_1 psql -U postgres -c "SELECT pg_promote();"
+```
+
+Update `DB_DSN` only if the manual `pg_promote()` path was used (Patroni's
+own failover does not require a DSN change — see step 2 above).
+
+**RPO/RTO:** RPO ≈ 0 in the common case (`synchronous_mode: true`), degrading
+to seconds of possible loss if the synchronous standby was already
+unreachable before the primary failed (`synchronous_mode_strict: false` —
+IDD §8.2a explains why that trade-off is deliberate: a single dead standby
+must not stall every write on an otherwise-healthy primary). Target RTO: under
+1 minute for the automated Patroni path; 15 minutes for the manual fallback,
+unchanged from before this section existed.
 
 ### 12.3.3 Asynq Dead-Letter Queue Non-Empty
 

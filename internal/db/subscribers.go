@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maaransoft/isp-bss-oss/internal/api"
 	"github.com/maaransoft/isp-bss-oss/internal/health"
 	"github.com/maaransoft/isp-bss-oss/internal/portal"
@@ -16,7 +15,7 @@ import (
 // ── RADIUS ──────────────────────────────────────────────────────────────────
 
 // RadiusStore serves the AAA hot path. Satisfies radius.DBQuerier.
-type RadiusStore struct{ pool *pgxpool.Pool }
+type RadiusStore struct{ pool dbPool }
 
 var _ radius.DBQuerier = (*RadiusStore)(nil)
 
@@ -56,7 +55,7 @@ func (s *RadiusStore) GetSubscriberByUsername(ctx context.Context, username stri
 // ── API ─────────────────────────────────────────────────────────────────────
 
 // APIStore serves the admin API. Satisfies api.SubscriberQuerier and api.KYCQuerier.
-type APIStore struct{ pool *pgxpool.Pool }
+type APIStore struct{ pool dbPool }
 
 var (
 	_ api.SubscriberQuerier = (*APIStore)(nil)
@@ -211,7 +210,7 @@ func (s *APIStore) UpsertKYC(ctx context.Context, subscriberID int, aadhaarEnc, 
 // ── Health ──────────────────────────────────────────────────────────────────
 
 // HealthStore serves the single-call diagnostic endpoint. Satisfies health.DBQuerier.
-type HealthStore struct{ pool *pgxpool.Pool }
+type HealthStore struct{ pool dbPool }
 
 var _ health.DBQuerier = (*HealthStore)(nil)
 
@@ -260,7 +259,7 @@ func (s *HealthStore) GetSubscriberWithMeta(ctx context.Context, subscriberID in
 // PortalStore serves the subscriber self-service portal. Satisfies
 // portal.PortalSubscriberQuerier, portal.PortalNotificationQuerier and
 // portal.PortalTicketQuerier.
-type PortalStore struct{ pool *pgxpool.Pool }
+type PortalStore struct{ pool dbPool }
 
 var (
 	_ portal.PortalSubscriberQuerier     = (*PortalStore)(nil)

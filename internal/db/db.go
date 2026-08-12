@@ -33,7 +33,7 @@ var ErrNotFound = errors.New("db: not found")
 
 // DB owns the connection pool and hands out per-domain stores.
 type DB struct {
-	pool *pgxpool.Pool
+	pool *haPool
 }
 
 // Config carries the pool tuning knobs. IDD §8.3 sizes the pool at 25
@@ -94,13 +94,13 @@ func Connect(ctx context.Context, cfg Config) (*DB, error) {
 		return nil, fmt.Errorf("db: ping: %w", err)
 	}
 
-	return &DB{pool: pool}, nil
+	return &DB{pool: newHAPool(pool)}, nil
 }
 
 // New wraps an already-configured pool. Used by tests and by callers that
 // manage the pool lifecycle themselves.
 func New(pool *pgxpool.Pool) *DB {
-	return &DB{pool: pool}
+	return &DB{pool: newHAPool(pool)}
 }
 
 // Close releases every pooled connection.
@@ -110,8 +110,12 @@ func (d *DB) Close() {
 	}
 }
 
-// Pool exposes the underlying pool for health checks and migrations.
-func (d *DB) Pool() *pgxpool.Pool { return d.pool }
+// Pool exposes the underlying pool for health checks and migrations. Note
+// this is the raw *pgxpool.Pool, not the SQLSTATE-25006-aware wrapper (see
+// hapool.go) every store actually uses — callers that run queries directly
+// against it (rather than through a store) do not get the automatic
+// failover-detection Reset(). None do today.
+func (d *DB) Pool() *pgxpool.Pool { return d.pool.Pool }
 
 // Ping reports whether the database is reachable.
 func (d *DB) Ping(ctx context.Context) error {
@@ -182,8 +186,10 @@ func isNoRows(err error) bool {
 }
 
 // inTx runs fn inside a transaction, committing on success and rolling back on
-// error or panic.
-func inTx(ctx context.Context, pool *pgxpool.Pool, fn func(tx pgx.Tx) error) error {
+// error or panic. pool is the dbPool interface (hapool.go), not the
+// concrete *pgxpool.Pool, so a write inside the transaction gets the same
+// SQLSTATE 25006 detection an ordinary Exec/QueryRow call does.
+func inTx(ctx context.Context, pool dbPool, fn func(tx pgx.Tx) error) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("db: begin transaction: %w", err)

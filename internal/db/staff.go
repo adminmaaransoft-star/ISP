@@ -5,18 +5,16 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/maaransoft/isp-bss-oss/internal/staffui"
 )
 
 // StaffStore serves staff account lookups for the operations console.
 type StaffStore struct {
-	pool *pgxpool.Pool
+	pool dbPool
 }
 
 // NewStaffStore constructs a StaffStore.
-func NewStaffStore(pool *pgxpool.Pool) *StaffStore { return &StaffStore{pool: pool} }
+func NewStaffStore(pool dbPool) *StaffStore { return &StaffStore{pool: pool} }
 
 // GetStaffByUsername returns an active staff account, or nil when there is no
 // such account or it has been deactivated.

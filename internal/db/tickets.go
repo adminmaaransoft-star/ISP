@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maaransoft/isp-bss-oss/internal/api"
 )
 
@@ -14,7 +13,7 @@ import (
 // of which the self-service surface should ever be able to do.
 //
 // Satisfies api.TicketAdminQuerier.
-type TicketStore struct{ pool *pgxpool.Pool }
+type TicketStore struct{ pool dbPool }
 
 var _ api.TicketAdminQuerier = (*TicketStore)(nil)
 

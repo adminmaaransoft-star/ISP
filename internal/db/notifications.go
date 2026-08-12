@@ -4,13 +4,12 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maaransoft/isp-bss-oss/internal/notifications"
 )
 
 // NotificationStore persists notification dispatch and delivery state.
 // Satisfies notifications.NotifQuerier.
-type NotificationStore struct{ pool *pgxpool.Pool }
+type NotificationStore struct{ pool dbPool }
 
 var _ notifications.NotifQuerier = (*NotificationStore)(nil)
 

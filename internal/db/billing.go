@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maaransoft/isp-bss-oss/internal/api"
 	"github.com/maaransoft/isp-bss-oss/internal/billing"
 	"github.com/shopspring/decimal"
@@ -15,7 +14,7 @@ import (
 // BillingStore serves wallet, dunning, ledger and invoice operations.
 // Satisfies billing.WalletQuerier, billing.DunningQuerier, api.LedgerQuerier
 // and api.InvoiceQuerier.
-type BillingStore struct{ pool *pgxpool.Pool }
+type BillingStore struct{ pool dbPool }
 
 var (
 	_ billing.WalletQuerier  = (*BillingStore)(nil)

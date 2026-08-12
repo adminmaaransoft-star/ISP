@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maaransoft/isp-bss-oss/internal/nas"
 )
 
@@ -14,7 +13,7 @@ import (
 // profile mappings for policy-reference vendors.
 //
 // Satisfies nas.DeviceStore.
-type NASStore struct{ pool *pgxpool.Pool }
+type NASStore struct{ pool dbPool }
 
 var _ nas.DeviceStore = (*NASStore)(nil)
 

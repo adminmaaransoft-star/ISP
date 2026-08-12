@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maaransoft/isp-bss-oss/internal/revenue"
 	"github.com/shopspring/decimal"
 )
@@ -13,7 +12,7 @@ import (
 // RevenueStore serves the nightly reconciliation job and franchise operations.
 // Satisfies revenue.RevenueQuerier, revenue.FranchiseQuerier and
 // revenue.SubscriberLister.
-type RevenueStore struct{ pool *pgxpool.Pool }
+type RevenueStore struct{ pool dbPool }
 
 var (
 	_ revenue.RevenueQuerier   = (*RevenueStore)(nil)

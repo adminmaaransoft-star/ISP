@@ -1,0 +1,277 @@
+# PostgreSQL HA overlay — NFR-AVAIL-002, IDD §8.2a, MDS §4.12.
+#
+# Adds a 3-node etcd cluster (Patroni's DCS) and turns the single
+# postgres_primary container into a 3-node Patroni-managed cluster
+# (postgres_primary + postgres_standby_1/2). Apply on top of the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.pg-ha.yml up -d
+#
+# Deliberately an overlay, not an edit to docker-compose.yml: local/demo use
+# (scripts/demo_up.sh) keeps running a single Postgres exactly as it does
+# today — fast, simple, matches what the whole test suite has been
+# validated against all session. HA is opt-in for environments that want it,
+# the same relationship IDD's aspirational blueprint already has to the
+# simpler stack developers actually run.
+#
+# Service names stay postgres_primary/postgres_standby_N as static
+# addressing labels, same as redis_primary/redis_replica_N already are in
+# the base file — after a Patroni failover, postgres_standby_1 may actually
+# be the primary. The container name never changes; Patroni's DCS state (or
+# `curl :8008/primary`) is the source of truth for current role, not the
+# label. Do not read the labels as promises about live role.
+#
+# NOT included here: application-layer retry/eviction logic for a pooled
+# connection that was talking to the old primary at the moment of failover.
+# Multi-host DSN + target_session_attrs=read-write (below) handles every
+# *new* connection correctly; a connection already checked out of the pool
+# when a failover happens needs the app to recognize SQLSTATE 25006
+# (read_only_sql_transaction) and force that one connection closed rather
+# than reuse it. That is a small, real Go change against internal/db,
+# scoped as its own pass once this topology is actually running — see the
+# implementation plan in the chat response this file shipped with.
+
+services:
+
+  # ── etcd (Patroni's distributed configuration store) ───────────────────────
+  # 3 nodes, quorum 2 — same shape as Redis Sentinel's 3-sentinel/quorum-2
+  # setup already in the base file, for the same reason: tolerate exactly
+  # one node failure without losing the ability to elect a leader.
+  etcd_1:
+    image: quay.io/coreos/etcd:v3.5.9
+    container_name: bss_etcd_1
+    command: >
+      etcd --name etcd_1
+      --data-dir /etcd-data
+      --listen-client-urls http://0.0.0.0:2379
+      --advertise-client-urls http://etcd_1:2379
+      --listen-peer-urls http://0.0.0.0:2380
+      --initial-advertise-peer-urls http://etcd_1:2380
+      --initial-cluster etcd_1=http://etcd_1:2380,etcd_2=http://etcd_2:2380,etcd_3=http://etcd_3:2380
+      --initial-cluster-state new
+      --initial-cluster-token bss-etcd-cluster
+    volumes:
+      - etcd_1_data:/etcd-data
+    networks:
+      - bss_internal
+    restart: always
+
+  etcd_2:
+    image: quay.io/coreos/etcd:v3.5.9
+    container_name: bss_etcd_2
+    command: >
+      etcd --name etcd_2
+      --data-dir /etcd-data
+      --listen-client-urls http://0.0.0.0:2379
+      --advertise-client-urls http://etcd_2:2379
+      --listen-peer-urls http://0.0.0.0:2380
+      --initial-advertise-peer-urls http://etcd_2:2380
+      --initial-cluster etcd_1=http://etcd_1:2380,etcd_2=http://etcd_2:2380,etcd_3=http://etcd_3:2380
+      --initial-cluster-state new
+      --initial-cluster-token bss-etcd-cluster
+    volumes:
+      - etcd_2_data:/etcd-data
+    networks:
+      - bss_internal
+    restart: always
+
+  etcd_3:
+    image: quay.io/coreos/etcd:v3.5.9
+    container_name: bss_etcd_3
+    command: >
+      etcd --name etcd_3
+      --data-dir /etcd-data
+      --listen-client-urls http://0.0.0.0:2379
+      --advertise-client-urls http://etcd_3:2379
+      --listen-peer-urls http://0.0.0.0:2380
+      --initial-advertise-peer-urls http://etcd_3:2380
+      --initial-cluster etcd_1=http://etcd_1:2380,etcd_2=http://etcd_2:2380,etcd_3=http://etcd_3:2380
+      --initial-cluster-state new
+      --initial-cluster-token bss-etcd-cluster
+    volumes:
+      - etcd_3_data:/etcd-data
+    networks:
+      - bss_internal
+    restart: always
+
+  # ── PostgreSQL, Patroni-managed (3 nodes) ───────────────────────────────────
+  # All three run the identical Dockerfile.postgres-ha image and mount the
+  # identical config/postgres/patroni.yml. Only the PATRONI_* environment
+  # variables differ per node (MDS §4.12, config/postgres/patroni.yml's
+  # header comment explains why that's the correct pattern, not a
+  # primary.yml/replica.yml split).
+  postgres_primary:
+    # image: explicit and distinct from the base file's `image:
+    # postgres:15-alpine` on purpose — the base file sets that key too, and
+    # Compose merges `build` + an inherited `image` by building the Dockerfile
+    # and tagging the result with whatever `image:` resolves to. Without this
+    # override, that would tag our custom Patroni build as `postgres:15-alpine`,
+    # silently shadowing the real upstream image under its own name.
+    image: bss-postgres-ha:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres-ha
+    container_name: bss_postgres_primary
+    environment:
+      - PATRONI_NAME=postgres_primary
+      - PATRONI_RESTAPI_CONNECT_ADDRESS=postgres_primary:8008
+      - PATRONI_POSTGRESQL_CONNECT_ADDRESS=postgres_primary
+      - PATRONI_SUPERUSER_PASSWORD=${DB_SECURE_PASSWORD}
+      - PATRONI_REPLICATION_PASSWORD=${PG_REPLICATION_PASSWORD}
+    volumes:
+      - pg_ha_data_1:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+      - "8008:8008"   # Patroni REST API — GET /primary for OPS scripts/health checks
+    networks:
+      - bss_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d isp_bss_oss"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - etcd_1
+      - etcd_2
+      - etcd_3
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4096M
+    restart: always
+
+  postgres_standby_1:
+    image: bss-postgres-ha:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres-ha
+    container_name: bss_postgres_standby_1
+    environment:
+      - PATRONI_NAME=postgres_standby_1
+      - PATRONI_RESTAPI_CONNECT_ADDRESS=postgres_standby_1:8008
+      - PATRONI_POSTGRESQL_CONNECT_ADDRESS=postgres_standby_1
+      - PATRONI_SUPERUSER_PASSWORD=${DB_SECURE_PASSWORD}
+      - PATRONI_REPLICATION_PASSWORD=${PG_REPLICATION_PASSWORD}
+    volumes:
+      - pg_ha_data_2:/var/lib/postgresql/data
+    networks:
+      - bss_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d isp_bss_oss"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - etcd_1
+      - etcd_2
+      - etcd_3
+      - postgres_primary
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4096M
+    restart: always
+
+  postgres_standby_2:
+    image: bss-postgres-ha:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres-ha
+    container_name: bss_postgres_standby_2
+    environment:
+      - PATRONI_NAME=postgres_standby_2
+      - PATRONI_RESTAPI_CONNECT_ADDRESS=postgres_standby_2:8008
+      - PATRONI_POSTGRESQL_CONNECT_ADDRESS=postgres_standby_2
+      - PATRONI_SUPERUSER_PASSWORD=${DB_SECURE_PASSWORD}
+      - PATRONI_REPLICATION_PASSWORD=${PG_REPLICATION_PASSWORD}
+    volumes:
+      - pg_ha_data_3:/var/lib/postgresql/data
+    networks:
+      - bss_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d isp_bss_oss"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - etcd_1
+      - etcd_2
+      - etcd_3
+      - postgres_primary
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4096M
+    restart: always
+
+  # ── Application services: multi-host DSN, no other changes ─────────────────
+  # Compose merges an overridden service's `environment` list as a full
+  # replacement, not element-wise — so these two blocks intentionally
+  # duplicate every env var from the base file's aaa_core_daemon/api_service,
+  # not just DB_DSN. That is not drift; trimming this to "just the changed
+  # line" would silently drop every other variable when both files are
+  # applied together. Diff against docker-compose.yml if a base var changes.
+  aaa_core_daemon:
+    depends_on:
+      postgres_primary:
+        condition: service_healthy
+      postgres_standby_1:
+        condition: service_healthy
+      postgres_standby_2:
+        condition: service_healthy
+      redis_primary:
+        condition: service_healthy
+    environment:
+      - DB_DSN=host=postgres_primary,postgres_standby_1,postgres_standby_2 port=5432,5432,5432 user=bss_app password=${APP_DB_PASSWORD} dbname=isp_bss_oss target_session_attrs=read-write sslmode=disable
+      - REDIS_SENTINEL_ADDRS=bss_redis_sentinel_1:26379,bss_redis_sentinel_2:26379,bss_redis_sentinel_3:26379
+      - REDIS_MASTER_NAME=${REDIS_MASTER_NAME}
+      - RADIUS_SECRET=${RADIUS_SECRET}
+      - RADIUS_VERIFIER_SECRET=${RADIUS_VERIFIER_SECRET}
+      - AES_KEY_STORE_URL=${AES_KEY_STORE_URL}
+      - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID}
+      - WHATSAPP_ACCESS_TOKEN=${WHATSAPP_ACCESS_TOKEN}
+      - SMS_GATEWAY_PROVIDER=${SMS_GATEWAY_PROVIDER}
+      - SMS_GATEWAY_API_KEY=${SMS_GATEWAY_API_KEY}
+      - SMS_GATEWAY_SENDER_ID=${SMS_GATEWAY_SENDER_ID}
+      - PAGERDUTY_ROUTING_KEY=${PAGERDUTY_ROUTING_KEY}
+      - LOG_FORMAT=json
+      - LOG_LEVEL=info
+
+  api_service:
+    depends_on:
+      postgres_primary:
+        condition: service_healthy
+      postgres_standby_1:
+        condition: service_healthy
+      postgres_standby_2:
+        condition: service_healthy
+      redis_primary:
+        condition: service_healthy
+    environment:
+      - DB_DSN=host=postgres_primary,postgres_standby_1,postgres_standby_2 port=5432,5432,5432 user=bss_app password=${APP_DB_PASSWORD} dbname=isp_bss_oss target_session_attrs=read-write sslmode=disable
+      - REDIS_SENTINEL_ADDRS=bss_redis_sentinel_1:26379,bss_redis_sentinel_2:26379,bss_redis_sentinel_3:26379
+      - REDIS_MASTER_NAME=${REDIS_MASTER_NAME}
+      - JWT_SECRET=${JWT_SECRET}
+      - RAZORPAY_WEBHOOK_SECRET=${RAZORPAY_WEBHOOK_SECRET}
+      - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID}
+      - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET}
+      - AES_KEY_STORE_URL=${AES_KEY_STORE_URL}
+      - GOTENBERG_URL=http://gotenberg_engine:3000
+      - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID}
+      - WHATSAPP_ACCESS_TOKEN=${WHATSAPP_ACCESS_TOKEN}
+      - WHATSAPP_WEBHOOK_VERIFY_TOKEN=${WHATSAPP_WEBHOOK_VERIFY_TOKEN}
+      - SMS_GATEWAY_PROVIDER=${SMS_GATEWAY_PROVIDER}
+      - SMS_GATEWAY_API_KEY=${SMS_GATEWAY_API_KEY}
+      - SMS_GATEWAY_SENDER_ID=${SMS_GATEWAY_SENDER_ID}
+      - LOG_FORMAT=json
+      - LOG_LEVEL=info
+
+volumes:
+  etcd_1_data:
+  etcd_2_data:
+  etcd_3_data:
+  pg_ha_data_1:
+  pg_ha_data_2:
+  pg_ha_data_3:

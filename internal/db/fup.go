@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maaransoft/isp-bss-oss/internal/api"
 	"github.com/maaransoft/isp-bss-oss/internal/fup"
 )
@@ -16,7 +15,7 @@ import (
 // types for no structural reason.
 // Satisfies fup.FUPQuerier, fup.CoAQuerier, api.SessionController,
 // api.LEAQuerier and api.LEAAuditRecorder.
-type FUPStore struct{ pool *pgxpool.Pool }
+type FUPStore struct{ pool dbPool }
 
 var (
 	_ fup.FUPQuerier        = (*FUPStore)(nil)

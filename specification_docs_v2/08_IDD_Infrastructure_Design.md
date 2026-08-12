@@ -1,5 +1,5 @@
 # Document 8: Infrastructure Design Document (IDD)
-**Version:** 2.0 | **Status:** Draft | **Date:** 2025-06-01
+**Version:** 2.1 | **Status:** Draft | **Date:** 2026-08-12 — §8.2a added (NFR-AVAIL-002, CRD §1.11 Phase 2); rest unchanged from v2.0
 **Document ID:** IDD
 **Traces From:** [SAD](03_SAD_System_Architecture.md)
 **Traces To:** [DXD](11_DXD_Developer_Setup.md) → [OPS](12_OPS_Operations_Runbook.md)
@@ -230,6 +230,151 @@ volumes:
 
 ---
 
+## 8.2a PostgreSQL High Availability *(new — NFR-AVAIL-002, v3)*
+
+### Why this exists
+
+Redis has had real HA since v2.0 of this document — 3 Sentinels, quorum 2,
+tested failover (§8.3). PostgreSQL, where `subscribers`, `wallet_ledgers`,
+and every billing record live, has been a single container this whole time.
+OPS §12.3.2 already documents a promotion procedure that assumes a replica
+(`bss_postgres_replica`) and claims RPO = 0 — neither the replica nor any
+automation behind that claim has ever existed until this section. This
+closes that gap rather than leaving the runbook describing a system that
+was never built.
+
+### Mechanism: Patroni + etcd, not repmgr or pg_auto_failover
+
+**Patroni**, coordinating through a 3-node **etcd** cluster, was chosen over
+the alternatives for reasons specific to this deployment, not in the
+abstract:
+
+- **repmgr** needs its own daemon (`repmgrd`) per node for automatic
+  failover and is generally considered less battle-tested for *automatic*
+  promotion than Patroni — repmgr's strength is manual/assisted failover,
+  which OPS §12.3.2 already has a procedure for and which this section is
+  explicitly trying to move beyond.
+- **pg_auto_failover** avoids a separate DCS (it uses a monitor node
+  instead of etcd/Consul), which is architecturally closer to how Redis
+  Sentinel works here — a real point in its favor — but it sees
+  meaningfully less production adoption and community troubleshooting
+  material than Patroni, which matters for a small ops team debugging an
+  incident at 3 a.m., not just for the failover mechanics themselves.
+- **Patroni** is the most widely deployed, most actively maintained option,
+  with the deepest community/StackOverflow surface for exactly the kind of
+  incident OPS §12.3 is written for. The etcd dependency is real overhead
+  (three more containers) but is the same shape of overhead this codebase
+  already accepted for Redis Sentinel — three coordinator processes to get
+  automatic leader election — so it is not a new category of complexity,
+  just the Postgres-shaped version of one already running in production.
+
+### Topology
+
+```
+                    ┌─────────────┐
+                    │  etcd_1/2/3 │  (DCS — leader election, quorum 2)
+                    └──────┬──────┘
+                           │
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+┌───────▼──────┐   ┌───────▼────────┐  ┌───────▼────────┐
+│postgres_primary│  │postgres_standby_1│ │postgres_standby_2│
+│  (Patroni +    │◄─┤ (Patroni +      │◄┤ (Patroni +      │
+│   postgres)    │  │  postgres,      │ │  postgres,      │
+│                │  │  streaming      │ │  streaming      │
+│                │  │  replica)       │ │  replica)       │
+└───────▲────────┘  └────────────────┘ └────────────────┘
+        │
+   aaa_core_daemon / api_service
+   DB_DSN lists all three hosts +
+   target_session_attrs=read-write —
+   pgx (this codebase's driver) tries
+   each in order and picks the one
+   currently accepting writes. No
+   HAProxy/PgBouncer layer: pgx's
+   native multi-host support (verified
+   against pgx v5's pgconn — the same
+   libpq-compatible behavior as
+   `host=a,b,c target_session_attrs=
+   read-write`) makes a proxy
+   unnecessary for this Go-only
+   client population.
+```
+
+`postgres_primary`/`postgres_standby_N` are static service-name labels, the
+same relationship `redis_primary`/`redis_replica_N` already have to actual
+runtime role — after a failover, `postgres_standby_1` may be the real
+primary. `curl postgres_primary:8008/primary` (Patroni's REST API, 200 only
+on the current leader) is the source of truth for current role, not the
+container name.
+
+### Deployment files
+
+| File | Purpose |
+|---|---|
+| `Dockerfile.postgres-ha` | `postgres:15-alpine` + Patroni, one image for all three nodes |
+| `config/postgres/patroni.yml` | Identical on every node; `PATRONI_NAME`/`PATRONI_*_CONNECT_ADDRESS`/passwords come from environment, not separate YAML files — see the file's own header comment for why that's the correct pattern for Patroni specifically (unlike Redis Sentinel's genuinely asymmetric primary/replica configs) |
+| `docker-compose.pg-ha.yml` | Overlay, not an edit to `docker-compose.yml` — apply with `docker compose -f docker-compose.yml -f docker-compose.pg-ha.yml up -d`. Local/demo use (`scripts/demo_up.sh`) is unaffected and keeps running a single Postgres |
+
+### Commit-durability setting
+
+`synchronous_mode: true` / `synchronous_mode_strict: false` in
+`patroni.yml`: Patroni requires a synchronous standby when one is healthy,
+but degrades to async rather than stalling every write if that standby
+becomes unreachable — a single dead standby must not turn into a full write
+outage on an otherwise-healthy primary. Within that, `synchronous_commit:
+remote_write` (not the stricter `on`) acknowledges a commit once the
+standby has *received* the WAL over the network, not once it has fsynced it
+to its own disk — durable against a primary crash, without a second
+disk-flush round-trip added to every `wallet_ledgers`/RADIUS-accounting
+write (DBD §6.6 covers the query-routing side of this same trade-off).
+
+### What is not solved by this file alone
+
+The connection string change (multi-host DSN, below) makes every *new*
+`internal/db` connection resolve to the correct current primary
+automatically — no Go code changes needed for that part, confirmed against
+`pgx/v5`'s `pgconn.ParseConfig`, which implements the same
+`target_session_attrs` behavior as libpq. What it does **not** do: a
+connection pgxpool already had checked out *at the moment of failover* is
+still physically talking to the old primary, now a read-only standby. The
+next write on that specific connection fails with SQLSTATE `25006`
+(`read_only_sql_transaction`) — a normal SQL error, not a network fault, so
+pgxpool has no built-in reason to evict that connection on its own. Closing
+that gap is a small, real `internal/db` change (recognize `25006`, force
+that one connection closed, let the pool dial fresh — which then resolves
+correctly via `Fallbacks`) and is scoped as its own implementation pass once
+this topology is actually running, not bundled into this configuration
+change.
+
+**Implemented as `internal/db/hapool.go`** (`dbPool` interface, `haPool`
+wrapper around `*pgxpool.Pool`, `haRow`/`haTx` for the `QueryRow`/transaction
+paths) — every store in `internal/db` now goes through it. Verified live,
+not just unit-tested, using `scripts/pg_failover_drill` (a small program
+using this codebase's own `internal/db.Connect` and a real store's write
+method, run against an actual 3-node Patroni cluster while the primary was
+killed/switched over):
+
+| Test | What happened | Recovery mechanism | Time |
+|---|---|---|---|
+| `docker kill` on the primary | Connection died mid-write (`unexpected EOF`) | pgx's own connection-health tracking + `Fallbacks` reconnect — `haPool` never engaged | ~26s |
+| Graceful `patroni ... switchover` | Patroni restarts the demoted node during role transition, terminating its connections (`SQLSTATE 57P01`) | Same as above — `haPool` never engaged | ~4s |
+| Backend held read-only while the connection stayed alive (`default_transaction_read_only=on`, no restart) — the specific condition `haPool` targets | Write failed with `SQLSTATE 25006` exactly as designed | `haPool.checkFailover` detected it, logged, called `Pool.Reset()` | ~4s once a real primary existed again |
+
+The honest finding: in this Patroni configuration, both real failure modes
+tested (hard crash, graceful switchover) terminate connections outright
+rather than leaving them alive-but-demoted — so `pgx`'s own native
+reconnection already recovers them, without `haPool`'s SQLSTATE 25006 logic
+ever engaging. That logic is still correct and worth keeping — the
+alive-but-read-only condition it defends against is real (a manual
+`pg_promote()` without full Patroni-orchestrated demotion of the old
+primary, or certain proxy/timing configurations, can produce exactly this),
+and the third test above confirms it fires precisely as designed when that
+condition actually occurs. It just wasn't the mechanism that happened to
+fire in either of the two most obvious failure drills.
+
+---
+
 ## 8.3 Redis Sentinel Configuration
 
 ### `config/redis/redis-primary.conf`
@@ -264,6 +409,7 @@ sentinel parallel-syncs bss_master 1
 | Variable | Required | Description |
 |---|---|---|
 | `DB_SECURE_PASSWORD` | Yes | PostgreSQL superuser password |
+| `PG_REPLICATION_PASSWORD` | Only with `docker-compose.pg-ha.yml` | Postgres replication user password (§8.2a) |
 | `JWT_SECRET` | Yes | HMAC secret for JWT signing |
 | `RAZORPAY_WEBHOOK_SECRET` | Yes | HMAC secret for Razorpay webhook validation |
 | `REDIS_SENTINEL_ADDRS` | Yes | Comma-separated sentinel addresses |
@@ -314,6 +460,7 @@ docker cp bss_redis_primary:/data/dump.rdb /backup/redis/$(date +%Y%m%d).rdb
 | Service | Probe Type | Endpoint / Command | Interval |
 |---|---|---|---|
 | `postgres_primary` | TCP + query | `pg_isready` | 10s |
+| `postgres_primary`/`_standby_N` (pg-ha overlay only) | HTTP | `GET :8008/primary` returns 200 only on the current leader (§8.2a) | operator/OPS-script use, not a container healthcheck |
 | `redis_primary` | TCP | `redis-cli ping` | 5s |
 | `aaa_core_daemon` | Prometheus scrape | `:9100/metrics` | 15s |
 | `api_service` | HTTP | `GET /health` | 15s |
