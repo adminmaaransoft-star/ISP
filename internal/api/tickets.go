@@ -7,7 +7,11 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/hibiken/asynq"
+	"github.com/rs/zerolog/log"
+
 	"github.com/maaransoft/isp-bss-oss/internal/middleware"
+	tickettask "github.com/maaransoft/isp-bss-oss/internal/tickets"
 )
 
 // ticketCategories and ticketStatuses mirror the CHECK constraints on the
@@ -114,8 +118,48 @@ func (h *Handler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// FR-NOTIF-007: tell the subscriber, but only when the status actually
+	// moved — an assignee-only patch is an internal routing change the
+	// subscriber has no stake in.
+	if req.Status != nil {
+		h.enqueueTicketUpdate(r.Context(), *ticket)
+	}
+
 	middleware.Audit(r.Context(), "ticket.update", strconv.Itoa(ticketID), map[string]any{
 		"status": req.Status, "assigned_to": req.AssignedTo,
 	})
 	writeJSON(w, http.StatusOK, ticket)
+}
+
+// enqueueTicketUpdate tells the subscriber their ticket's status changed
+// (FR-NOTIF-007, TMPL-008). Failures are logged, never returned: the ticket
+// is already updated and the caller already has their 200 by this point.
+func (h *Handler) enqueueTicketUpdate(ctx context.Context, ticket TicketRecord) {
+	if h.tasks == nil || h.db == nil {
+		return
+	}
+
+	username := ""
+	if sub, err := h.db.GetSubscriberByID(ctx, ticket.SubscriberID); err == nil && sub != nil {
+		username = sub.Username
+	}
+
+	payload, err := json.Marshal(tickettask.UpdatePayload{
+		SubscriberID: ticket.SubscriberID,
+		Username:     username,
+		TicketID:     ticket.ID,
+		Status:       ticket.Status,
+	})
+	if err != nil {
+		return
+	}
+
+	task := asynq.NewTask(tickettask.TaskTypeTicketUpdate, payload,
+		asynq.Queue("notifications"),
+		asynq.MaxRetry(3),
+		asynq.Retention(24*time.Hour))
+	if _, err := h.tasks.Enqueue(task); err != nil {
+		log.Warn().Err(err).Int("ticket_id", ticket.ID).
+			Msg("api: ticket update enqueue failed")
+	}
 }

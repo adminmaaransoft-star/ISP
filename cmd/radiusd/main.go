@@ -33,6 +33,7 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/notifications"
 	"github.com/maaransoft/isp-bss-oss/internal/radius"
 	"github.com/maaransoft/isp-bss-oss/internal/revenue"
+	"github.com/maaransoft/isp-bss-oss/internal/tickets"
 )
 
 const (
@@ -153,6 +154,7 @@ func run() error {
 	warningHandler := fup.NewWarningHandler(dispatcher)
 	dunningNoticeHandler := billing.NewDunningNoticeHandler(dispatcher)
 	paymentReceiptHandler := billing.NewPaymentReceiptHandler(dispatcher)
+	ticketUpdateHandler := tickets.NewUpdateHandler(dispatcher)
 
 	workerServer := asynq.NewServer(asynqRedis, asynq.Config{
 		Concurrency: workerConcurrency,
@@ -174,6 +176,7 @@ func run() error {
 	workerMux.Handle(fup.TaskTypeFUPWarning, warningHandler)
 	workerMux.Handle(billing.TaskTypeDunningNotice, dunningNoticeHandler)
 	workerMux.Handle(billing.TaskTypePaymentReceipt, paymentReceiptHandler)
+	workerMux.Handle(tickets.TaskTypeTicketUpdate, ticketUpdateHandler)
 
 	if err := workerServer.Start(workerMux); err != nil {
 		return fmt.Errorf("start Asynq workers: %w", err)

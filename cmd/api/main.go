@@ -177,6 +177,7 @@ func run() error {
 		Tickets:     staffTicketStore{portal: database.Portal(), admin: database.Tickets()},
 		LEA:         database.FUP(),
 		Revenue:     database.Revenue(),
+		Tasks:       asynqClient,
 		JWTSecret:   cfg.JWTSecret,
 	})
 

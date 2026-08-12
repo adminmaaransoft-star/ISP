@@ -21,6 +21,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/hibiken/asynq"
+
 	"github.com/maaransoft/isp-bss-oss/internal/api"
 	"github.com/maaransoft/isp-bss-oss/internal/health"
 	"github.com/maaransoft/isp-bss-oss/internal/portal"
@@ -75,6 +77,15 @@ type TicketQuerier interface {
 	UpdateTicketAdmin(ctx context.Context, ticketID int, status *string, assignedTo *int) (*api.TicketRecord, error)
 }
 
+// TaskEnqueuer is the subset of *asynq.Client the console needs to trigger
+// background work — currently just the ticket status-change notification
+// (FR-NOTIF-007). Redefined per package rather than shared with internal/api,
+// matching how internal/billing and internal/fup each keep their own
+// Notifier-shaped interface.
+type TaskEnqueuer interface {
+	Enqueue(task *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error)
+}
+
 // LEAQuerier serves the law-enforcement lookup.
 type LEAQuerier interface {
 	LookupByPublicIP(ctx context.Context, publicIP string, port *int, at time.Time) (*api.LEAResult, error)
@@ -101,6 +112,7 @@ type HandlerDeps struct {
 	Tickets     TicketQuerier
 	LEA         LEAQuerier
 	Revenue     RevenueQuerier
+	Tasks       TaskEnqueuer
 	JWTSecret   string
 }
 
@@ -114,6 +126,7 @@ type Handler struct {
 	tickets     TicketQuerier
 	lea         LEAQuerier
 	revenue     RevenueQuerier
+	tasks       TaskEnqueuer
 	jwtSecret   string
 }
 
@@ -128,6 +141,7 @@ func NewHandler(deps HandlerDeps) *Handler {
 		tickets:     deps.Tickets,
 		lea:         deps.LEA,
 		revenue:     deps.Revenue,
+		tasks:       deps.Tasks,
 		jwtSecret:   deps.JWTSecret,
 	}
 }

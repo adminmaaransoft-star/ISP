@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -30,6 +31,7 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/billing"
 	"github.com/maaransoft/isp-bss-oss/internal/health"
 	"github.com/maaransoft/isp-bss-oss/internal/middleware"
+	tickettask "github.com/maaransoft/isp-bss-oss/internal/tickets"
 )
 
 // ── Token helper ─────────────────────────────────────────────────────────────
@@ -567,6 +569,83 @@ func TestUpdateTicket_UnknownReturns404(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("want 404, got %d", rec.Code)
+	}
+}
+
+// TestUpdateTicket_StatusChange_EnqueuesNotification is the FR-NOTIF-007
+// regression test: a status change on the JSON API — not just the console —
+// must tell the subscriber. Before this was wired, UpdateTicketAdmin was a
+// bare UPDATE and nothing downstream ever knew a ticket moved.
+func TestUpdateTicket_StatusChange_EnqueuesNotification(t *testing.T) {
+	ticketsStore := newStubTicketsAdmin()
+	created, err := ticketsStore.CreateTicketAdmin(context.Background(), 9, "connectivity", "No internet")
+	if err != nil {
+		t.Fatalf("seed ticket: %v", err)
+	}
+
+	tasks := &stubTaskEnqueuer{}
+	h := api.NewHandler(api.HandlerDeps{
+		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(&stubWallet{}),
+		Tickets: ticketsStore, Tasks: tasks,
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, itJWTSecret)
+
+	body := `{"status":"resolved"}`
+	req := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/v1/tickets/%d", created.ID), strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+itRoleToken(t, "technician", false))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", rec.Code, rec.Body.String())
+	}
+
+	enqueued := tasks.snapshot()
+	if len(enqueued) != 1 {
+		t.Fatalf("want 1 enqueued task, got %d", len(enqueued))
+	}
+	if enqueued[0].Type() != tickettask.TaskTypeTicketUpdate {
+		t.Errorf("task type = %q, want %q", enqueued[0].Type(), tickettask.TaskTypeTicketUpdate)
+	}
+	var payload tickettask.UpdatePayload
+	if err := json.Unmarshal(enqueued[0].Payload(), &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload.SubscriberID != 9 || payload.TicketID != created.ID || payload.Status != "resolved" || payload.Username != "test" {
+		t.Errorf("payload = %+v, want subscriber 9, ticket %d, status resolved, username test", payload, created.ID)
+	}
+}
+
+// TestUpdateTicket_AssigneeOnlyChange_DoesNotNotify guards the other branch:
+// re-routing a ticket to a different technician is an internal change the
+// subscriber has no stake in, and should never look like a status update.
+func TestUpdateTicket_AssigneeOnlyChange_DoesNotNotify(t *testing.T) {
+	ticketsStore := newStubTicketsAdmin()
+	created, err := ticketsStore.CreateTicketAdmin(context.Background(), 9, "connectivity", "No internet")
+	if err != nil {
+		t.Fatalf("seed ticket: %v", err)
+	}
+
+	tasks := &stubTaskEnqueuer{}
+	h := api.NewHandler(api.HandlerDeps{
+		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(&stubWallet{}),
+		Tickets: ticketsStore, Tasks: tasks,
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, itJWTSecret)
+
+	body := `{"assigned_to":3}`
+	req := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/v1/tickets/%d", created.ID), strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+itRoleToken(t, "technician", false))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", rec.Code, rec.Body.String())
+	}
+	if got := tasks.snapshot(); len(got) != 0 {
+		t.Errorf("assignee-only patch should not enqueue a notification, got %d task(s)", len(got))
 	}
 }
 

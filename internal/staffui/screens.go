@@ -1,17 +1,21 @@
 package staffui
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/hibiken/asynq"
 	"github.com/rs/zerolog/log"
 
 	"github.com/maaransoft/isp-bss-oss/internal/api"
 	"github.com/maaransoft/isp-bss-oss/internal/health"
 	"github.com/maaransoft/isp-bss-oss/internal/portal"
 	"github.com/maaransoft/isp-bss-oss/internal/revenue"
+	"github.com/maaransoft/isp-bss-oss/internal/tickets"
 	"github.com/shopspring/decimal"
 )
 
@@ -287,13 +291,59 @@ func (h *Handler) UpdateTicketStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.tickets.UpdateTicketAdmin(r.Context(), ticketID, &status, nil); err != nil {
+	updated, err := h.tickets.UpdateTicketAdmin(r.Context(), ticketID, &status, nil)
+	if err != nil {
 		log.Error().Err(err).Int("ticket_id", ticketID).Msg("staffui: ticket update failed")
 		h.renderError(w, r, s, http.StatusInternalServerError, "Could not update that ticket.")
 		return
 	}
 
+	// FR-NOTIF-007: tell the subscriber. A CSR resolving a ticket from here is
+	// the exact "embarrassed in front of a subscriber" gap this closes — the
+	// customer would otherwise never learn their ticket moved.
+	if updated != nil {
+		h.enqueueTicketUpdate(r.Context(), *updated)
+	}
+
 	http.Redirect(w, r, "/staff/tickets?subscriber_id="+subscriberID+"&updated=1", http.StatusSeeOther)
+}
+
+// enqueueTicketUpdate tells the subscriber their ticket's status changed
+// (FR-NOTIF-007, TMPL-008). Failures are logged, never surfaced: the ticket
+// is already updated at this point, so failing the request over an
+// undelivered notice would tell the CSR their update did not take when it
+// did.
+func (h *Handler) enqueueTicketUpdate(ctx context.Context, ticket api.TicketRecord) {
+	if h.tasks == nil {
+		return
+	}
+
+	username := ""
+	if h.subscribers != nil {
+		if sub, err := h.subscribers.GetSubscriberByID(ctx, ticket.SubscriberID); err == nil && sub != nil {
+			username = sub.Username
+		}
+	}
+
+	payload, err := json.Marshal(tickets.UpdatePayload{
+		SubscriberID: ticket.SubscriberID,
+		Username:     username,
+		TicketID:     ticket.ID,
+		Status:       ticket.Status,
+	})
+	if err != nil {
+		log.Warn().Err(err).Msg("staffui: ticket update payload marshal failed")
+		return
+	}
+
+	task := asynq.NewTask(tickets.TaskTypeTicketUpdate, payload,
+		asynq.Queue("notifications"),
+		asynq.MaxRetry(3),
+		asynq.Retention(24*time.Hour))
+	if _, err := h.tasks.Enqueue(task); err != nil {
+		log.Warn().Err(err).Int("ticket_id", ticket.ID).
+			Msg("staffui: ticket update enqueue failed")
+	}
 }
 
 // ── Revenue (isp_owner) ─────────────────────────────────────────────────────

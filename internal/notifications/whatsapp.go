@@ -74,6 +74,7 @@ var templateNames = map[string]string{
 	"TMPL-005": "payment_received",
 	"TMPL-006": "plan_expiring",
 	"TMPL-007": "promotional_offer",
+	"TMPL-008": "ticket_update",
 }
 
 // TemplateNameFor resolves the Meta template name for an internal template ID.

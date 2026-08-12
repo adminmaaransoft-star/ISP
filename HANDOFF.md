@@ -1,46 +1,98 @@
 # Handoff — state of play
 
-Written 2026-08-12 at commit `deb06d2`. Delete this file once the items below
-are done; it describes a moment, not the system.
+Written 2026-08-12 at commit `deb06d2`; updated same day after pushing to
+`origin/main` and closing item 1. Delete this file once the items below are
+done; it describes a moment, not the system.
 
 ---
 
 ## Do this first
 
-**Five commits are unpushed and the `v1.0.0` tag is five commits stale.**
+**Pushed.** `origin/main` is now at `63b3c57` (the 6 commits that were
+unpushed, including this file's own initial version, all landed). Pre-push
+audit confirmed `.env` untracked, no key material in history, `node_modules`
+and `e2e/snapshots` excluded.
 
-`origin/main` is at `74e2655`. It does **not** have the dunning scanner, the
-nightly revenue reconciliation, or the operations console. Anyone cloning today
-gets a system where nobody is reminded to pay and staff have no UI.
+**Still open: the `v1.1.0` tag.** `v1.0.0` still points at `74e2655` and should
+— it's a released tag, not to be moved. Six commits of work sit on top of it
+(five original + the FR-NOTIF-007 work below). Cutting `v1.1.0` is a naming
+judgement call for a person, not something to decide unattended:
 
 ```bash
-git log --oneline origin/main..HEAD    # 5 commits
-git push origin main
 git tag -a v1.1.0 -m "..." && git push origin v1.1.0
 ```
 
-`v1.0.0` should stay where it is — it is a released tag. The work since is a
-minor release, not a re-cut.
+---
+
+## Completed this session
+
+### FR-NOTIF-007 — notify on ticket status change ✅
+
+The console let a CSR change a ticket status and the subscriber was never
+told; `TMPL-008` (`ticket_update`) was seeded but nothing dispatched it. Fixed
+in both places that change a ticket's status, not just the console:
+
+- New package `internal/tickets` (`notify_task.go`): `TaskTypeTicketUpdate`,
+  `UpdatePayload`, `UpdateHandler` — same shape as
+  `internal/billing/dunning_task.go`.
+- `internal/notifications/whatsapp.go`: registered `TMPL-008` →
+  `ticket_update` in `templateNames` (it was seeded but had no Meta template
+  name mapping — would have sent with the raw ID as the name).
+- `internal/staffui`: added a `Tasks` dependency; `UpdateTicketStatus` enqueues
+  after a successful change.
+- `internal/api/tickets.go`: `UpdateTicket` (the JSON API's PATCH endpoint)
+  also enqueues — it had the identical gap and shares the same
+  `UpdateTicketAdmin` call, so leaving it out would have left one of the two
+  real entry points still silently unwired. Guarded to fire only when
+  `status` actually changed, not on an assignee-only patch.
+- `cmd/api/main.go` / `cmd/radiusd/main.go`: wired the `Tasks` dependency and
+  registered the new handler on the worker mux.
+- `scripts/check_wiring.sh`: added `NewUpdateHandler` to the tracked
+  components (now 12/12).
+
+Verified past "it compiles": unit tests in `internal/tickets` with a
+deliberate-break negative control (swapped the template var order, confirmed
+the test failed, reverted); two new integration tests in
+`internal/api/new_endpoints_integration_test.go` (status change enqueues,
+assignee-only does not) with the same negative-control treatment; then
+rebuilt `api_service` and `aaa_core_daemon`, ran the existing Playwright
+ticket-workflow test against the real containers, and confirmed the full
+round trip in Postgres:
+
+```
+notification_log: subscriber_id=1, template_id=TMPL-008, triggered_by_event=ticket_update, delivery_status=failed
+```
+
+`failed` is expected and correct — the demo stack's `WHATSAPP_ACCESS_TOKEN`
+is not a real Meta credential (confirmed via a 401 in the worker log), the
+same pre-existing limitation the dunning and FUP notifications already have
+here. The point of the check was confirming the task actually reaches the
+worker and a real send is attempted, which it does.
+
+**One discrepancy found and worth knowing:** `golangci-lint run ./...`
+reports 2 pre-existing `gosec` findings (G705 in `internal/api/invoices.go`,
+G710 in `internal/staffui/screens.go`) — confirmed present on the untouched
+`63b3c57` tree via `git stash`, not introduced this session. The "0 issues"
+claim in the previous handoff no longer holds; nobody has fixed or triaged
+these yet.
+
+**Environment note for next time:** this repo has `core.autocrlf=true`. Any
+`git stash`/`pop` round-trip re-CRLFs whatever it touches, which makes
+`gofmt -l` flag entire files as unformatted even though nothing semantic
+changed. Fix with `sed -i 's/\r$//' <file>` on the affected files rather than
+touching `core.autocrlf` (never change git config per this project's rules).
+Also: the demo stack's seeded Redis live-session key
+(`session:active:{id}`) has a 24h TTL (`scripts/demo_up.sh`); a stack left
+running longer than that will fail the two Playwright tests that check the
+"online" dashboard state for reasons that have nothing to do with your
+change. Reseed with the same `redis-cli SET ... EX 86400` command in
+`demo_up.sh` before trusting a red result there.
 
 ---
 
 ## Next tasks, in priority order
 
-### 1. FR-NOTIF-007 — notify on ticket status change (~half a day)
-
-The console lets a CSR change a ticket status. `FR-NOTIF-007` requires telling
-the subscriber. `TMPL-008` (`ticket_update`) is seeded. **Nothing dispatches
-it** — `db.TicketStore.UpdateTicketAdmin` is a bare `UPDATE`.
-
-Harmless when only an API call could change a status; now a CSR resolves a
-ticket from the console and the customer is never told. That is the
-"embarrassed in front of a subscriber" problem CRD PER-004 names for the role.
-
-Follow the pattern already in the tree: `internal/billing/dunning_task.go`
-(handler) + enqueue from the console's `UpdateTicketStatus`, registered on the
-worker mux in `cmd/radiusd/main.go`.
-
-### 2. Console write actions (~1 week)
+### 1. Console write actions (~1 week)
 
 `internal/staffui` is read-mostly. The write actions the API already supports
 have no screen:
@@ -55,7 +107,7 @@ have no screen:
 
 Each needs a confirmation step and an audit entry — more design than typing.
 
-### 3. Security review of `staff_users` (~2 days + a decision)
+### 2. Security review of `staff_users` (~2 days + a decision)
 
 Migration 021 added a **new authentication surface**. Not specified anywhere,
 so these are open decisions rather than omissions:
@@ -66,7 +118,7 @@ so these are open decisions rather than omissions:
 - no screen for creating accounts (they come from the seed)
 - 8-hour sessions
 
-### 4. L6-004 Sentinel failover — a decision, not a sprint
+### 3. L6-004 Sentinel failover — a decision, not a sprint
 
 Measured 5055ms on the shipped config against a 3000ms budget; ~3.1s with
 `down-after-milliseconds` at 500. Recommendation: adopt 500 and move the target
@@ -75,17 +127,18 @@ when a master container leaves Docker DNS, Sentinel never promotes at all.
 Reproduce: `CHAOS_MODE=kill ./scripts/run_sentinel_failover_test.sh`.
 See `DOD_STATUS_REPORT.md` Finding #6.
 
-### 5. The 1-hour soak (L6-005) — pure time
+### 4. The 1-hour soak (L6-005) — pure time
 
 `./scripts/run_soak_test.sh` is committed and validated on a 90s run. Needs one
 uninterrupted hour on a machine that will not sleep.
 
-### 6. Remaining unimplemented requirements
+### 5. Remaining unimplemented requirements
 
-39 of 52 FRs are traceable to a `TestFR_` test. Genuinely unimplemented:
+40 of 52 FRs are traceable to a `TestFR_` test (FR-NOTIF-007 moved from
+"unimplemented" to tested this session). Genuinely unimplemented:
 
 - `FR-NOTIF-003` / `FR-FUP-005` — notify when FUP throttle is applied (same
-  missing-trigger shape as #1)
+  missing-trigger shape FR-NOTIF-007 had)
 - `FR-NET-003` — IPv6 prefix recording; the column exists in migration 010 and
   nothing writes it
 - `FR-FRN-003` — consolidated P&L across LCO partners
@@ -127,11 +180,16 @@ Run these before believing anything:
 
 ```bash
 gofmt -l . && go build ./... && go vet -tags=integration ./...
-go test -count=1 -race -tags=integration ./...     # 16 packages
-golangci-lint run ./...                            # 0 issues
-./scripts/check_wiring.sh                          # 11/11 wired
+go test -count=1 -race -tags=integration ./...     # 17 packages (internal/tickets is new)
+golangci-lint run ./...                            # 2 known gosec issues, see above — not 0
+./scripts/check_wiring.sh                          # 12/12 wired
 npx playwright test                                # 45 browser tests
 ```
+
+`-race` needs a C compiler on `PATH`; in this Windows/Git-Bash shell `gcc` was
+not found (`CGO_ENABLED=1` without it fails outright), so this session's runs
+were without `-race`. Whatever shell had `gcc` resolving before, use that one
+if race detection matters for what you're changing.
 
 `check_wiring.sh` exists because three components shipped complete, tested and
 never called. It is a grep, not a test, and it caught what the suite could not.

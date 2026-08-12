@@ -43,6 +43,7 @@ COMPONENTS=(
     "NewDunningNoticeHandler:dunning notification worker"
     "NewPaymentReceiptHandler:payment receipt worker"
     "NewWarningHandler:80% FUP warning worker"
+    "NewUpdateHandler:ticket status-change notification worker"
     "NewCoAHandler:CoA worker (applies rate limits)"
     "NewPoDHandler:PoD worker (disconnects sessions)"
     "NewVerifierCache:RADIUS fast-verifier cache"
