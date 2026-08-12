@@ -1,5 +1,5 @@
 # Document 6: Database Design Document (DBD)
-**Version:** 2.0 | **Status:** Draft | **Date:** 2025-06-01
+**Version:** 2.1 | **Status:** Draft | **Date:** 2026-08-12 — §6.2 `nas_devices`/`plan_nas_profiles`, §6.6 added (CRD §1.11 Phase 2); rest unchanged from v2.0
 **Document ID:** DBD
 **Traces From:** [MDS](04_MDS_Module_Design.md) → [DDS](05_DDS_Detailed_Design.md)
 **Traces To:** [API](07_API_OpenAPI_Contract.md) → [TST](13_TST_Test_Strategy.md)
@@ -25,7 +25,15 @@ notification_templates  ─── (N) notification_log        [NEW — FR-NOTIF-
 revenue_snapshots ─────────── (standalone — FR-REV-001) [NEW]
 collections_forecast ──────── (standalone — FR-REV-004) [NEW]
 lea_audit_log ─────────────── (append-only — FR-OBS-003)
+nas_devices (1) ─────── (N) plan_nas_profiles  [v3 — FR-NAS-002]
+plans       (1) ─────── (N) plan_nas_profiles  [v3 — FR-NAS-001]
+encryption_keys (1) ─── (N) nas_devices        [v3 — FR-NAS-002, secret encrypted at rest]
 ```
+
+> `nas_devices` is deliberately **not** a hard FK target of
+> `subscriber_session_history.nas_ip_address` — see the note on that column
+> below. The relationship is a runtime lookup by IP value, not a referential
+> constraint, so accounting from an unregistered NAS is never rejected.
 
 ---
 
@@ -169,7 +177,7 @@ lea_audit_log ─────────────── (append-only — FR-
 | `id` | `BIGSERIAL` PK | |
 | `subscriber_id` | `INTEGER` FK | |
 | `session_id` | `VARCHAR(255)` | RADIUS Acct-Session-Id |
-| `nas_ip_address` | `INET` | |
+| `nas_ip_address` | `INET` | Looked up against `nas_devices.ip` at runtime for vendor/secret resolution (FR-NAS-002) — not a hard FK; accounting from an unregistered NAS must never be rejected |
 | `assigned_ipv4` | `INET` NULLABLE | |
 | `assigned_ipv6_prefix` | `CIDR` NULLABLE | IPv6 PD |
 | `start_time` | `TIMESTAMPTZ` | Partition key |
@@ -177,6 +185,47 @@ lea_audit_log ─────────────── (append-only — FR-
 | `input_octets` | `BIGINT` DEFAULT 0 | |
 | `output_octets` | `BIGINT` DEFAULT 0 | |
 | `terminate_cause` | `VARCHAR(50)` NULLABLE | |
+
+### Table: `nas_devices` *(new — FR-NAS-002, v3)*
+**Module:** MOD-NAS | Migration `022_create_nas_devices.sql`
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `ip` | `INET` | UNIQUE NOT NULL | Source IP the NAS sends Access-Requests/Accounting from |
+| `vendor` | `VARCHAR(20)` | NOT NULL CHECK IN (`mikrotik`,`huawei`,`zte`,`cisco`,`juniper`,`wireless_generic`) | Selects the attribute builder (MDS §4.11) |
+| `description` | `VARCHAR(100)` | NULLABLE | e.g. "POP-Chennai-Anna-Nagar edge router" |
+| `radius_secret_encrypted` | `TEXT` | NOT NULL | `{key_version}:{base64(nonce+ct)}` — same AES-GCM-256 pattern as `kyc_verifications`; a RADIUS shared secret is a credential and must not sit in plaintext next to 500 other NAS rows |
+| `key_version_id` | `VARCHAR(10)` | NOT NULL, FK → `encryption_keys.version_id` | |
+| `coa_port` | `INTEGER` | NOT NULL DEFAULT 1700 | MikroTik's default (matches current hardcoded behavior); RFC 5176's standard default is 3799 — override per device, this is a known cross-vendor mismatch, not a typo |
+| `pod_port` | `INTEGER` | NOT NULL DEFAULT 1700 | |
+| `created_at` | `TIMESTAMPTZ` | DEFAULT NOW() | |
+| `updated_at` | `TIMESTAMPTZ` | DEFAULT NOW() | |
+
+An IP with no row here is not an error — `internal/nas` falls back to vendor
+`mikrotik` and the existing global `RADIUS_SECRET` (MDS §4.11 rollout note),
+so this table starts empty in an upgraded deployment and fills in over time
+as non-MikroTik NAS devices are registered, rather than requiring a
+big-bang backfill before the release can ship.
+
+### Table: `plan_nas_profiles` *(new — FR-NAS-001, v3)*
+**Module:** MOD-NAS | Migration `022_create_nas_devices.sql`
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `plan_id` | `INTEGER` | NOT NULL, FK → `plans.id` | |
+| `vendor` | `VARCHAR(20)` | NOT NULL | Same enum as `nas_devices.vendor` |
+| `profile_name` | `VARCHAR(100)` | NOT NULL | Pre-provisioned NAS-side QoS policy/profile name this plan maps to for reference-model vendors (MDS §4.11) |
+| `created_at` | `TIMESTAMPTZ` | DEFAULT NOW() | |
+| `CONSTRAINT uq_plan_vendor` | | UNIQUE (`plan_id`, `vendor`) | One profile mapping per plan per vendor |
+
+Only needed for reference-model vendors (Cisco, Juniper, wireless — MDS
+§4.11); dynamic-rate vendors (MikroTik, Huawei, ZTE) derive their attribute
+directly from `plans.rate_limit_string` and need no row here. A
+reference-vendor NAS whose plan has no matching row here is an
+`nas_attribute_build_errors_total` metric increment, not a silent no-op —
+see MDS §4.11.
 
 ### Table: `tickets`
 **FR:** FR-SUB-004 | **Module:** MOD-PORTAL
@@ -315,6 +364,12 @@ CREATE INDEX idx_revenue_unbilled ON subscribers(status, plan_expiry) WHERE stat
 
 -- Franchise: LCO subscriber isolation
 CREATE INDEX idx_franchise_subscribers ON subscribers(franchise_id) WHERE franchise_id IS NOT NULL;
+
+-- NAS: vendor/secret lookup on every Access-Request and CoA/PoD send (FR-NAS-002, v3)
+-- Already covered by the UNIQUE constraint on nas_devices.ip; no separate index needed.
+
+-- NAS: plan-to-profile resolution for reference-model vendors (FR-NAS-001, v3)
+CREATE INDEX idx_plan_nas_vendor ON plan_nas_profiles(plan_id, vendor);
 ```
 
 ---
@@ -325,3 +380,36 @@ CREATE INDEX idx_franchise_subscribers ON subscribers(franchise_id) WHERE franch
 ALTER TABLE lea_audit_log ENABLE ROW LEVEL SECURITY;
 CREATE POLICY lea_insert_only ON lea_audit_log FOR INSERT WITH CHECK (true);
 ```
+
+---
+
+## 6.6 Read Replica & Failover Considerations *(new — NFR-AVAIL-002, v3)*
+
+Schema-level implications of MDS §4.12 (PostgreSQL HA). The failover
+topology itself — which failover manager, standby count, DNS/VIP mechanics —
+is an IDD §8 concern and out of scope here; this section covers what the
+*schema and query patterns* need to already support before that topology
+exists, so adding HA later doesn't require another migration pass.
+
+**Replication role.** A dedicated `bss_replicator` role (`REPLICATION`
+privilege only, no table grants) should be created alongside the existing
+`bss_app` least-privilege role (migration `019_create_app_role.sql`) — the
+same reasoning that keeps the application off the `postgres` superuser
+applies to the replication stream: a compromised standby's credentials
+should not be able to read table data directly, only the WAL stream.
+
+**`synchronous_commit`.** Recommend `remote_write` (not `on`) for the
+standby: `on` blocks every commit on the standby's disk fsync, which turns a
+replica hiccup into primary-side write latency for `wallet_ledgers` and
+`subscriber_session_history` — exactly the tables where FR-BIL-003's
+atomic double-entry write and the RADIUS accounting path can least afford
+added latency. `remote_write` still guarantees the standby has *received*
+the WAL (no silent data loss on primary crash), just not fsynced it,
+which is the right trade for this workload.
+
+**No schema changes required for the tables in §6.2** — read-replica
+routing (MDS §4.12's routing table) is a connection-string/query-routing
+decision in `internal/db`, not a table design one. The one exception:
+`revenue_snapshots` and `collections_forecast` (§6.2) are already
+write-once/read-many nightly-batch tables, which makes them the safest
+first candidates to route to a replica once one exists.

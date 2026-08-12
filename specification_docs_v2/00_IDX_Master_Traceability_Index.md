@@ -1,5 +1,5 @@
 # Document 00: Master Traceability Index
-**Version:** 2.0 | **Status:** Draft | **Date:** 2025-06-01
+**Version:** 3.0 | **Status:** Draft | **Date:** 2026-08-12
 **Document ID:** IDX
 
 This document maps every Business Outcome → Requirement ID → Architecture Component → Module → Database Object → API Endpoint → Test Case, providing end-to-end traceability across the entire documentation suite.
@@ -14,7 +14,7 @@ IDX  ← You are here (master index)
 ├── CRD  01_CRD_Customer_Requirements.md   Business outcomes, personas, scope, compliance
 │     └── traces to all downstream docs
 │
-├── SRS  02_SRS_System_Requirements.md     52 FRs + 9 NFRs with module and test references
+├── SRS  02_SRS_System_Requirements.md     92 FRs + 11 NFRs (52 FR/9 NFR baseline + 40 FR/2 NFR v3 expansion, requirements-stage)
 │     ├── traces to SAD, MDS, DDS, DBD, API, TST
 │
 ├── SAD  03_SAD_System_Architecture.md     11 components, data flows, HA/DR
@@ -61,6 +61,7 @@ IDX  ← You are here (master index)
 | Franchise / LCO growth support | BO-004 | FR-FRN-001..003 | MDS §4.10, DBD §6.2, API §7 | INT-FRN-001..003 |
 | ARPU + churn visibility | BO-005 | FR-REV-003..004 | MDS §4.8, API §7 | INT-REV-003..004 |
 | Scale to 20,000 subscribers | BO-006 | NFR-SCAL-001 | SAD §3.1, IDD §8.2 | TST §13.4 |
+| Full ISP operations-suite parity (CRM → field ops on one platform) | BO-007 | FR-NAS, FR-HSP, FR-API, FR-MOB, FR-SUP, FR-CRM, FR-INV, FR-WFL, FR-ANN, FR-FRN-004..006, FR-RPT, FR-DOC, FR-CPE, NFR-AVAIL-002, NFR-TEN-001 | CRD §1.11 | TBD — v3, requirements-stage |
 
 ---
 
@@ -146,3 +147,46 @@ IDX  ← You are here (master index)
 | Added persona "what they buy" framing to all personas | All personas | CRD §1.2 |
 | Documented future phase items (NAS SNMP, mobile app, AI churn) | All | CRD §1.10 |
 | Updated version to 2.0 across all 13 documents | — | All |
+
+---
+
+## Change Log: v2 → v3
+
+Prompted by a 2026-08-12 gap analysis comparing this platform against a
+reference commercial ISP-manager architecture (see CRD §1.11 for the full
+rationale). The v2 core — AAA, billing, FUP, notifications, revenue assurance
+— was confirmed sound and is unchanged. What's added is the operations-suite
+breadth a full parity claim requires, adopted as a phased roadmap rather than
+a flat feature checklist.
+
+| Change | Gap Addressed | Docs Affected |
+|---|---|---|
+| Adopted BO-007: full ISP operations-suite parity as an explicit owner-level outcome | Reference-architecture gap analysis | CRD §1.1, §1.11, IDX |
+| Added multi-vendor NAS attribute support (Cisco/Juniper/Huawei/ZTE, not just MikroTik) + per-device `nas_devices` table | Network layer only enforces bandwidth correctly on MikroTik today | SRS FR-NAS-001..004, CRD §1.11 Phase 2 |
+| Added CHAP/EAP-MSCHAPv2 support requirement | PAP-only today, a direct consequence of bcrypt-only credential storage | SRS FR-AAA-005..006 |
+| Added CoA-on-plan-change requirement | Mid-cycle upgrade doesn't reach an already-connected session today | SRS FR-AAA-007 |
+| Added PostgreSQL HA/failover requirement | Redis has Sentinel HA; Postgres — where the money lives — is a single instance | SRS NFR-AVAIL-002 |
+| Added hotspot/captive-portal + MAC-auth module | Only PPPoE-style auth exists today | SRS FR-HSP-001..003 |
+| Added partner API-key auth + outbound webhooks | 3rd-party API reuses internal staff JWT; no outbound event mechanism exists | SRS FR-API-001..003 |
+| Added mobile-facing API requirement | No mobile app or mobile-specific API surface exists | SRS FR-MOB-001..002 |
+| Added helpdesk SLA (priority, due-by, breach alerting) | Tickets have no priority or SLA tracking today | SRS FR-SUP-001..003 |
+| Added CRM/lead-pipeline module | No pre-subscriber prospect tracking exists | SRS FR-CRM-001..003 |
+| Added inventory/CPE-tracking module | No device/stock/warehouse tracking exists | SRS FR-INV-001..003 |
+| Added task & approval workflow module | No second-approver sign-off or ad hoc field-task assignment exists | SRS FR-WFL-001..002 |
+| Added announcements/broadcast module | No staff-to-subscriber broadcast mechanism exists | SRS FR-ANN-001..002 |
+| Extended franchise module from "defined but unreachable" to routed + portal + onboarding | `internal/revenue/franchise.go` exists (commission calc, roles) but has zero routes — confirmed via grep, no `/api/v1/franchises` endpoint registered anywhere in Go code | SRS FR-FRN-004..006 |
+| Added general reporting module (growth/churn, plan-mix, ticket metrics, per-area collections) | Only revenue reconciliation exists as a report today | SRS FR-RPT-001..003 |
+| Added external document storage requirement | PDFs render via self-hosted Gotenberg only, no S3/Drive/SFTP archival | SRS FR-DOC-001 |
+| Added TR-069/CWMP CPE auto-provisioning requirement | No automated CPE provisioning exists — technicians configure by hand | SRS FR-CPE-001..003 |
+| Added email and push as notification channels | Only WhatsApp + SMS exist as dispatch channels today | SRS FR-NOTIF-012..013 |
+| Added multi-tenant SaaS hosting as a distinct, sequenced-last requirement | Current architecture is single-tenant on-premise; franchise multi-tenancy is row-level within one deployment, not a hosting model | SRS NFR-TEN-001, CRD §1.11 Phase 5 |
+| Updated version to 3.0 on IDX, CRD, SRS | — | IDX, CRD, SRS |
+
+**Deliberately not done in this pass:** MDS module design, DDS implementation
+patterns, DBD schema, and API contracts for the 40 new FRs above. Those are
+requirements-stage only — each gets its own design pass when it's actually
+scheduled for implementation, matching how FR-NOTIF-007 went from a one-line
+gap to a wired, tested, verified feature in a single focused slice rather
+than every module landing at once with no depth. MDS/DDS/DBD/API remain at
+v2 and should be treated as stale for anything in the v3 expansion list until
+that module's design pass happens.

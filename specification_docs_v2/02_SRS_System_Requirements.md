@@ -1,5 +1,5 @@
 # Document 2: System Requirements Specification (SRS)
-**Version:** 2.0 | **Status:** Draft | **Date:** 2025-06-01
+**Version:** 3.0 | **Status:** Draft | **Date:** 2026-08-12
 **Document ID:** SRS
 **Traces From:** [CRD](01_CRD_Customer_Requirements.md)
 **Traces To:** [SAD](03_SAD_System_Architecture.md) → [MDS](04_MDS_Module_Design.md) → [DDS](05_DDS_Detailed_Design.md) → [DBD](06_DBD_Database_Design.md) → [API](07_API_OpenAPI_Contract.md) → [TST](13_TST_Test_Strategy.md)
@@ -16,6 +16,9 @@
 | FR-AAA-002 | Authenticate users against Redis cache in ≤ 5 ms | — | MDS §4.1 |
 | FR-AAA-003 | Deduplicate Interim-Update packets via atomic Redis SetNX (session ID + octet count key) | — | DDS §5.2 |
 | FR-AAA-004 | Write subscriber session to Redis on first auth; TTL = plan validity period | — | MDS §4.1 |
+| FR-AAA-005 | Support CHAP in addition to PAP; requires a credential-storage strategy compatible with challenge-response verification (bcrypt-only storage cannot answer a CHAP challenge) | CRD-EXP-001 | MDS §4.1 |
+| FR-AAA-006 | Support EAP-MSCHAPv2 for wireless-controller/hotspot deployments that require it | CRD-EXP-001 | MDS §4.1 |
+| FR-AAA-007 | A plan change or top-up must invalidate the subscriber's Redis auth-cache entry and enqueue a CoA to any active session, so the new rate limit applies without waiting for reauthentication | CRD-EXP-001 | MDS §4.1, §4.2 |
 
 ### Billing & Finance
 
@@ -64,6 +67,8 @@
 | FR-NOTIF-009 | Every outbound notification must create a `notification_log` record with: channel, template ID, subscriber ID, event, timestamp, delivery status, failure reason | CRD-NOTIF-002 | DBD §6.2 |
 | FR-NOTIF-010 | WhatsApp messages must use pre-approved Business API templates; template ID must be stored in notification config | CRD-NOTIF-001 | MDS §4.7 |
 | FR-NOTIF-011 | System must store WhatsApp delivery status callbacks: sent → delivered → read / failed | CRD-NOTIF-001 | DBD §6.2 |
+| FR-NOTIF-012 | System must support email as a notification channel alongside WhatsApp and SMS | CRD-EXP-003 | MDS §4.7 |
+| FR-NOTIF-013 | System must support push notifications (OneSignal or FCM/APNs) for mobile app users, sharing the same DND/notification_log path as other channels | CRD-EXP-003 | MDS §4.7 |
 
 ### Observability
 
@@ -109,6 +114,101 @@
 | FR-FRN-001 | System must support multi-tenant LCO accounts: each LCO manages their own subscribers under a parent ISP | CRD-FRN-001 | MDS §4.10 |
 | FR-FRN-002 | LCO commission must be calculated per recharge and tracked in a separate LCO ledger | CRD-FRN-001 | MDS §4.10 |
 | FR-FRN-003 | Parent ISP must see consolidated P&L across all LCO partners via a franchise analytics view | CRD-FRN-001 | API §7 |
+| FR-FRN-004 | The franchise commission/P&L engine must be reachable via routed API endpoints and a staff-console section, gated to the `franchise_admin`/`franchise_staff` roles already defined in code | CRD-EXP-002 | MDS §4.10, API §7 |
+| FR-FRN-005 | LCO/franchise partners must have their own restricted portal login, scoped so they cannot see another franchise's subscribers | CRD-FRN-001, CRD-EXP-002 | MDS §4.10 |
+| FR-FRN-006 | Onboarding a new LCO/franchise partner must be a staff-console workflow, not a direct database insert | CRD-EXP-002 | MDS §4.10 |
+
+### NAS Vendor Support *(new — gap CRD-EXP-001, v3)*
+
+| FR ID | Requirement | CRD Ref | Module |
+|---|---|---|---|
+| FR-NAS-001 | Send vendor-appropriate bandwidth-control RADIUS attributes per NAS vendor (Cisco `cisco-avpair`, Juniper, Huawei vendor-2011, MikroTik vendor-14988, generic RFC 3576) instead of a single hardcoded MikroTik VSA | CRD-EXP-001 | MDS §4.1 |
+| FR-NAS-002 | A `nas_devices` table must record each NAS's IP, vendor, RADIUS secret, and CoA/PoD port, replacing the single global shared secret | CRD-EXP-001 | DBD §6.2 |
+| FR-NAS-003 | CoA/PoD attribute construction must be selected per session based on the originating NAS's recorded vendor | CRD-EXP-001 | MDS §4.2 |
+| FR-NAS-004 | Support wireless-controller-specific attributes (Cisco, Aruba, Ruckus) for hotspot/WiFi bandwidth and session control | CRD-EXP-001 | MDS §4.1 |
+
+### Hotspot / Captive Portal *(new — gap CRD-EXP-003, v3)*
+
+| FR ID | Requirement | CRD Ref | Module |
+|---|---|---|---|
+| FR-HSP-001 | Serve a captive-portal web page for hotspot subscribers, redirecting unauthenticated MAC addresses to a walled-garden login page | CRD-EXP-003 | MDS §4.1, new module |
+| FR-HSP-002 | Support MAC-address-based authentication (MAC auth bypass) as an alternative to username/password for hotspot NAS devices | CRD-EXP-003 | MDS §4.1 |
+| FR-HSP-003 | Hotspot sessions must use the same FUP/CoA machinery as PPPoE sessions for rate limiting | CRD-EXP-003 | MDS §4.2 |
+
+### Partner / 3rd-Party Integration *(new — gap CRD-EXP-003, v3)*
+
+| FR ID | Requirement | CRD Ref | Module |
+|---|---|---|---|
+| FR-API-001 | Support API-key-based authentication for 3rd-party integrations, distinct from internal staff JWTs, scoped to specific read/write permissions | CRD-EXP-003 | DDS §5.7 |
+| FR-API-002 | Support outbound webhooks: a partner registers a callback URL and receives signed HTTP POSTs on subscriber lifecycle events (activation, suspension, payment, ticket status) | CRD-EXP-003 | new module |
+| FR-API-003 | Outbound webhook deliveries must retry with backoff (mirroring the existing Asynq pattern) and log delivery status for audit | CRD-EXP-003 | new module |
+
+### Mobile *(new — gap CRD-EXP-003, v3)*
+
+| FR ID | Requirement | CRD Ref | Module |
+|---|---|---|---|
+| FR-MOB-001 | Expose a mobile-facing API (or reuse the existing portal API) with push-token registration for iOS/Android apps | CRD-EXP-003 | MDS §4.9 |
+| FR-MOB-002 | Mobile app must support the same self-service capabilities as the web portal: usage, invoices, renewal, tickets, notification history | CRD-EXP-003 | MDS §4.9 |
+
+### Helpdesk / SLA *(new — gap CRD-EXP-002, v3)*
+
+| FR ID | Requirement | CRD Ref | Module |
+|---|---|---|---|
+| FR-SUP-001 | Tickets must carry a priority (low/medium/high/critical) and a computed SLA due-by timestamp based on priority and category | CRD-EXP-002 | DBD §6.2 |
+| FR-SUP-002 | Alert (dashboard + notification) when a ticket is approaching or has breached its SLA due-by time | CRD-EXP-002 | MDS, new module |
+| FR-SUP-003 | Support ticket assignment rules/routing (e.g., by category or franchise) beyond manual `assigned_to` | CRD-EXP-002 | MDS, new module |
+
+### CRM / Lead Management *(new — gap CRD-EXP-002, v3)*
+
+| FR ID | Requirement | CRD Ref | Module |
+|---|---|---|---|
+| FR-CRM-001 | Track prospects (pre-subscriber leads) with contact info, source, and status through a pipeline (new → contacted → converted/lost) | CRD-EXP-002 | new module |
+| FR-CRM-002 | Converting a lead to a subscriber must carry over prospect data and record the conversion for funnel reporting | CRD-EXP-002 | new module |
+| FR-CRM-003 | Report lead-to-subscriber conversion rate and pipeline funnel by source/stage | CRD-EXP-002 | new module |
+
+### Inventory / CPE Management *(new — gap CRD-EXP-002, v3)*
+
+| FR ID | Requirement | CRD Ref | Module |
+|---|---|---|---|
+| FR-INV-001 | Track CPE inventory: device type, serial number, vendor, warehouse/location, and status (in-stock / issued / returned / faulty) | CRD-EXP-002 | new module |
+| FR-INV-002 | Issuing a CPE during onboarding must link the device serial number to the subscriber record | CRD-EXP-002 | new module |
+| FR-INV-003 | Track vendor purchase records and low-stock alerts per device type | CRD-EXP-002 | new module |
+
+### Task & Approval Workflows *(new — gap CRD-EXP-002, v3)*
+
+| FR ID | Requirement | CRD Ref | Module |
+|---|---|---|---|
+| FR-WFL-001 | Support configurable approval workflows for sensitive actions (large wallet credits, plan downgrades, termination) requiring second-approver sign-off before taking effect | CRD-EXP-002 | new module |
+| FR-WFL-002 | Support ad hoc field-task assignment independent of the ticket system, with due dates and completion tracking | CRD-EXP-002 | new module |
+
+### Announcements *(new — gap CRD-EXP-002, v3)*
+
+| FR ID | Requirement | CRD Ref | Module |
+|---|---|---|---|
+| FR-ANN-001 | Staff can compose and broadcast an announcement to all subscribers or a filtered segment (franchise, plan, area) via WhatsApp/SMS/email/portal banner | CRD-EXP-002 | new module |
+| FR-ANN-002 | Announcement delivery reuses the existing DND/notification_log machinery for auditability | CRD-EXP-002 | MDS §4.7 |
+
+### General Reporting *(new — gap CRD-EXP-002, v3)*
+
+| FR ID | Requirement | CRD Ref | Module |
+|---|---|---|---|
+| FR-RPT-001 | Report subscriber growth/churn trends, plan-mix distribution, and ticket-resolution metrics, beyond revenue reconciliation | CRD-EXP-002 | MDS §4.8 (extended) |
+| FR-RPT-002 | Reports must be exportable (CSV/PDF) and schedulable for periodic email delivery to owner/franchise roles | CRD-EXP-002 | MDS §4.8 (extended) |
+| FR-RPT-003 | Report per-area collection performance for franchise/LCO partners | CRD-EXP-002 | MDS §4.8, §4.10 |
+
+### Document Storage *(new — gap CRD-EXP-003, v3)*
+
+| FR ID | Requirement | CRD Ref | Module |
+|---|---|---|---|
+| FR-DOC-001 | Support archiving generated documents (invoices, KYC scans) to external storage (S3-compatible, Google Drive, or SFTP) in addition to local Gotenberg-only generation | CRD-EXP-003 | new module |
+
+### CPE Auto-Provisioning (TR-069/CWMP) *(new — gap CRD-EXP-003, v3)*
+
+| FR ID | Requirement | CRD Ref | Module |
+|---|---|---|---|
+| FR-CPE-001 | Run or integrate with a TR-069 Auto-Configuration Server (ACS) to auto-provision CPE (SSID, PPPoE credentials, firmware) on first connect | CRD-EXP-003 | new module |
+| FR-CPE-002 | CPE provisioning profiles must derive from the subscriber's plan, pushing a bandwidth profile to the CPE alongside the NAS-side RADIUS limit | CRD-EXP-003 | new module |
+| FR-CPE-003 | Support remote CPE reboot/firmware-update/diagnostics via TR-069 RPCs, surfaced to NOC/technician roles | CRD-EXP-003 | new module |
 
 ---
 
@@ -125,6 +225,8 @@
 | NFR-SEC-001 | Security | TLS 1.3 minimum on all external endpoints | `testssl.sh` scan | CRD-REG-002 | — |
 | NFR-SEC-002 | Security | No plaintext PII in logs, DB, or error responses | Automated PII scanner in CI | CRD-REG-002 | TST §13.5 |
 | NFR-BIZ-001 | Revenue | Unbilled-subscriber report must run within 60 s for 20,000 subscribers | Timed query test | CRD-REV-001 | TST §13.3 |
+| NFR-AVAIL-002 | Availability | PostgreSQL must run with a streaming replica and automated failover — Redis already has this via Sentinel; the database is currently the single point of failure Redis is not | Chaos test: primary kill, measure promotion time | CRD-EXP-001 | TST §13.4 (extend) |
+| NFR-TEN-001 | Scalability | Support multi-tenant SaaS hosting (isolated per-ISP-operator data), distinct from today's single-tenant on-premise deployment model | Architecture review + tenant-isolation test | CRD-EXP-004 | TST §13.4 (extend) |
 
 ---
 
@@ -148,14 +250,32 @@
 
 | FR Group | Count | Primary Doc Owner | Test Coverage |
 |---|---|---|---|
-| AAA | 4 | DDS §5.1–5.2 | TST INT-AAA-001..005 |
+| AAA | 7 | DDS §5.1–5.2 | TST INT-AAA-001..005 (extend) |
 | Billing & Finance | 7 | DDS §5.4–5.6, MDS §4.3 | TST INT-BIL-001..006 |
 | FUP & Session | 5 | DDS §5.3, MDS §4.2 | TST INT-FUP-001..004 |
 | Security | 5 | DDS §5.5–5.7 | TST INT-SEC-001..004 |
-| Notifications (WhatsApp/SMS/Email) | 11 | MDS §4.7 | TST INT-NOTIF-001..008 |
+| Notifications (WhatsApp/SMS/Email/Push) | 13 | MDS §4.7 | TST INT-NOTIF-001..008 (extend) |
 | Observability | 5 | SAD §3.2, MDS §4.1 | TST INT-OBS-001..003 |
 | CGNAT / Network | 3 | DBD §6.2 | TST INT-NET-001..002 |
 | Revenue Assurance | 4 | MDS §4.8 | TST INT-REV-001..004 |
 | Subscriber Portal | 5 | MDS §4.9 | TST INT-SUB-001..004 |
-| Franchise / LCO | 3 | MDS §4.10 | TST INT-FRN-001..002 |
-| **Total** | **52** | | |
+| Franchise / LCO | 6 | MDS §4.10 | TST INT-FRN-001..002 (extend) |
+| NAS Vendor Support *(v3)* | 4 | MDS §4.1 (extend) | TBD — Module design pending |
+| Hotspot / Captive Portal *(v3)* | 3 | new module | TBD — Module design pending |
+| Partner / 3rd-Party Integration *(v3)* | 3 | new module | TBD — Module design pending |
+| Mobile *(v3)* | 2 | MDS §4.9 (extend) | TBD — Module design pending |
+| Helpdesk / SLA *(v3)* | 3 | new module | TBD — Module design pending |
+| CRM / Lead Management *(v3)* | 3 | new module | TBD — Module design pending |
+| Inventory / CPE *(v3)* | 3 | new module | TBD — Module design pending |
+| Task & Approval Workflows *(v3)* | 2 | new module | TBD — Module design pending |
+| Announcements *(v3)* | 2 | MDS §4.7 (extend) | TBD — Module design pending |
+| General Reporting *(v3)* | 3 | MDS §4.8 (extend) | TBD — Module design pending |
+| Document Storage *(v3)* | 1 | new module | TBD — Module design pending |
+| CPE Auto-Provisioning *(v3)* | 3 | new module | TBD — Module design pending |
+| **Total** | **92** | | |
+
+> The 40 FRs marked *(v3)* have no MDS/DDS/DBD/API design yet and no test
+> IDs — they are requirements-stage only. Each gets its own module design
+> pass when it's actually scheduled for implementation, the same way
+> FR-NOTIF-007 went from a one-line SRS gap to a wired, tested feature in a
+> single focused pass rather than everything landing at once.

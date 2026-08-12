@@ -1,5 +1,5 @@
 # Document 4: Module Design Specification (MDS)
-**Version:** 2.0 | **Status:** Draft | **Date:** 2025-06-01
+**Version:** 2.1 | **Status:** Draft | **Date:** 2026-08-12 — §4.11–4.12 added (CRD §1.11 Phase 2); §4.1–4.10 unchanged from v2.0
 **Document ID:** MDS
 **Traces From:** [SAD](03_SAD_System_Architecture.md) → [SRS](02_SRS_System_Requirements.md)
 **Traces To:** [DDS](05_DDS_Detailed_Design.md) → [DBD](06_DBD_Database_Design.md) → [API](07_API_OpenAPI_Contract.md) → [TST](13_TST_Test_Strategy.md)
@@ -239,3 +239,168 @@ CROSS JOIN (SELECT entry_type, amount FROM wallet_ledgers) wl;
 4. Parent ISP dashboard aggregates across all LCOs for consolidated P&L
 
 **Data Isolation:** Every DB query from LCO-scoped JWT automatically includes `AND franchise_id = {caller_franchise_id}` via middleware row-filter. LCO users cannot access other franchises' data even with direct API calls.
+
+---
+
+## 4.11 Module 11: Multi-Vendor NAS Attribute Engine *(new — gap CRD-EXP-001, FR-NAS-001..004)*
+**Module ID:** MOD-NAS | **SAD Ref:** extends SAD-COMP-001 (AAA Control Plane Daemon) — new SAD-COMP entry pending a dedicated SAD pass | **FR:** FR-NAS-001..004
+
+### Why this module exists
+
+`internal/radius/handlers.go` and `internal/fup/coa_task.go` today hand-encode
+one hardcoded MikroTik VSA (vendor 14988, attribute 8) into every
+Access-Accept and CoA packet, regardless of what actually sent the request.
+Any Cisco, Juniper, Huawei, ZTE, or wireless-controller NAS authenticates
+subscribers correctly but receives an attribute it doesn't understand — the
+subscriber connects at whatever the NAS's own default is, not their plan
+speed, with no error anywhere because RADIUS silently ignores unrecognized
+vendor attributes by design. This module replaces the single hand-rolled
+builder with a per-NAS vendor strategy, without touching the working
+MikroTik path (which becomes the reference implementation of the same
+interface, and remains the fallback default — see rollout note below).
+
+### Two fundamentally different attribute models
+
+The vendor split isn't just "different attribute numbers" — it's two
+different provisioning models, and the design has to carry both:
+
+| Model | Vendors (attribute family — **verify against deployed firmware before relying on exact numbers**) | What RADIUS sends |
+|---|---|---|
+| **Dynamic numeric rate** | MikroTik (vendor 14988, `Mikrotik-Rate-Limit`, already implemented) · Huawei (vendor 2011, `Huawei-Input-Average-Rate` / `Huawei-Output-Average-Rate`) · ZTE (vendor-specific rx/tx rate pair, model-dependent) | A literal bps/rate value computed from `plans.rate_limit_string` at request time — no NAS-side pre-configuration needed per plan |
+| **Policy/profile reference** | Cisco (vendor 9, `cisco-avpair`, e.g. `subscriber:sub-qos-policy-in=<name>`) · Juniper (named firewall filter / hierarchical policer reference, `Filter-Id` or vendor-specific) · Wireless controllers — Cisco WLC (vendor 14179, `Airespace-Data-Bandwidth-Average-Contract`), Aruba (vendor 14823, role/QoS reference), Ruckus (vendor-specific role reference) | A **name** the NAS resolves against a QoS policy/profile it already has provisioned locally — RADIUS never sends a raw number to these vendors |
+
+The practical consequence: for reference-vendors, a plan tier must exist as a
+matching named policy on the NAS *before* RADIUS can select it. That's an
+operational/runbook dependency (OPS §12, to be added when this module is
+scheduled), not something this module can provision remotely — CWMP/TR-069
+(FR-CPE, Phase 4) provisions the CPE, not the NAS's own QoS policy-map table.
+
+### Interface
+
+```go
+// internal/nas — new package
+type RateProfile struct {
+    RateLimitString string // "50M/50M" — plans.rate_limit_string, source for dynamic-rate vendors
+    ProfileName     string // pre-provisioned NAS-side policy name, source for reference vendors
+}
+
+type AttributeBuilder interface {
+    BuildAccept(p RateProfile) ([]*radius.Attribute, error) // Access-Accept
+    BuildCoA(p RateProfile) ([]*radius.Attribute, error)    // CoA-Request
+    // PoD carries no vendor attribute (RFC 3576 Disconnect-Request needs
+    // only Acct-Session-Id) — not part of this interface.
+}
+
+var builders = map[Vendor]AttributeBuilder{
+    VendorMikrotik: mikrotikBuilder{}, // wraps the existing, unmodified VSA logic
+    VendorHuawei:   huaweiBuilder{},
+    VendorZTE:      zteBuilder{},
+    VendorCisco:    ciscoBuilder{},
+    VendorJuniper:  juniperBuilder{},
+    VendorWireless: wirelessBuilder{},
+}
+```
+
+`internal/radius/handlers.go` (Access-Accept) and `internal/fup/coa_task.go`
+(CoA) both call `nas.BuilderFor(vendor).BuildAccept/BuildCoA(profile)` instead
+of constructing the VSA inline. `internal/fup/pod_task.go` is unchanged — PoD
+needs no vendor-specific attribute.
+
+### Vendor resolution and rollout safety
+
+Vendor is resolved by looking up the requesting NAS's source IP (Access-
+Request) or the session's recorded NAS IP (CoA, via the existing
+`FUPStore.GetSubscriberNASSession` lookup) against the new `nas_devices`
+table (DBD §6.2). **An IP with no matching row defaults to
+`VendorMikrotik`** — this is deliberate, not an oversight: it reproduces
+today's actual behavior exactly, so an existing MikroTik-only deployment
+needs zero new rows to keep working after this ships. A
+`nas_unclassified_total{nas_ip}` counter increments on every such fallback,
+giving NOC an actionable list of NAS devices worth registering rather than a
+silent assumption.
+
+### Per-NAS RADIUS secret
+
+Today's `internal/radius/daemon.go` verifies every packet against one global
+`RADIUS_SECRET`. Per-NAS secrets require the packet server's secret lookup
+itself to become IP-aware — `layeh.com/radius`'s `PacketServer.SecretSource`
+accepts a `func(ctx, *net.UDPAddr) ([]byte, error)` precisely for this case.
+Resolution order: `nas_devices` row for the source IP (decrypted — see DBD
+§6.2) → fall back to the existing global `RADIUS_SECRET` if no row exists,
+same backward-compatible default as vendor resolution above.
+
+### Key Metrics
+
+- `nas_unclassified_total` (counter, label: `nas_ip`) — NAS traffic seen with
+  no `nas_devices` row, currently served on the MikroTik-fallback default
+- `nas_attribute_build_errors_total` (counter, labels: `vendor`, `reason`) —
+  e.g. a reference-vendor plan with no matching `plan_nas_profiles` row
+- `radius_auth_total` gains a `nas_vendor` label (extends the existing
+  metric from §4.1, not a new one)
+
+---
+
+## 4.12 Module 12: PostgreSQL High Availability & Failover *(new — gap CRD-EXP-001, NFR-AVAIL-002)*
+**Module ID:** MOD-PGHA | **SAD Ref:** extends SAD-COMP-004 (Relational Storage Core) | **FR:** NFR-AVAIL-002
+
+### Why this module exists
+
+Redis has real Sentinel HA today (3 sentinels, quorum 2, tested failover —
+IDD §8.3). PostgreSQL — where `subscribers`, `wallet_ledgers`, and every
+billing record live — is a single container with no replica and no
+failover. A crashed or corrupted primary is a full outage with a restore-
+from-backup RTO, not a supervised promotion. This module's scope is
+deliberately the **application-layer contract** a failover needs (connection
+behavior, what's safe to route to a replica); the deployment topology itself
+(which failover manager, how many standbys, DNS/VIP mechanics) belongs in
+IDD §8 and is a separate infrastructure design pass — noted here as a
+dependency, not designed in this document.
+
+### Application-layer failover contract
+
+- **Connection string carries both hosts.** `pgx`'s multi-host DSN
+  (`host=pg_primary,pg_standby port=5432,5432 target_session_attrs=read-write`)
+  lets the driver itself find the current primary after a promotion, rather
+  than the application needing to watch for a failover event. `db.Connect`
+  (`internal/db`) takes this DSN form; no application code changes on
+  failover, only the DSN config.
+- **Retry-with-backoff on connection-layer errors**, distinct from query
+  errors: a promotion takes a real, bounded window (seconds, not
+  milliseconds) during which every connection attempt fails. The existing
+  Asynq retry pattern (`internal/fup`, `internal/billing` — exponential
+  backoff, max 5 attempts) is the template; this module applies the same
+  shape to the DB connection pool's own reconnect logic rather than
+  inventing a second retry convention.
+- **RADIUS auth path must fail closed, not open, on a DB outage during
+  failover.** The subscriber cache (`internal/cache/subscriber_cache.go`)
+  already serves reads from Redis with a 60s TTL and Postgres only on a
+  cache miss — during a short promotion window, already-cached subscribers
+  keep authenticating normally and only *new* logins or cache-miss re-auths
+  are affected. This existing cache-first design is what keeps a Postgres
+  failover from being a RADIUS outage, and should not be weakened while
+  adding HA.
+
+### Read-routing candidates (once a standby exists)
+
+Not every read needs the primary. Reports that tolerate replica lag are
+routing candidates, cutting primary load without a schema change:
+
+| Query | Current source | Replica-safe? |
+|---|---|---|
+| Unbilled-subscriber report (FR-REV-001) | Primary | Yes — nightly batch, lag-tolerant |
+| Ledger reconciliation (FR-REV-002) | Primary | **No** — must read a consistent point-in-time snapshot; replica lag would produce false variance alerts |
+| Revenue/collections dashboards (staffui) | Primary | Yes — dashboard, not a transactional read |
+| RADIUS auth fallback on cache miss | Primary | **No** — must read the current, not-lagged, subscriber state (status, plan) |
+| CoA/PoD NAS/session lookup | Primary | **No** — same currency requirement as auth |
+
+The rule of thumb this table encodes: anything that gates a live decision
+(auth, CoA target, ledger truth) stays on the primary; anything that
+summarizes history for a human is a replica candidate.
+
+### Key Metrics
+
+- `pg_replication_lag_seconds` (gauge, from `pg_stat_replication` on the
+  primary) — feeds an OPS alert threshold (to be set in a later OPS pass)
+- `db_connection_retry_total` (counter, labels: `outcome=recovered|exhausted`)
+- `db_failover_detected_total` (counter) — incremented when the pool
+  observes a primary-target change mid-session
