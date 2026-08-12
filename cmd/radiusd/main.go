@@ -30,10 +30,12 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/config"
 	"github.com/maaransoft/isp-bss-oss/internal/db"
 	"github.com/maaransoft/isp-bss-oss/internal/fup"
+	"github.com/maaransoft/isp-bss-oss/internal/nas"
 	"github.com/maaransoft/isp-bss-oss/internal/notifications"
 	"github.com/maaransoft/isp-bss-oss/internal/radius"
 	"github.com/maaransoft/isp-bss-oss/internal/revenue"
 	"github.com/maaransoft/isp-bss-oss/internal/tickets"
+	"github.com/maaransoft/isp-bss-oss/pkg/crypto"
 )
 
 const (
@@ -84,6 +86,36 @@ func run() error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 4)
 
+	// ── NAS multi-vendor attribute engine ────────────────────────────────────
+	//
+	// Optional, same as Gotenberg/Razorpay below: with AES_KEY_STORE_URL
+	// unset, no resolver is built and every component that would use it
+	// falls back to exactly today's behavior — one global RADIUS secret,
+	// every Access-Accept/CoA gets the MikroTik VSA unconditionally. A
+	// deployment not ready to register its NAS inventory yet is unaffected.
+	// FR-NAS-001..004 | MDS §4.11
+	var nasResolver *nas.Resolver
+	if cfg.AESKeyStoreURL != "" {
+		nasKeyStore, err := crypto.LoadKeyStore(cfg.AESKeyStoreURL)
+		if err != nil {
+			return fmt.Errorf("load AES key store for NAS secrets: %w", err)
+		}
+		nasResolver = nas.NewResolver(database.NAS(), nasKeyStore, []byte(cfg.RadiusSecret), fup.DefaultCoAPort)
+		if err := nasResolver.Refresh(ctx); err != nil {
+			log.Warn().Err(err).Msg("radiusd: initial NAS device cache load failed, starting on the fallback default")
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			log.Info().Msg("radiusd: NAS device resolver started")
+			nasResolver.Run(ctx)
+			log.Info().Msg("radiusd: NAS device resolver stopped")
+		}()
+		log.Info().Msg("radiusd: multi-vendor NAS support enabled")
+	} else {
+		log.Warn().Msg("radiusd: AES_KEY_STORE_URL unset — multi-vendor NAS support disabled, every NAS gets the MikroTik VSA")
+	}
+
 	// ── RADIUS daemon ───────────────────────────────────────────────────────
 
 	// Auth reads go through the Redis cache, not straight to PostgreSQL: SAD
@@ -92,6 +124,9 @@ func run() error {
 	subscriberCache := cache.NewSubscriberCache(database.Radius(), redisClient, cfg.SubscriberCacheTTL)
 
 	daemon := radius.NewRadiusDaemon(cfg.RadiusAddr, []byte(cfg.RadiusSecret), subscriberCache, redisClient, []byte(cfg.RadiusVerifierSecret))
+	if nasResolver != nil {
+		daemon.SetNASResolver(nasResolver)
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -151,6 +186,10 @@ func run() error {
 	dispatcher := newDispatcher(cfg, database)
 	coaHandler := fup.NewCoAHandler(database.FUP(), []byte(cfg.RadiusSecret))
 	podHandler := fup.NewPoDHandler(database.FUP(), []byte(cfg.RadiusSecret))
+	if nasResolver != nil {
+		coaHandler.SetNASResolver(nasResolver)
+		podHandler.SetNASResolver(nasResolver)
+	}
 	warningHandler := fup.NewWarningHandler(dispatcher)
 	dunningNoticeHandler := billing.NewDunningNoticeHandler(dispatcher)
 	paymentReceiptHandler := billing.NewPaymentReceiptHandler(dispatcher)

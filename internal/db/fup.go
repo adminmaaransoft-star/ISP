@@ -118,18 +118,21 @@ func (s *FUPStore) SetFUPActive(ctx context.Context, subscriberID int, active bo
 	return nil
 }
 
-// GetSubscriberNASSession returns the NAS address, RADIUS session id and the
-// rate limit to apply, for building a CoA-Request.
+// GetSubscriberNASSession returns the NAS address, RADIUS session id, the
+// rate limit to apply, and the subscriber's plan ID, for building a
+// CoA-Request. planID resolves a policy-reference vendor's QoS profile name
+// (FR-NAS-001, MDS §4.11) the same way it does for Access-Accept.
 //
 // The returned rate limit is the throttled profile when the subscriber is
 // flagged fup_active, which is what makes the CoA actually reduce their speed.
-func (s *FUPStore) GetSubscriberNASSession(ctx context.Context, subscriberID int) (nasIP, sessionID, rateLimit string, err error) {
+func (s *FUPStore) GetSubscriberNASSession(ctx context.Context, subscriberID int) (nasIP, sessionID, rateLimit string, planID int, err error) {
 	const q = `
 		SELECT host(h.nas_ip_address), h.session_id,
 		       CASE WHEN s.fup_active AND COALESCE(p.fup_throttle_string,'') <> ''
 		            THEN p.fup_throttle_string
 		            ELSE p.rate_limit_string
-		       END
+		       END,
+		       s.plan_id
 		FROM subscriber_session_history h
 		JOIN subscribers s ON s.id = h.subscriber_id
 		JOIN plans p       ON p.id = s.plan_id
@@ -137,17 +140,17 @@ func (s *FUPStore) GetSubscriberNASSession(ctx context.Context, subscriberID int
 		ORDER BY h.start_time DESC
 		LIMIT 1`
 
-	err = s.pool.QueryRow(ctx, q, subscriberID).Scan(&nasIP, &sessionID, &rateLimit)
+	err = s.pool.QueryRow(ctx, q, subscriberID).Scan(&nasIP, &sessionID, &rateLimit, &planID)
 	if isNoRows(err) {
 		// No live session: the subscriber disconnected before the CoA task ran.
 		// Retrying cannot help, so this is reported as not-found rather than a
 		// transient failure.
-		return "", "", "", fmt.Errorf("db: no active session for subscriber %d: %w", subscriberID, ErrNotFound)
+		return "", "", "", 0, fmt.Errorf("db: no active session for subscriber %d: %w", subscriberID, ErrNotFound)
 	}
 	if err != nil {
-		return "", "", "", fmt.Errorf("db: get NAS session for subscriber %d: %w", subscriberID, err)
+		return "", "", "", 0, fmt.Errorf("db: get NAS session for subscriber %d: %w", subscriberID, err)
 	}
-	return nasIP, sessionID, rateLimit, nil
+	return nasIP, sessionID, rateLimit, planID, nil
 }
 
 // StartSession records a new RADIUS session at Accounting-Start.

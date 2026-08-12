@@ -54,6 +54,7 @@ type cachedSubscriber struct {
 	RateLimitStr string `json:"rate_limit"`
 	FUPActive    bool   `json:"fup_active"`
 	FUPThrottle  string `json:"fup_throttle"`
+	PlanID       int    `json:"plan_id,omitempty"`
 	// NotFound records a negative result, so a flood of requests for a username
 	// that does not exist cannot turn into a flood of database queries.
 	NotFound bool `json:"not_found,omitempty"`
@@ -105,6 +106,7 @@ func (c *SubscriberCache) GetSubscriberByUsername(ctx context.Context, username 
 				RateLimitStr: entry.RateLimitStr,
 				FUPActive:    entry.FUPActive,
 				FUPThrottle:  entry.FUPThrottle,
+				PlanID:       entry.PlanID,
 			}, nil
 		}
 		// A corrupt entry is treated as a miss rather than an error: the
@@ -139,6 +141,7 @@ func (c *SubscriberCache) store(ctx context.Context, key string, sub *radius.Sub
 			RateLimitStr: sub.RateLimitStr,
 			FUPActive:    sub.FUPActive,
 			FUPThrottle:  sub.FUPThrottle,
+			PlanID:       sub.PlanID,
 		}
 	}
 

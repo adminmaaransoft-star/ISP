@@ -11,6 +11,8 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"layeh.com/radius"
 	"layeh.com/radius/rfc2865"
+
+	"github.com/maaransoft/isp-bss-oss/internal/nas"
 )
 
 // handleRequest dispatches Access-Request or Accounting-Request packets.
@@ -104,25 +106,35 @@ func (d *RadiusDaemon) handleAuth(ctx context.Context, w radius.ResponseWriter, 
 		}
 	}
 
-	// Build Accept response with rate-limit reply attributes (MikroTik-Rate-Limit)
+	// Build Accept response with vendor-appropriate bandwidth attributes
+	// (FR-NAS-001..004, MDS §4.11): resolved per requesting NAS when a
+	// resolver is wired, falling back to the MikroTik VSA unconditionally
+	// (today's exact, unchanged behavior) when it is not.
 	resp := r.Response(radius.CodeAccessAccept)
 	rateLimit := sub.RateLimitStr
 	if sub.FUPActive && sub.FUPThrottle != "" {
 		rateLimit = sub.FUPThrottle
 	}
-	// Vendor-specific attribute: MikroTik-Rate-Limit (vendor 14988, attr 8)
-	// VSA vendor-data format: vendor-type(1) + vendor-length(1) + value(N)
-	rlBytes := []byte(rateLimit)
-	vsaData := make([]byte, 2+len(rlBytes))
-	vsaData[0] = 8             // MikroTik-Rate-Limit vendor attribute type
-	if 2+len(rlBytes) <= 255 { // RADIUS attribute value max 253 bytes
-		vsaData[1] = byte(2 + len(rlBytes)) //nolint:gosec
-	} else {
-		vsaData[1] = 255
+
+	vendor := nas.VendorMikrotik
+	profileName := ""
+	if d.nasResolver != nil {
+		device := d.nasResolver.ResolveAddr(r.RemoteAddr)
+		vendor = device.Vendor
+		profileName = d.nasResolver.ResolveProfile(sub.PlanID, vendor)
 	}
-	copy(vsaData[2:], rlBytes)
-	if vsAttr, err := radius.NewVendorSpecific(14988, radius.Attribute(vsaData)); err == nil {
-		resp.Add(26, vsAttr) // 26 = Vendor-Specific RADIUS attribute type
+
+	attrs, err := nas.BuildAcceptAttrs(vendor, nas.RateProfile{RateLimitString: rateLimit, ProfileName: profileName})
+	if err != nil {
+		// Not a reject: the subscriber is legitimate and should still get
+		// online. They connect without a bandwidth attribute — the same
+		// silent-no-enforcement outcome an unclassified NAS already has
+		// today — logged and metered so it is found, not just tolerated.
+		log.Warn().Err(err).Str("username", username).Str("vendor", string(vendor)).
+			Msg("radius: vendor attribute build failed, Accept sent without a bandwidth attribute")
+	}
+	for _, a := range attrs {
+		resp.Add(a.Type, a.Value)
 	}
 
 	w.Write(resp) //nolint:errcheck,gosec

@@ -32,7 +32,7 @@ func (s *RadiusStore) GetSubscriberByUsername(ctx context.Context, username stri
 	const q = `
 		SELECT s.id, s.username, s.password_hash, s.status,
 		       p.rate_limit_string, COALESCE(p.fup_throttle_string, ''),
-		       COALESCE(s.fup_active, FALSE)
+		       COALESCE(s.fup_active, FALSE), s.plan_id
 		FROM subscribers s
 		JOIN plans p ON p.id = s.plan_id
 		WHERE s.username = $1`
@@ -40,7 +40,7 @@ func (s *RadiusStore) GetSubscriberByUsername(ctx context.Context, username stri
 	var sub radius.Subscriber
 	err := s.pool.QueryRow(ctx, q, username).Scan(
 		&sub.ID, &sub.Username, &sub.PasswordHash, &sub.Status,
-		&sub.RateLimitStr, &sub.FUPThrottle, &sub.FUPActive,
+		&sub.RateLimitStr, &sub.FUPThrottle, &sub.FUPActive, &sub.PlanID,
 	)
 	if isNoRows(err) {
 		// A missing subscriber is a normal reject, not a failure: handleAuth

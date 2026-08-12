@@ -14,6 +14,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/redis/go-redis/v9"
 	"layeh.com/radius"
+
+	"github.com/maaransoft/isp-bss-oss/internal/nas"
 )
 
 const (
@@ -57,6 +59,7 @@ type Subscriber struct {
 	RateLimitStr string // MikroTik format: "100M/100M"
 	FUPActive    bool
 	FUPThrottle  string
+	PlanID       int // resolves a policy-reference vendor's QoS profile name (FR-NAS-001, MDS §4.11)
 }
 
 // radiusJob bundles the ResponseWriter and Request so both can pass through the worker queue.
@@ -74,6 +77,16 @@ type RadiusDaemon struct {
 	guard         *BruteForceGuard
 	verifierCache *VerifierCache
 	packetQueue   chan radiusJob
+	nasResolver   *nas.Resolver
+}
+
+// SetNASResolver enables per-NAS secret verification and vendor-aware
+// Access-Accept attributes (FR-NAS-001..004, MDS §4.11). Optional: with no
+// resolver set, the daemon behaves exactly as before — one global secret,
+// every Access-Accept gets the MikroTik VSA — so this is safe to leave
+// unset on a deployment not ready to register its NAS inventory yet.
+func (d *RadiusDaemon) SetNASResolver(r *nas.Resolver) {
+	d.nasResolver = r
 }
 
 // NewRadiusDaemon constructs a RadiusDaemon. verifierSecret keys the
@@ -130,9 +143,14 @@ func (d *RadiusDaemon) StartContext(ctx context.Context) error {
 		}()
 	}
 
+	packetSecretSource := radius.StaticSecretSource(d.secret)
+	if d.nasResolver != nil {
+		packetSecretSource = d.nasResolver
+	}
+
 	server := &radius.PacketServer{
 		Addr:         d.addr,
-		SecretSource: radius.StaticSecretSource(d.secret),
+		SecretSource: packetSecretSource,
 		Handler: radius.HandlerFunc(func(w radius.ResponseWriter, r *radius.Request) {
 			select {
 			case d.packetQueue <- radiusJob{w: w, r: r}:

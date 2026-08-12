@@ -11,6 +11,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"layeh.com/radius"
+
+	"github.com/maaransoft/isp-bss-oss/internal/nas"
 )
 
 var (
@@ -35,16 +37,17 @@ type CoAPayload struct {
 
 // CoAQuerier retrieves subscriber state needed to build the CoA packet.
 type CoAQuerier interface {
-	GetSubscriberNASSession(ctx context.Context, subscriberID int) (nasIP, sessionID, rateLimit string, err error)
+	GetSubscriberNASSession(ctx context.Context, subscriberID int) (nasIP, sessionID, rateLimit string, planID int, err error)
 }
 
 // CoAHandler processes CoA send tasks with exponential backoff via Asynq retry.
 //
-// FR: FR-FUP-002 | DDS §5.3
+// FR: FR-FUP-002, FR-NAS-001..004 | DDS §5.3 | MDS §4.11
 type CoAHandler struct {
-	db     CoAQuerier
-	secret []byte
-	port   int
+	db          CoAQuerier
+	secret      []byte
+	port        int
+	nasResolver *nas.Resolver
 }
 
 // NewCoAHandler constructs a CoAHandler targeting DefaultCoAPort.
@@ -55,6 +58,14 @@ func NewCoAHandler(db CoAQuerier, secret []byte) *CoAHandler {
 // SetPort overrides the NAS CoA destination port.
 func (h *CoAHandler) SetPort(port int) {
 	h.port = port
+}
+
+// SetNASResolver enables per-NAS secret/port and vendor-aware CoA attributes
+// (FR-NAS-001..004, MDS §4.11). Optional: with no resolver set, CoAHandler
+// behaves exactly as before — the constructor's global secret and port,
+// MikroTik VSA unconditionally.
+func (h *CoAHandler) SetNASResolver(r *nas.Resolver) {
+	h.nasResolver = r
 }
 
 // ProcessTask implements asynq.Handler.
@@ -68,12 +79,30 @@ func (h *CoAHandler) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		return fmt.Errorf("coa: unmarshal payload: %w", err)
 	}
 
-	nasIP, sessionID, rateLimit, err := h.db.GetSubscriberNASSession(ctx, p.SubscriberID)
+	nasIP, sessionID, rateLimit, planID, err := h.db.GetSubscriberNASSession(ctx, p.SubscriberID)
 	if err != nil {
 		return fmt.Errorf("coa: get NAS session for sub %d: %w", p.SubscriberID, err)
 	}
 
-	return SendReliableCoA(nasIP, h.effectivePort(), sessionID, rateLimit, h.secret)
+	secret, port := h.secret, h.effectivePort()
+	vendor := nas.VendorMikrotik
+	profileName := ""
+	if h.nasResolver != nil {
+		device := h.nasResolver.Resolve(nasIP)
+		secret, port, vendor = device.Secret, device.CoAPort, device.Vendor
+		profileName = h.nasResolver.ResolveProfile(planID, vendor)
+	}
+
+	attrs, err := nas.BuildCoAAttrs(vendor, nas.RateProfile{RateLimitString: rateLimit, ProfileName: profileName})
+	if err != nil {
+		// Unlike Access-Accept, a CoA with no bandwidth attribute is a no-op
+		// enforcement action wearing a success — retrying (Asynq backoff,
+		// eventual dead-letter + alert) is the right failure mode, not a
+		// best-effort send.
+		return fmt.Errorf("coa: build vendor attributes for sub %d (%s): %w", p.SubscriberID, vendor, err)
+	}
+
+	return SendReliableCoA(nasIP, port, sessionID, attrs, secret)
 }
 
 func (h *CoAHandler) effectivePort() int {
@@ -86,30 +115,15 @@ func (h *CoAHandler) effectivePort() int {
 // SendReliableCoA sends a CoA-Request to the NAS and waits for CoA-ACK.
 // Returns an error on NAK or timeout — Asynq will retry with exponential backoff.
 //
-// DDS §5.3
-func SendReliableCoA(nasIP string, port int, sessionID, rateLimit string, secret []byte) error {
+// DDS §5.3 | MDS §4.11
+func SendReliableCoA(nasIP string, port int, sessionID string, attrs []nas.Attr, secret []byte) error {
 	pkt := radius.New(radius.CodeCoARequest, secret)
 	pkt.Set(radius.Type(44), []byte(sessionID)) // Acct-Session-Id
-	addRateLimitVSA(pkt, rateLimit)
+	for _, a := range attrs {
+		pkt.Add(a.Type, a.Value)
+	}
 
 	return sendReliableControl(nasIP, port, secret, pkt, radius.CodeCoAACK, coaAckTotal)
-}
-
-// addRateLimitVSA attaches the MikroTik-Rate-Limit vendor-specific attribute
-// (vendor 14988, attr 8) that tells the NAS what speed to apply.
-func addRateLimitVSA(pkt *radius.Packet, rateLimit string) {
-	rlBytes := []byte(rateLimit)
-	vsaData := make([]byte, 2+len(rlBytes))
-	vsaData[0] = 8
-	if 2+len(rlBytes) <= 255 {
-		vsaData[1] = byte(2 + len(rlBytes)) //nolint:gosec
-	} else {
-		vsaData[1] = 255
-	}
-	copy(vsaData[2:], rlBytes)
-	if vsAttr, err := radius.NewVendorSpecific(14988, radius.Attribute(vsaData)); err == nil {
-		pkt.Add(26, vsAttr) // 26 = Vendor-Specific
-	}
 }
 
 // sendReliableControl sends a pre-built control packet (CoA-Request or

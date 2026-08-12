@@ -181,7 +181,7 @@ func TestFR_FUP_002_FUPStore_GetSubscriberNASSession(t *testing.T) {
 
 	store := database.FUP()
 
-	nasIP, sessionID, rateLimit, err := store.GetSubscriberNASSession(ctx, 1)
+	nasIP, sessionID, rateLimit, planID, err := store.GetSubscriberNASSession(ctx, 1)
 	if err != nil {
 		t.Fatalf("GetSubscriberNASSession: %v", err)
 	}
@@ -194,11 +194,14 @@ func TestFR_FUP_002_FUPStore_GetSubscriberNASSession(t *testing.T) {
 	if rateLimit != "100M/100M" {
 		t.Errorf("before throttling the full rate applies, got %q", rateLimit)
 	}
+	if planID != 1 {
+		t.Errorf("plan_id: want 1, got %d", planID)
+	}
 
 	if err := store.SetFUPActive(ctx, 1, true); err != nil {
 		t.Fatalf("SetFUPActive: %v", err)
 	}
-	_, _, rateLimit, err = store.GetSubscriberNASSession(ctx, 1)
+	_, _, rateLimit, _, err = store.GetSubscriberNASSession(ctx, 1)
 	if err != nil {
 		t.Fatalf("GetSubscriberNASSession after throttle: %v", err)
 	}
@@ -208,7 +211,7 @@ func TestFR_FUP_002_FUPStore_GetSubscriberNASSession(t *testing.T) {
 
 	t.Run("no live session reports not found", func(t *testing.T) {
 		seedSubscriber(ctx, t, pool, 2, seedOpts{Username: "offline-coa@isp"})
-		if _, _, _, err := store.GetSubscriberNASSession(ctx, 2); !errors.Is(err, db.ErrNotFound) {
+		if _, _, _, _, err := store.GetSubscriberNASSession(ctx, 2); !errors.Is(err, db.ErrNotFound) {
 			t.Errorf("want ErrNotFound for a subscriber with no open session, got %v", err)
 		}
 	})

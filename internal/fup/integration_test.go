@@ -67,8 +67,8 @@ type itCoADB struct {
 	rateLimit string
 }
 
-func (db *itCoADB) GetSubscriberNASSession(context.Context, int) (string, string, string, error) {
-	return db.nasIP, db.sessionID, db.rateLimit, nil
+func (db *itCoADB) GetSubscriberNASSession(context.Context, int) (string, string, string, int, error) {
+	return db.nasIP, db.sessionID, db.rateLimit, 0, nil
 }
 
 // itAlerter records the alerts fired at it.
@@ -573,8 +573,8 @@ func TestFR_NET_002_PoDTask_NoLiveSessionSkipsRetry(t *testing.T) {
 // that GetSubscriberNASSession failed, not which sentinel it returned.
 type itNoSessionDB struct{}
 
-func (itNoSessionDB) GetSubscriberNASSession(context.Context, int) (string, string, string, error) {
-	return "", "", "", errors.New("no active session")
+func (itNoSessionDB) GetSubscriberNASSession(context.Context, int) (string, string, string, int, error) {
+	return "", "", "", 0, errors.New("no active session")
 }
 
 // ── INT-FUP-004 ─────────────────────────────────────────────────────────────

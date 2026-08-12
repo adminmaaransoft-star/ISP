@@ -48,6 +48,7 @@ COMPONENTS=(
     "NewPoDHandler:PoD worker (disconnects sessions)"
     "NewVerifierCache:RADIUS fast-verifier cache"
     "NewSubscriberCache:RADIUS subscriber cache"
+    "NewResolver:multi-vendor NAS attribute/secret resolver"
 )
 
 if [ "${1:-}" = "--list" ]; then

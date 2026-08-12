@@ -193,7 +193,7 @@ encryption_keys (1) ─── (N) nas_devices        [v3 — FR-NAS-002, secret 
 |---|---|---|---|
 | `id` | `SERIAL` | PK | |
 | `ip` | `INET` | UNIQUE NOT NULL | Source IP the NAS sends Access-Requests/Accounting from |
-| `vendor` | `VARCHAR(20)` | NOT NULL CHECK IN (`mikrotik`,`huawei`,`zte`,`cisco`,`juniper`,`wireless_generic`) | Selects the attribute builder (MDS §4.11) |
+| `vendor` | `VARCHAR(20)` | NOT NULL CHECK IN (`mikrotik`,`huawei`,`zte`,`cisco`,`juniper`,`cisco_wlc`,`aruba`,`ruckus`) | Selects the attribute builder (MDS §4.11). Corrected from this doc's original 6-value list (with one bucketed `wireless_generic`) during implementation: Cisco WLC (vendor 14179, Airespace-derived), Aruba (14823) and Ruckus each need their own attribute encoding and cannot share a builder — see migration `022_create_nas_devices.sql`'s header comment |
 | `description` | `VARCHAR(100)` | NULLABLE | e.g. "POP-Chennai-Anna-Nagar edge router" |
 | `radius_secret_encrypted` | `TEXT` | NOT NULL | `{key_version}:{base64(nonce+ct)}` — same AES-GCM-256 pattern as `kyc_verifications`; a RADIUS shared secret is a credential and must not sit in plaintext next to 500 other NAS rows |
 | `key_version_id` | `VARCHAR(10)` | NOT NULL, FK → `encryption_keys.version_id` | |
