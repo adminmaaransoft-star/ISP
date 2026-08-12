@@ -179,10 +179,13 @@ func TestTicketStore_AdminLifecycle(t *testing.T) {
 
 	seedPlan(ctx, t, pool, 1, "P", "100M/100M", 0, "", "799.00")
 	seedSubscriber(ctx, t, pool, 1, seedOpts{Username: "ticketed@isp"})
+	// assigned_to gained an FK to staff_users in migration 023, so the
+	// assignee this test sets has to be a real account now.
+	seedStaffUser(ctx, t, pool, 42, "tech42", "technician")
 
 	store := database.Tickets()
 
-	created, err := store.CreateTicketAdmin(ctx, 1, "connectivity", "No internet since morning")
+	created, err := store.CreateTicketAdmin(ctx, 1, "connectivity", "No internet since morning", nil)
 	if err != nil {
 		t.Fatalf("CreateTicketAdmin: %v", err)
 	}
@@ -195,7 +198,7 @@ func TestTicketStore_AdminLifecycle(t *testing.T) {
 
 	t.Run("partial update touches only the given fields", func(t *testing.T) {
 		status := "in_progress"
-		updated, err := store.UpdateTicketAdmin(ctx, created.ID, &status, nil)
+		updated, err := store.UpdateTicketAdmin(ctx, created.ID, &status, nil, nil)
 		if err != nil {
 			t.Fatalf("UpdateTicketAdmin status: %v", err)
 		}
@@ -207,7 +210,7 @@ func TestTicketStore_AdminLifecycle(t *testing.T) {
 		}
 
 		tech := 42
-		updated, err = store.UpdateTicketAdmin(ctx, created.ID, nil, &tech)
+		updated, err = store.UpdateTicketAdmin(ctx, created.ID, nil, &tech, nil)
 		if err != nil {
 			t.Fatalf("UpdateTicketAdmin assignee: %v", err)
 		}
@@ -221,14 +224,14 @@ func TestTicketStore_AdminLifecycle(t *testing.T) {
 
 	t.Run("updating an unknown ticket returns (nil, nil)", func(t *testing.T) {
 		status := "resolved"
-		got, err := store.UpdateTicketAdmin(ctx, 999999, &status, nil)
+		got, err := store.UpdateTicketAdmin(ctx, 999999, &status, nil, nil)
 		if err != nil || got != nil {
 			t.Errorf("want (nil, nil), got (%+v, %v)", got, err)
 		}
 	})
 
 	t.Run("an invalid category is rejected by the schema", func(t *testing.T) {
-		if _, err := store.CreateTicketAdmin(ctx, 1, "not_a_real_category", "x"); err == nil {
+		if _, err := store.CreateTicketAdmin(ctx, 1, "not_a_real_category", "x", nil); err == nil {
 			t.Error("expected the tickets category CHECK to reject an unknown category")
 		}
 	})

@@ -158,6 +158,12 @@ services:
       # host at all. Kept at host-side 9100 (distinct from api_service's
       # 9101) so the two services don't collide on the same host port.
       - "9100:9101"   # Prometheus metrics
+    volumes:
+      # This daemon reads the key store too, not just api_service: the
+      # multi-vendor NAS resolver (FR-NAS-002) decrypts each NAS's RADIUS
+      # secret with it. AES_KEY_STORE_URL was already set below without this
+      # mount, which meant the path resolved to nothing inside the container.
+      - ./config/keys:/app/config/keys:ro
     environment:
       # bss_app, not postgres: the app must run as a non-superuser,
       # non-owner role so PostgreSQL RLS (lea_audit_log's append-only

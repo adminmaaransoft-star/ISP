@@ -423,6 +423,6 @@ func (s staffTicketStore) ListTickets(ctx context.Context, subscriberID int) ([]
 	return s.portal.ListTickets(ctx, subscriberID)
 }
 
-func (s staffTicketStore) UpdateTicketAdmin(ctx context.Context, ticketID int, status *string, assignedTo *int) (*api.TicketRecord, error) {
-	return s.admin.UpdateTicketAdmin(ctx, ticketID, status, assignedTo)
+func (s staffTicketStore) UpdateTicketAdmin(ctx context.Context, ticketID int, status *string, assignedTo *int, priority *string) (*api.TicketRecord, error) {
+	return s.admin.UpdateTicketAdmin(ctx, ticketID, status, assignedTo, priority)
 }

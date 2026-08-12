@@ -74,7 +74,7 @@ type BillingQuerier interface {
 // TicketQuerier serves the support queue.
 type TicketQuerier interface {
 	ListTickets(ctx context.Context, subscriberID int) ([]portal.TicketEntry, error)
-	UpdateTicketAdmin(ctx context.Context, ticketID int, status *string, assignedTo *int) (*api.TicketRecord, error)
+	UpdateTicketAdmin(ctx context.Context, ticketID int, status *string, assignedTo *int, priority *string) (*api.TicketRecord, error)
 }
 
 // TaskEnqueuer is the subset of *asynq.Client the console needs to trigger

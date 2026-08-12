@@ -84,7 +84,7 @@ func main() {
 		case <-ticker.C:
 			attempt++
 			writeCtx, writeCancel := context.WithTimeout(ctx, 2*time.Second)
-			_, err := tickets.CreateTicketAdmin(writeCtx, subscriberID, "connectivity", fmt.Sprintf("drill write #%d", attempt))
+			_, err := tickets.CreateTicketAdmin(writeCtx, subscriberID, "connectivity", fmt.Sprintf("drill write #%d", attempt), nil)
 			writeCancel()
 
 			ts := time.Now().Format("15:04:05.000")

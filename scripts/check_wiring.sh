@@ -49,6 +49,7 @@ COMPONENTS=(
     "NewVerifierCache:RADIUS fast-verifier cache"
     "NewSubscriberCache:RADIUS subscriber cache"
     "NewResolver:multi-vendor NAS attribute/secret resolver"
+    "NewSLAScanner:SLA breach scanner (helpdesk deadlines)"
 )
 
 if [ "${1:-}" = "--list" ]; then

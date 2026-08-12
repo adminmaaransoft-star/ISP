@@ -384,14 +384,34 @@ func (s *PortalStore) ListTickets(ctx context.Context, subscriberID int) ([]port
 
 // CreateTicket files a ticket against req.SubscriberID, which the handler sets
 // from the authenticated JWT rather than the request body.
+//
+// Priority is always the category default here — a subscriber never sets
+// their own (FR-SUP-001 | MDS §4.13), which is why nil is passed rather than
+// plumbing a priority through portal.TicketCreateRequest.
 func (s *PortalStore) CreateTicket(ctx context.Context, req portal.TicketCreateRequest) (*portal.TicketEntry, error) {
+	sla, err := resolveTicketSLA(ctx, s.pool, req.SubscriberID, req.Category, nil)
+	if err != nil {
+		return nil, err
+	}
+
 	const q = `
-		INSERT INTO tickets (subscriber_id, category, description, status)
-		VALUES ($1, $2, $3, 'open')
+		INSERT INTO tickets (
+			subscriber_id, category, description, status,
+			priority, sla_response_due_at, sla_resolution_due_at,
+			franchise_id, routed_role
+		)
+		VALUES (
+			$1, $2, $3, 'open',
+			$4, NOW() + ($5 * INTERVAL '1 minute'), NOW() + ($6 * INTERVAL '1 minute'),
+			$7, $8
+		)
 		RETURNING id, category, description, status, created_at`
 
 	var t portal.TicketEntry
-	err := s.pool.QueryRow(ctx, q, req.SubscriberID, req.Category, req.Description).
+	err = s.pool.QueryRow(ctx, q,
+		req.SubscriberID, req.Category, req.Description,
+		sla.Priority, sla.ResponseMinutes, sla.ResolutionMinutes,
+		sla.FranchiseID, sla.RoutedRole).
 		Scan(&t.ID, &t.Category, &t.Description, &t.Status, &t.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("db: create ticket for subscriber %d: %w", req.SubscriberID, err)

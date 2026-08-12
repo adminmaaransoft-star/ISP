@@ -94,11 +94,26 @@ func run() error {
 	// every Access-Accept/CoA gets the MikroTik VSA unconditionally. A
 	// deployment not ready to register its NAS inventory yet is unaffected.
 	// FR-NAS-001..004 | MDS §4.11
+	// An unloadable key store is a warning, not a fatal error, for the same
+	// reason newDispatcher below tolerates missing WhatsApp credentials:
+	// RADIUS authentication is what keeps subscribers online, and refusing
+	// to start over an optional enhancement takes authentication down with
+	// it. This returned a fatal error when the resolver was first wired,
+	// which crash-looped radiusd on the shipped docker-compose.yml —
+	// aaa_core_daemon sets AES_KEY_STORE_URL but did not mount the key file
+	// (fixed alongside this). Found by restarting the container, not by
+	// reading the code: every test passed throughout, because none of them
+	// runs main().
 	var nasResolver *nas.Resolver
-	if cfg.AESKeyStoreURL != "" {
+	switch cfg.AESKeyStoreURL {
+	case "":
+		log.Warn().Msg("radiusd: AES_KEY_STORE_URL unset — multi-vendor NAS support disabled, every NAS gets the MikroTik VSA")
+	default:
 		nasKeyStore, err := crypto.LoadKeyStore(cfg.AESKeyStoreURL)
 		if err != nil {
-			return fmt.Errorf("load AES key store for NAS secrets: %w", err)
+			log.Error().Err(err).
+				Msg("radiusd: AES key store unreadable — multi-vendor NAS support disabled, every NAS gets the MikroTik VSA and the global RADIUS secret")
+			break
 		}
 		nasResolver = nas.NewResolver(database.NAS(), nasKeyStore, []byte(cfg.RadiusSecret), fup.DefaultCoAPort)
 		if err := nasResolver.Refresh(ctx); err != nil {
@@ -112,8 +127,6 @@ func run() error {
 			log.Info().Msg("radiusd: NAS device resolver stopped")
 		}()
 		log.Info().Msg("radiusd: multi-vendor NAS support enabled")
-	} else {
-		log.Warn().Msg("radiusd: AES_KEY_STORE_URL unset — multi-vendor NAS support disabled, every NAS gets the MikroTik VSA")
 	}
 
 	// ── RADIUS daemon ───────────────────────────────────────────────────────
@@ -179,6 +192,22 @@ func run() error {
 		log.Info().Msg("radiusd: revenue reconciliation scheduler started")
 		reconcileScheduler.Run(ctx)
 		log.Info().Msg("radiusd: revenue reconciliation scheduler stopped")
+	}()
+
+	// ── SLA breach scanner ──────────────────────────────────────────────────
+
+	// Notices tickets crossing their response/resolution deadlines and alerts
+	// on breaches (FR-SUP-002). Shares logAlerter with the dead-letter monitor
+	// and the revenue reconciliation: staff_users carries no contact details,
+	// so there is no per-staff channel to notify and pretending otherwise
+	// would be worse than routing through the alert path that already exists.
+	slaScanner := tickets.NewSLAScanner(database.SLA(), logAlerter{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Info().Msg("radiusd: SLA breach scanner started")
+		slaScanner.Run(ctx)
+		log.Info().Msg("radiusd: SLA breach scanner stopped")
 	}()
 
 	// ── Asynq workers ───────────────────────────────────────────────────────

@@ -20,6 +20,8 @@ import (
 var (
 	ticketCategories = map[string]bool{"connectivity": true, "billing": true, "plan_change": true, "other": true}
 	ticketStatuses   = map[string]bool{"open": true, "in_progress": true, "resolved": true, "closed": true}
+	// ticketPriorities mirrors chk_tickets_priority (migration 023).
+	ticketPriorities = map[string]bool{"low": true, "medium": true, "high": true, "critical": true}
 )
 
 // TicketRecord is the API representation of a support ticket.
@@ -32,14 +34,24 @@ type TicketRecord struct {
 	AssignedTo   *int      `json:"assigned_to,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+
+	// SLA fields (FR-SUP-001, FR-SUP-003 | MDS §4.13). Pointers because
+	// tickets created before migration 023 have none — they are genuinely
+	// absent rather than zero, and a zero time.Time rendered as
+	// "0001-01-01T00:00:00Z" would read as a deadline in the distant past
+	// and light up the breach scanner for every historical row.
+	Priority           string     `json:"priority,omitempty"`
+	SLAResponseDueAt   *time.Time `json:"sla_response_due_at,omitempty"`
+	SLAResolutionDueAt *time.Time `json:"sla_resolution_due_at,omitempty"`
+	RoutedRole         *string    `json:"routed_role,omitempty"`
 }
 
 // TicketAdminQuerier creates and updates tickets on behalf of any subscriber.
 // Distinct from the portal's ticket queries, which are scoped to the calling
 // subscriber. Satisfied by *db.TicketStore.
 type TicketAdminQuerier interface {
-	CreateTicketAdmin(ctx context.Context, subscriberID int, category, description string) (*TicketRecord, error)
-	UpdateTicketAdmin(ctx context.Context, ticketID int, status *string, assignedTo *int) (*TicketRecord, error)
+	CreateTicketAdmin(ctx context.Context, subscriberID int, category, description string, priority *string) (*TicketRecord, error)
+	UpdateTicketAdmin(ctx context.Context, ticketID int, status *string, assignedTo *int, priority *string) (*TicketRecord, error)
 }
 
 // CreateTicket handles POST /api/v1/tickets.
@@ -50,9 +62,10 @@ func (h *Handler) CreateTicket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		SubscriberID int    `json:"subscriber_id"`
-		Category     string `json:"category"`
-		Description  string `json:"description"`
+		SubscriberID int     `json:"subscriber_id"`
+		Category     string  `json:"category"`
+		Description  string  `json:"description"`
+		Priority     *string `json:"priority"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "ERR_BAD_REQUEST", err.Error())
@@ -70,8 +83,12 @@ func (h *Handler) CreateTicket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "ERR_VALIDATION", "description is required")
 		return
 	}
+	if req.Priority != nil && !ticketPriorities[*req.Priority] {
+		writeError(w, http.StatusUnprocessableEntity, "ERR_VALIDATION", "priority must be one of low, medium, high, critical")
+		return
+	}
 
-	ticket, err := h.tickets.CreateTicketAdmin(r.Context(), req.SubscriberID, req.Category, req.Description)
+	ticket, err := h.tickets.CreateTicketAdmin(r.Context(), req.SubscriberID, req.Category, req.Description, req.Priority)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "ERR_INTERNAL", "create ticket failed")
 		return
@@ -98,6 +115,7 @@ func (h *Handler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Status     *string `json:"status"`
 		AssignedTo *int    `json:"assigned_to"`
+		Priority   *string `json:"priority"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "ERR_BAD_REQUEST", err.Error())
@@ -107,8 +125,12 @@ func (h *Handler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "ERR_VALIDATION", "status must be one of open, in_progress, resolved, closed")
 		return
 	}
+	if req.Priority != nil && !ticketPriorities[*req.Priority] {
+		writeError(w, http.StatusUnprocessableEntity, "ERR_VALIDATION", "priority must be one of low, medium, high, critical")
+		return
+	}
 
-	ticket, err := h.tickets.UpdateTicketAdmin(r.Context(), ticketID, req.Status, req.AssignedTo)
+	ticket, err := h.tickets.UpdateTicketAdmin(r.Context(), ticketID, req.Status, req.AssignedTo, req.Priority)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "ERR_INTERNAL", "update ticket failed")
 		return

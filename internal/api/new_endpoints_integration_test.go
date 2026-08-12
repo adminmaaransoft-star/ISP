@@ -152,22 +152,26 @@ func newStubTicketsAdmin() *stubTicketsAdmin {
 	return &stubTicketsAdmin{tickets: map[int]*api.TicketRecord{}, nextID: 1}
 }
 
-func (s *stubTicketsAdmin) CreateTicketAdmin(_ context.Context, subscriberID int, category, description string) (*api.TicketRecord, error) {
+func (s *stubTicketsAdmin) CreateTicketAdmin(_ context.Context, subscriberID int, category, description string, priority *string) (*api.TicketRecord, error) {
 	if s.createErr != nil {
 		return nil, s.createErr
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	resolved := "medium"
+	if priority != nil {
+		resolved = *priority
+	}
 	t := &api.TicketRecord{
 		ID: s.nextID, SubscriberID: subscriberID, Category: category, Description: description,
-		Status: "open", CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		Status: "open", Priority: resolved, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	s.tickets[t.ID] = t
 	s.nextID++
 	return t, nil
 }
 
-func (s *stubTicketsAdmin) UpdateTicketAdmin(_ context.Context, ticketID int, status *string, assignedTo *int) (*api.TicketRecord, error) {
+func (s *stubTicketsAdmin) UpdateTicketAdmin(_ context.Context, ticketID int, status *string, assignedTo *int, priority *string) (*api.TicketRecord, error) {
 	if s.updateErr != nil {
 		return nil, s.updateErr
 	}
@@ -182,6 +186,9 @@ func (s *stubTicketsAdmin) UpdateTicketAdmin(_ context.Context, ticketID int, st
 	}
 	if assignedTo != nil {
 		t.AssignedTo = assignedTo
+	}
+	if priority != nil {
+		t.Priority = *priority
 	}
 	return t, nil
 }
@@ -578,7 +585,7 @@ func TestUpdateTicket_UnknownReturns404(t *testing.T) {
 // bare UPDATE and nothing downstream ever knew a ticket moved.
 func TestUpdateTicket_StatusChange_EnqueuesNotification(t *testing.T) {
 	ticketsStore := newStubTicketsAdmin()
-	created, err := ticketsStore.CreateTicketAdmin(context.Background(), 9, "connectivity", "No internet")
+	created, err := ticketsStore.CreateTicketAdmin(context.Background(), 9, "connectivity", "No internet", nil)
 	if err != nil {
 		t.Fatalf("seed ticket: %v", err)
 	}
@@ -622,7 +629,7 @@ func TestUpdateTicket_StatusChange_EnqueuesNotification(t *testing.T) {
 // subscriber has no stake in, and should never look like a status update.
 func TestUpdateTicket_AssigneeOnlyChange_DoesNotNotify(t *testing.T) {
 	ticketsStore := newStubTicketsAdmin()
-	created, err := ticketsStore.CreateTicketAdmin(context.Background(), 9, "connectivity", "No internet")
+	created, err := ticketsStore.CreateTicketAdmin(context.Background(), 9, "connectivity", "No internet", nil)
 	if err != nil {
 		t.Fatalf("seed ticket: %v", err)
 	}

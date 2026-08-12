@@ -291,7 +291,7 @@ func (h *Handler) UpdateTicketStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.tickets.UpdateTicketAdmin(r.Context(), ticketID, &status, nil)
+	updated, err := h.tickets.UpdateTicketAdmin(r.Context(), ticketID, &status, nil, nil)
 	if err != nil {
 		log.Error().Err(err).Int("ticket_id", ticketID).Msg("staffui: ticket update failed")
 		h.renderError(w, r, s, http.StatusInternalServerError, "Could not update that ticket.")

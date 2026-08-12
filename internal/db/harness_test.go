@@ -27,6 +27,14 @@ var truncateOrder = []string{
 	"lco_ledger",
 	"cgnat_allocations",
 	"subscriber_session_history",
+	// sla_events before tickets: CASCADE would take it anyway, but listing
+	// it keeps the dependency order this slice documents actually true.
+	//
+	// The SLA lookup tables (sla_policies, category_priority_defaults,
+	// ticket_routing_rules) are deliberately absent: migration 023 seeds
+	// them and every ticket-creation path reads them, so truncating them
+	// would break ticket creation everywhere rather than isolate a test.
+	"sla_events",
 	"tickets",
 	"notification_log",
 	"notification_templates",
@@ -36,6 +44,8 @@ var truncateOrder = []string{
 	"kyc_verifications",
 	"subscribers",
 	"plans",
+	// After tickets: tickets.assigned_to references it (migration 023).
+	"staff_users",
 	"franchises",
 }
 
@@ -77,6 +87,33 @@ func truncateAll(t *testing.T, pool *pgxpool.Pool) {
 			t.Fatalf("truncate %s: %v", table, err)
 		}
 	}
+	restoreSeededReferenceData(t, pool)
+}
+
+// restoreSeededReferenceData puts back reference rows that a migration seeds
+// and TRUNCATE ... CASCADE removes as collateral.
+//
+// ticket_routing_rules has an FK to franchises, so truncating franchises
+// cascades into it and silently empties the routing table migration 023
+// populated. Nothing in truncateOrder names it, which is exactly what makes
+// this worth restoring explicitly: without it, every ticket created in a test
+// comes out unrouted and the routing behaviour looks broken when only the
+// harness is.
+//
+// sla_policies and category_priority_defaults have no such FK and survive
+// truncation, so they need no restoration here.
+func restoreSeededReferenceData(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(), `
+		INSERT INTO ticket_routing_rules (category, franchise_id, target_role, priority_order)
+		VALUES ('connectivity', NULL, 'technician', 10),
+		       ('billing',      NULL, 'csr',        10),
+		       ('plan_change',  NULL, 'csr',        10),
+		       ('other',        NULL, 'csr',        20)
+		ON CONFLICT DO NOTHING`)
+	if err != nil {
+		t.Fatalf("restore ticket_routing_rules: %v", err)
+	}
 }
 
 // ── Seed helpers ────────────────────────────────────────────────────────────
@@ -93,6 +130,21 @@ type seedOpts struct {
 	FUPActive    bool
 	MobileNumber string
 	DndOptOut    bool
+}
+
+// seedStaffUser creates a console operator. Needed by anything that sets
+// tickets.assigned_to since migration 023 added the FK to staff_users that
+// migration 009 promised and never delivered — before it, assigned_to
+// accepted any integer, including ones matching no real account.
+func seedStaffUser(ctx context.Context, t *testing.T, pool *pgxpool.Pool, id int, username, role string) {
+	t.Helper()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO staff_users (id, username, password_hash, full_name, role, active)
+		VALUES ($1, $2, '$2a$12$seedhash', $3, $4, TRUE)`,
+		id, username, username, role)
+	if err != nil {
+		t.Fatalf("seed staff user %d: %v", id, err)
+	}
 }
 
 func seedFranchise(ctx context.Context, t *testing.T, pool *pgxpool.Pool, id int, name, ratePct, status string) {
