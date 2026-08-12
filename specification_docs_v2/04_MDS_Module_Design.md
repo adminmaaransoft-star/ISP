@@ -1,5 +1,5 @@
 # Document 4: Module Design Specification (MDS)
-**Version:** 2.1 | **Status:** Draft | **Date:** 2026-08-12 — §4.11–4.12 added (CRD §1.11 Phase 2); §4.1–4.10 unchanged from v2.0
+**Version:** 2.2 | **Status:** Draft | **Date:** 2026-08-12 — §4.13 added (CRD §1.11 Phase 3); §4.11–4.12 unchanged from v2.1, §4.1–4.10 unchanged from v2.0
 **Document ID:** MDS
 **Traces From:** [SAD](03_SAD_System_Architecture.md) → [SRS](02_SRS_System_Requirements.md)
 **Traces To:** [DDS](05_DDS_Detailed_Design.md) → [DBD](06_DBD_Database_Design.md) → [API](07_API_OpenAPI_Contract.md) → [TST](13_TST_Test_Strategy.md)
@@ -404,3 +404,191 @@ summarizes history for a human is a replica candidate.
 - `db_connection_retry_total` (counter, labels: `outcome=recovered|exhausted`)
 - `db_failover_detected_total` (counter) — incremented when the pool
   observes a primary-target change mid-session
+
+---
+
+## 4.13 Module 13: Helpdesk & SLA Engine *(new — gap CRD-EXP-002, FR-SUP-001..003)*
+**Module ID:** MOD-SUP | **SAD Ref:** new component, extends the ticket write
+paths already covered informally under SAD-COMP-006 (API Gateway & RBAC) —
+a dedicated SAD-COMP entry is pending a full SAD pass | **FR:** FR-SUP-001..003
+
+### What exists today, and the gap
+
+`tickets` (migration 009) has `category`, `status`, and a bare, **unconstrained**
+`assigned_to INTEGER` — the migration's own comment promises "FK to
+admin_users.id added in future migration"; that migration was never written,
+and `admin_users` never existed. The real staff table (`staff_users`,
+migration 021) postdates the ticket table by twelve migrations. No priority,
+no due date, no breach tracking, no index beyond the primary key — a ticket
+created a week ago and one created a minute ago are indistinguishable in a
+list query without reading every row's `created_at`. Three separate call
+sites write to this table today (`internal/api/tickets.go`,
+`internal/staffui/screens.go`, `internal/portal` for subscriber-raised
+tickets) and none of them sets anything SLA-related, because there is
+nothing to set.
+
+### Design decisions, and why
+
+**Priority is category-derived by default, staff-overridable, subscriber
+never sets it directly.** A subscriber choosing "critical" for every ticket
+is not a hypothetical — it is the default outcome of letting the reporter
+set their own urgency. `category` already carries a real urgency signal
+(`connectivity` — the subscriber has no service — is categorically more
+urgent than `plan_change`), so priority defaults from a category → priority
+table staff can retune without a deploy, and only staff (console/API) can
+override it after triage. Portal-created tickets always get the default.
+
+**SLA has two clocks, not one: response and resolution.** "Time until
+someone even looks at this" and "time until this is actually resolved" are
+different operational signals — a ticket sitting at `open` past its
+response SLA means nobody has started; one past its resolution SLA but
+already `in_progress` is a different problem. `FR-SUP-001`'s "a computed
+SLA due-by timestamp" becomes two: `sla_response_due_at` (breached if still
+`open` when it passes) and `sla_resolution_due_at` (breached if not
+`resolved`/`closed` when it passes).
+
+**SLA targets live in a table (`sla_policies`), not Go constants.** Same
+reasoning as `plan_nas_profiles` in §4.11: an ops team retuning "how fast
+must a critical connectivity ticket be resolved" is a data change, not a
+code change. Keyed on `(category, priority)`, not priority alone — a
+critical billing dispute and a critical connectivity outage plausibly
+deserve different resolution windows even at the same priority label.
+
+**Due-by timestamps are a snapshot at creation, not a live recomputation.**
+Both are computed once, from the ticket's `created_at`, at insert time (and
+recomputed, still anchored to the *original* `created_at`, if staff change
+priority during triage). Anchoring to a floating "last touched" time instead
+would let repeated updates push a deadline out indefinitely — the same
+"snapshot, not live" reasoning already applied to CoA/PoD's NAS-session
+lookup happening at task-execution time rather than trusting a stale
+enqueue-time payload (MDS §4.2), just in the opposite direction: there, the
+snapshot is deliberately *not* trusted; here, it deliberately *is*, because
+letting it drift is the bug.
+
+**Breach and warning events are a log, not columns.** Four extra booleans/
+timestamps on the hot `tickets` table (`response_warned_at`,
+`response_breached_at`, `resolution_warned_at`, `resolution_breached_at`)
+would work, but `sla_events` (ticket_id, event_type, occurred_at,
+`UNIQUE(ticket_id, event_type)`) is the same append-only-log shape this
+codebase already uses for `notification_log` and `lea_audit_log`, and the
+uniqueness constraint *is* the idempotency mechanism the scanner needs
+(insert, check whether a row was actually written, only alert if so) rather
+than a hand-rolled "have I already warned about this" check.
+
+**Warning threshold: 80% of the window elapsed** — reusing FR-FUP-004's
+already-shipped 80%-warning pattern for FUP quota exactly, not inventing a
+second convention for the same shape of problem.
+
+**Routing targets a role, not a specific staff member.** Auto-assigning to
+an individual needs a workload/availability model this codebase has no data
+for (nothing tracks how many open tickets a given `staff_users` row already
+has). `ticket_routing_rules` (`category` nullable, `franchise_id` nullable,
+`target_role`, `priority_order`) resolves to a role at creation time,
+stored on the ticket (`routed_role`) — a human still picks the specific
+assignee from that role's queue. Rule matching is explicit-precedence, not
+inferred specificity: lowest `priority_order` among rules whose nullable
+columns match (or are null, meaning "any") wins; no match leaves
+`routed_role` null and the ticket in the general queue.
+
+### Write-path integration
+
+`internal/db/tickets.go`'s `CreateTicketAdmin` (and the portal's
+`PortalStore.CreateTicket`, `internal/db/subscribers.go`) both gain the same
+three-step sequence before insert:
+
+```sql
+-- 1. Resolve priority (skip if caller supplied an explicit override — staff only)
+--    Category → default priority is itself a small lookup table
+--    (category_priority_defaults) rather than a Go switch, for the same
+--    retune-without-deploy reason as sla_policies.
+SELECT default_priority FROM category_priority_defaults WHERE category = $1;
+
+-- 2. Resolve SLA targets for (category, resolved priority)
+SELECT response_minutes, resolution_minutes FROM sla_policies
+WHERE category = $1 AND priority = $2;
+
+-- 3. Resolve routing (first match by priority_order; franchise_id comes from
+--    a join to subscribers, since tickets does not carry it independently
+--    except as the denormalized copy this module adds — see DBD)
+SELECT target_role FROM ticket_routing_rules
+WHERE (category = $1 OR category IS NULL)
+  AND (franchise_id = $2 OR franchise_id IS NULL)
+ORDER BY priority_order ASC LIMIT 1;
+```
+
+Then a single `INSERT` carries `priority`, `sla_response_due_at =
+created_at + response_minutes`, `sla_resolution_due_at = created_at +
+resolution_minutes`, `franchise_id`, and `routed_role`. A category/priority
+pair with no `sla_policies` row is a configuration gap, not a silent
+no-op: the insert should fail loudly (`NOT NULL` on the resolution columns
+with no `DEFAULT`) rather than create a ticket with no SLA at all — the same
+"never fail silently" stance FR-NAS's `nas_attribute_build_errors_total`
+already takes (MDS §4.11) for a materially identical failure shape (a
+lookup with no matching row).
+
+`UpdateTicketAdmin`'s priority-change path recomputes step 2 and rewrites
+both due-at columns from the ticket's existing `created_at` — never from
+`now()`.
+
+### SLA breach scanner
+
+`internal/tickets/sla_scanner.go` (new file, existing package — the one
+`notify_task.go` already lives in). Same shape as `fup.Scanner` and
+`billing.DunningScanner` (MDS §4.2, §4.3): a ticker-driven loop registered
+in `cmd/radiusd/main.go` alongside them, not a new pattern.
+
+```go
+type SLAScanner struct {
+    db     SLAQuerier
+    client *asynq.Client
+}
+
+func (s *SLAScanner) Run(ctx context.Context) {
+    ticker := time.NewTicker(5 * time.Minute) // SLA windows are hours, not seconds — FUP's 10s cadence is the wrong reference point here; billing's hourly scan is the closer analog, halved for tighter breach detection
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            s.scan(ctx)
+        }
+    }
+}
+```
+
+Each tick, for both response and resolution clocks independently: find open
+tickets past the 80%-warning threshold or past the due-at itself, attempt
+`INSERT INTO sla_events (ticket_id, event_type) VALUES (...) ON CONFLICT
+(ticket_id, event_type) DO NOTHING`, and only enqueue an alert task when
+that insert actually added a row (`RowsAffected() == 1`) — the same
+insert-and-check-rows-affected idempotency shape already used for dead-letter
+alerting (`internal/fup/deadletter_monitor.go`).
+
+### Alerting: dashboard first, reusing the existing Alerter — not a new channel
+
+FR-SUP-002 asks for "dashboard + notification." The dashboard half is new
+UI work (a breach count/badge on staffui's Support section, `internal/
+staffui/screens.go`) — out of scope for this schema/module pass, tracked
+for the implementation pass. The notification half deliberately does **not**
+introduce a new staff notification channel: `staff_users` has no email or
+phone column today, and building one now would be scope creep into
+FR-NOTIF-012 (email channel, Phase 4, not yet implemented) or a staff-facing
+SMS/WhatsApp channel that doesn't exist either. Instead, a breach event
+enqueues through the same `Alerter` interface (`Trigger(event string, detail
+any)`) `fup.DeadLetterMonitor` already depends on and `cmd/radiusd/main.go`
+already wires to `logAlerter{}` (PagerDuty-shaped, log-only until PagerDuty
+delivery is actually implemented — an existing, already-documented
+limitation, not a new one this module introduces). A real per-staff
+notification is a real future need; it is not manufactured here just to
+check a box.
+
+### Key Metrics
+
+- `sla_events_total` (counter, labels: `event_type`) — mirrors
+  `fup_breach_detected_total`'s shape (MDS §4.2)
+- `sla_scan_duration_seconds` (histogram) — the scan touches every open
+  ticket every 5 minutes; worth watching as ticket volume grows
+- `tickets_unrouted_total` (gauge) — tickets with no matching
+  `ticket_routing_rules` row, i.e. sitting in the general queue with no
+  role signal at all

@@ -154,9 +154,9 @@
 
 | FR ID | Requirement | CRD Ref | Module |
 |---|---|---|---|
-| FR-SUP-001 | Tickets must carry a priority (low/medium/high/critical) and a computed SLA due-by timestamp based on priority and category | CRD-EXP-002 | DBD §6.2 |
-| FR-SUP-002 | Alert (dashboard + notification) when a ticket is approaching or has breached its SLA due-by time | CRD-EXP-002 | MDS, new module |
-| FR-SUP-003 | Support ticket assignment rules/routing (e.g., by category or franchise) beyond manual `assigned_to` | CRD-EXP-002 | MDS, new module |
+| FR-SUP-001 | Tickets must carry a priority (low/medium/high/critical) and a computed SLA due-by timestamp based on priority and category | CRD-EXP-002 | MDS §4.13, DBD §6.2 |
+| FR-SUP-002 | Alert (dashboard + notification) when a ticket is approaching or has breached its SLA due-by time | CRD-EXP-002 | MDS §4.13, DBD §6.2 |
+| FR-SUP-003 | Support ticket assignment rules/routing (e.g., by category or franchise) beyond manual `assigned_to` | CRD-EXP-002 | MDS §4.13, DBD §6.2 |
 
 ### CRM / Lead Management *(new — gap CRD-EXP-002, v3)*
 
@@ -264,7 +264,7 @@
 | Hotspot / Captive Portal *(v3)* | 3 | new module | TBD — Module design pending |
 | Partner / 3rd-Party Integration *(v3)* | 3 | new module | TBD — Module design pending |
 | Mobile *(v3)* | 2 | MDS §4.9 (extend) | TBD — Module design pending |
-| Helpdesk / SLA *(v3)* | 3 | new module | TBD — Module design pending |
+| Helpdesk / SLA *(v3)* | 3 | MDS §4.13 | TBD — Module design complete (2026-08-12), implementation/tests pending |
 | CRM / Lead Management *(v3)* | 3 | new module | TBD — Module design pending |
 | Inventory / CPE *(v3)* | 3 | new module | TBD — Module design pending |
 | Task & Approval Workflows *(v3)* | 2 | new module | TBD — Module design pending |

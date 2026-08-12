@@ -1,5 +1,5 @@
 # Document 6: Database Design Document (DBD)
-**Version:** 2.1 | **Status:** Draft | **Date:** 2026-08-12 — §6.2 `nas_devices`/`plan_nas_profiles`, §6.6 added (CRD §1.11 Phase 2); rest unchanged from v2.0
+**Version:** 2.2 | **Status:** Draft | **Date:** 2026-08-12 — §6.2 SLA engine tables added, `tickets` altered (CRD §1.11 Phase 3); §6.2 Phase 2 tables/§6.6 unchanged from v2.1, rest unchanged from v2.0
 **Document ID:** DBD
 **Traces From:** [MDS](04_MDS_Module_Design.md) → [DDS](05_DDS_Detailed_Design.md)
 **Traces To:** [API](07_API_OpenAPI_Contract.md) → [TST](13_TST_Test_Strategy.md)
@@ -28,6 +28,11 @@ lea_audit_log ─────────────── (append-only — FR-
 nas_devices (1) ─────── (N) plan_nas_profiles  [v3 — FR-NAS-002]
 plans       (1) ─────── (N) plan_nas_profiles  [v3 — FR-NAS-001]
 encryption_keys (1) ─── (N) nas_devices        [v3 — FR-NAS-002, secret encrypted at rest]
+tickets     (1) ─────── (N) sla_events         [v3 — FR-SUP-002, append-only]
+franchises  (1) ─────── (N) ticket_routing_rules  [v3 — FR-SUP-003, franchise_id nullable]
+staff_users (1) ─────── (N) tickets            [v3 — FR-SUP-003, assigned_to — the FK migration 009 promised and never added]
+franchises  (1) ─────── (N) tickets            [v3 — FR-SUP-003, denormalized from subscribers.franchise_id]
+sla_policies, category_priority_defaults, ticket_routing_rules ── (standalone lookup tables — FR-SUP-001..003)
 ```
 
 > `nas_devices` is deliberately **not** a hard FK target of
@@ -228,7 +233,7 @@ reference-vendor NAS whose plan has no matching row here is an
 see MDS §4.11.
 
 ### Table: `tickets`
-**FR:** FR-SUB-004 | **Module:** MOD-PORTAL
+**FR:** FR-SUB-004, FR-SUP-001..003 (v3) | **Module:** MOD-PORTAL, MOD-SUP
 
 | Column | Type | Constraints | Description |
 |---|---|---|---|
@@ -237,9 +242,86 @@ see MDS §4.11.
 | `category` | `VARCHAR(50)` | NOT NULL | `connectivity`, `billing`, `plan_change`, `other` |
 | `description` | `TEXT` | NOT NULL | |
 | `status` | `VARCHAR(20)` | DEFAULT 'open' | `open`, `in_progress`, `resolved`, `closed` |
-| `assigned_to` | `INTEGER` | FK → admin_users.id NULLABLE | |
+| `assigned_to` | `INTEGER` | FK → staff_users.id NULLABLE | **Correction, v3:** this doc previously said `FK → admin_users.id`, matching migration 009's own comment ("FK to admin_users.id added in future migration"). Neither was ever true — `admin_users` never existed, no FK was ever added, and `assigned_to` has been a bare unconstrained integer since migration 009. `staff_users` (migration 021) is the real staff table; migration 023 (below) adds the FK that should have existed from the start |
+| `priority` | `VARCHAR(20)` | NOT NULL DEFAULT 'medium' | `low`, `medium`, `high`, `critical` — *(new, v3)*. Category-derived by default (`category_priority_defaults`), staff-overridable, never set directly by a subscriber (MDS §4.13) |
+| `sla_response_due_at` | `TIMESTAMPTZ` | NULLABLE | *(new, v3)* — breached if `status` is still `open` once this passes |
+| `sla_resolution_due_at` | `TIMESTAMPTZ` | NULLABLE | *(new, v3)* — breached if `status` is not `resolved`/`closed` once this passes |
+| `franchise_id` | `INTEGER` | FK → franchises.id NULLABLE | *(new, v3)* — denormalized from `subscribers.franchise_id` at creation, same pattern `wallet_ledgers.franchise_id` already uses, for routing-rule matching (MDS §4.13) without a join on every ticket read |
+| `routed_role` | `VARCHAR(20)` | NULLABLE | *(new, v3)* — snapshot of the matching `ticket_routing_rules.target_role` at creation time, not recomputed if rules change later (MDS §4.13) |
 | `created_at` | `TIMESTAMPTZ` | DEFAULT NOW() | |
 | `updated_at` | `TIMESTAMPTZ` | DEFAULT NOW() | |
+
+### Table: `category_priority_defaults` *(new — FR-SUP-001, v3)*
+**Module:** MOD-SUP | Migration `023_create_sla_engine.sql`
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `category` | `VARCHAR(50)` | PK | Matches `tickets.category`'s CHECK values |
+| `default_priority` | `VARCHAR(20)` | NOT NULL | `low`, `medium`, `high`, `critical` |
+
+Seeded with one row per `tickets.category` value — a category with no row
+here is a configuration gap the ticket-creation insert should fail loudly
+on (MDS §4.13), not silently default to something. Seed suggestion (not
+prescriptive — an ops decision, not a schema one): `connectivity` → `high`
+(no service is the most urgent category by default), `billing` →
+`medium`, `plan_change` → `low`, `other` → `low`.
+
+### Table: `sla_policies` *(new — FR-SUP-001, v3)*
+**Module:** MOD-SUP | Migration `023_create_sla_engine.sql`
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `category` | `VARCHAR(50)` | NOT NULL | |
+| `priority` | `VARCHAR(20)` | NOT NULL | |
+| `response_minutes` | `INTEGER` | NOT NULL | Time to first response (ticket leaving `open`) |
+| `resolution_minutes` | `INTEGER` | NOT NULL | Time to resolution (`resolved`/`closed`) |
+| `created_at` | `TIMESTAMPTZ` | DEFAULT NOW() | |
+| `CONSTRAINT uq_sla_category_priority` | | UNIQUE (`category`, `priority`) | |
+
+Keyed on the pair, not `priority` alone — a critical connectivity outage
+and a critical billing dispute plausibly deserve different resolution
+windows even at the same priority label (MDS §4.13). A ticket whose
+`(category, priority)` has no row here is the same class of configuration
+gap as a missing `category_priority_defaults` row — the insert should fail,
+not create a ticket with no SLA at all.
+
+### Table: `sla_events` *(new — FR-SUP-002, v3)*
+**Module:** MOD-SUP | Migration `023_create_sla_engine.sql`
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `BIGSERIAL` | PK | |
+| `ticket_id` | `INTEGER` | NOT NULL, FK → tickets.id | |
+| `event_type` | `VARCHAR(30)` | NOT NULL CHECK IN (`response_warning`,`response_breach`,`resolution_warning`,`resolution_breach`) | |
+| `occurred_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT NOW() | |
+| `CONSTRAINT uq_sla_event` | | UNIQUE (`ticket_id`, `event_type`) | |
+
+Append-only, same shape as `notification_log` and `lea_audit_log` — and the
+uniqueness constraint on `(ticket_id, event_type)` **is** the SLA scanner's
+idempotency mechanism (MDS §4.13): attempt the insert, act on the alert
+only if a row was actually written, rather than a separate boolean column
+per event type on `tickets` itself.
+
+### Table: `ticket_routing_rules` *(new — FR-SUP-003, v3)*
+**Module:** MOD-SUP | Migration `023_create_sla_engine.sql`
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `category` | `VARCHAR(50)` | NULLABLE | NULL matches any category |
+| `franchise_id` | `INTEGER` | FK → franchises.id NULLABLE | NULL matches any franchise (including none) |
+| `target_role` | `VARCHAR(20)` | NOT NULL CHECK IN (`isp_owner`,`noc_engineer`,`billing_admin`,`csr`,`technician`) | Same role enum `staff_users.role` already uses |
+| `priority_order` | `INTEGER` | NOT NULL DEFAULT 100 | Lower matches first; explicit precedence, not inferred from how many columns are non-null (MDS §4.13) |
+| `created_at` | `TIMESTAMPTZ` | DEFAULT NOW() | |
+
+Routes to a role, not a specific `staff_users` row — auto-assigning to an
+individual would need a workload/availability model nothing in this schema
+tracks (MDS §4.13). A ticket matching no rule leaves `tickets.routed_role`
+null; it sits in the general queue rather than failing ticket creation —
+unlike a missing SLA policy, an unrouted ticket is a normal, expected
+outcome (not every category/franchise combination needs an explicit rule),
+not a configuration error.
 
 ### Table: `revenue_snapshots` *(new — FR-REV-001)*
 **Module:** MOD-REV
@@ -370,6 +452,32 @@ CREATE INDEX idx_franchise_subscribers ON subscribers(franchise_id) WHERE franch
 
 -- NAS: plan-to-profile resolution for reference-model vendors (FR-NAS-001, v3)
 CREATE INDEX idx_plan_nas_vendor ON plan_nas_profiles(plan_id, vendor);
+
+-- SLA scanner: the query that runs every 5 minutes (MDS §4.13) — open
+-- tickets whose response/resolution clock is worth checking. Partial index
+-- (WHERE status excludes closed states) keeps it small and keeps it useful
+-- as the ticket table grows, rather than indexing rows the scanner will
+-- never select.
+CREATE INDEX idx_tickets_sla_resolution ON tickets(sla_resolution_due_at)
+  WHERE status NOT IN ('resolved', 'closed');
+CREATE INDEX idx_tickets_sla_response ON tickets(sla_response_due_at)
+  WHERE status = 'open';
+
+-- Tickets: subscriber's own ticket list (portal) and admin lookup by
+-- subscriber_id (staffui) — surprisingly absent before v3; every query
+-- against this table up to now was a sequential scan.
+CREATE INDEX idx_tickets_subscriber ON tickets(subscriber_id);
+
+-- Tickets: staff's assigned queue and franchise-scoped queue
+CREATE INDEX idx_tickets_assigned_to ON tickets(assigned_to) WHERE assigned_to IS NOT NULL;
+CREATE INDEX idx_tickets_franchise ON tickets(franchise_id) WHERE franchise_id IS NOT NULL;
+
+-- SLA events: per-ticket event history lookup (also enforced by
+-- uq_sla_event for the idempotency use, this index serves ordinary reads)
+CREATE INDEX idx_sla_events_ticket ON sla_events(ticket_id, occurred_at DESC);
+
+-- Routing: rule matching at ticket-creation time, ordered by precedence
+CREATE INDEX idx_routing_rules_lookup ON ticket_routing_rules(category, franchise_id, priority_order);
 ```
 
 ---

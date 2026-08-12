@@ -17,6 +17,7 @@ coverage.out
 # IDE
 .idea/
 .vscode/settings.json
+.vscode/mcp.json
 *.swp
 *.swo
 
@@ -39,3 +40,7 @@ e2e/.cache/
 
 # Playwright snapshots are regenerated on every run
 e2e/snapshots/
+
+# Ad-hoc live-verification screenshots (driven by hand against a running
+# stack, not by the committed suite) — same reasoning as e2e/snapshots/
+e2e/live-test/

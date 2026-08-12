@@ -1,147 +1,99 @@
 # Handoff — state of play
 
-Written 2026-08-12 at commit `deb06d2`; updated same day after pushing to
-`origin/main` and closing item 1. Delete this file once the items below are
-done; it describes a moment, not the system.
+Rewritten 2026-08-12. The previous version described a moment that has since
+passed and had gone stale in ways that would mislead a fresh session (it
+still listed the already-shipped FR-NOTIF-007 as the next task, and quoted
+package/wiring counts that no longer matched). Re-derive the numbers below
+rather than trusting them if this file is more than a few sessions old —
+`go test ./...`, `check_wiring.sh` and `git log` are the truth, this file is
+a convenience.
 
 ---
 
-## Do this first
+## Where the project is
 
-**Pushed.** `origin/main` is now at `63b3c57` (the 6 commits that were
-unpushed, including this file's own initial version, all landed). Pre-push
-audit confirmed `.env` untracked, no key material in history, `node_modules`
-and `e2e/snapshots` excluded.
+`v1.0.0` was cut, then ten commits landed on top of it. The work since falls
+into two groups:
 
-**Still open: the `v1.1.0` tag.** `v1.0.0` still points at `74e2655` and should
-— it's a released tag, not to be moved. Six commits of work sit on top of it
-(five original + the FR-NOTIF-007 work below). Cutting `v1.1.0` is a naming
-judgement call for a person, not something to decide unattended:
+**Shipped and verified** (all pushed to `origin/main`):
 
-```bash
-git tag -a v1.1.0 -m "..." && git push origin v1.1.0
-```
-
----
-
-## Completed this session
-
-### FR-NOTIF-007 — notify on ticket status change ✅
-
-The console let a CSR change a ticket status and the subscriber was never
-told; `TMPL-008` (`ticket_update`) was seeded but nothing dispatched it. Fixed
-in both places that change a ticket's status, not just the console:
-
-- New package `internal/tickets` (`notify_task.go`): `TaskTypeTicketUpdate`,
-  `UpdatePayload`, `UpdateHandler` — same shape as
-  `internal/billing/dunning_task.go`.
-- `internal/notifications/whatsapp.go`: registered `TMPL-008` →
-  `ticket_update` in `templateNames` (it was seeded but had no Meta template
-  name mapping — would have sent with the raw ID as the name).
-- `internal/staffui`: added a `Tasks` dependency; `UpdateTicketStatus` enqueues
-  after a successful change.
-- `internal/api/tickets.go`: `UpdateTicket` (the JSON API's PATCH endpoint)
-  also enqueues — it had the identical gap and shares the same
-  `UpdateTicketAdmin` call, so leaving it out would have left one of the two
-  real entry points still silently unwired. Guarded to fire only when
-  `status` actually changed, not on an assignee-only patch.
-- `cmd/api/main.go` / `cmd/radiusd/main.go`: wired the `Tasks` dependency and
-  registered the new handler on the worker mux.
-- `scripts/check_wiring.sh`: added `NewUpdateHandler` to the tracked
-  components (now 12/12).
-
-Verified past "it compiles": unit tests in `internal/tickets` with a
-deliberate-break negative control (swapped the template var order, confirmed
-the test failed, reverted); two new integration tests in
-`internal/api/new_endpoints_integration_test.go` (status change enqueues,
-assignee-only does not) with the same negative-control treatment; then
-rebuilt `api_service` and `aaa_core_daemon`, ran the existing Playwright
-ticket-workflow test against the real containers, and confirmed the full
-round trip in Postgres:
-
-```
-notification_log: subscriber_id=1, template_id=TMPL-008, triggered_by_event=ticket_update, delivery_status=failed
-```
-
-`failed` is expected and correct — the demo stack's `WHATSAPP_ACCESS_TOKEN`
-is not a real Meta credential (confirmed via a 401 in the worker log), the
-same pre-existing limitation the dunning and FUP notifications already have
-here. The point of the check was confirming the task actually reaches the
-worker and a real send is attempted, which it does.
-
-**One discrepancy found and worth knowing:** `golangci-lint run ./...`
-reports 2 pre-existing `gosec` findings (G705 in `internal/api/invoices.go`,
-G710 in `internal/staffui/screens.go`) — confirmed present on the untouched
-`63b3c57` tree via `git stash`, not introduced this session. The "0 issues"
-claim in the previous handoff no longer holds; nobody has fixed or triaged
-these yet.
-
-**Environment note for next time:** this repo has `core.autocrlf=true`. Any
-`git stash`/`pop` round-trip re-CRLFs whatever it touches, which makes
-`gofmt -l` flag entire files as unformatted even though nothing semantic
-changed. Fix with `sed -i 's/\r$//' <file>` on the affected files rather than
-touching `core.autocrlf` (never change git config per this project's rules).
-Also: the demo stack's seeded Redis live-session key
-(`session:active:{id}`) has a 24h TTL (`scripts/demo_up.sh`); a stack left
-running longer than that will fail the two Playwright tests that check the
-"online" dashboard state for reasons that have nothing to do with your
-change. Reseed with the same `redis-cli SET ... EX 86400` command in
-`demo_up.sh` before trusting a red result there.
-
----
-
-## Next tasks, in priority order
-
-### 1. Console write actions (~1 week)
-
-`internal/staffui` is read-mostly. The write actions the API already supports
-have no screen:
-
-| Action | API route | Role |
+| Feature | FR | Verification |
 |---|---|---|
-| Disconnect session | `POST /api/v1/sessions/{id}/disconnect` | noc_engineer |
-| FUP override | `POST /api/v1/sessions/{id}/fup-override` | noc_engineer |
-| Credit wallet | `POST /api/v1/wallets/recharge` | billing_admin, csr |
-| Create subscriber | `POST /api/v1/subscribers` | billing_admin |
-| Update subscriber | `PATCH /api/v1/subscribers/{id}` | billing_admin |
+| Dunning scanner, nightly revenue reconciliation, operations console | FR-BIL-004, FR-REV-*, FR-SEC-005 | 45 Playwright tests across 5 staff personas |
+| Ticket status-change notifications | FR-NOTIF-007 | Live: console click → `notification_log` row in 1s |
+| Multi-vendor NAS attribute engine | FR-NAS-001..004 | 20 unit tests, byte-exact VSA encoding per vendor |
+| PostgreSQL HA (Patroni + etcd) + connection-pool failover fix | NFR-AVAIL-002 | Live: 3-node cluster, 3 failover modes drilled |
 
-Each needs a confirmation step and an audit entry — more design than typing.
+**Designed, not built** — the Jaze-parity roadmap (CRD §1.11) adopted as
+BO-007: 40 FRs across 11 groups, phased. Phase 2 (network correctness) is
+done. Phase 3 (operations-suite parity) has one module designed:
 
-### 2. Security review of `staff_users` (~2 days + a decision)
+- **Helpdesk & SLA Engine** (FR-SUP-001..003) — MDS §4.13 + DBD §6.2 are
+  written and specific enough to build from. Migration would be
+  `023_create_sla_engine.sql`. **This is the obvious next thing to build.**
 
-Migration 021 added a **new authentication surface**. Not specified anywhere,
-so these are open decisions rather than omissions:
+Everything else in Phases 3–5 is requirements-stage only (SRS §2.1), with no
+module design yet. Each gets its own design pass when scheduled — deliberately
+not all at once.
 
-- no MFA
-- no password rotation or expiry
-- no lockout after repeated failures
-- no screen for creating accounts (they come from the seed)
-- 8-hour sessions
+---
 
-### 3. L6-004 Sentinel failover — a decision, not a sprint
+## Current numbers (verified 2026-08-12)
 
-Measured 5055ms on the shipped config against a 3000ms budget; ~3.1s with
-`down-after-milliseconds` at 500. Recommendation: adopt 500 and move the target
-to 8s. **Separately**, decide whether the DNS/tilt failure mode is acceptable —
-when a master container leaves Docker DNS, Sentinel never promotes at all.
-Reproduce: `CHAOS_MODE=kill ./scripts/run_sentinel_failover_test.sh`.
-See `DOD_STATUS_REPORT.md` Finding #6.
+| | |
+|---|---|
+| Go packages | 26 total; **18 have tests and pass** |
+| Wiring check | **13/13** components have a production caller |
+| Browser tests | 45 (Playwright, 5 staff personas + subscriber portal) |
+| Migrations | 22 applied (`001`–`022`) |
+| Lint | 2 known pre-existing `gosec` findings, untriaged (see below) |
 
-### 4. The 1-hour soak (L6-005) — pure time
+---
 
-`./scripts/run_soak_test.sh` is committed and validated on a 90s run. Needs one
-uninterrupted hour on a machine that will not sleep.
+## Open decisions that need a person, not a sprint
 
-### 5. Remaining unimplemented requirements
+1. **L6-004 Sentinel failover target.** Measured 5055ms against a 3000ms
+   budget; ~3.1s with `down-after-milliseconds` at 500. Recommendation:
+   adopt 500 and move the target to 8s. **Separately**, decide whether the
+   DNS/tilt failure mode is acceptable — when a master container leaves
+   Docker DNS, Sentinel never promotes at all. Reproduce with
+   `CHAOS_MODE=kill ./scripts/run_sentinel_failover_test.sh`. See
+   `DOD_STATUS_REPORT.md` Finding #6.
 
-40 of 52 FRs are traceable to a `TestFR_` test (FR-NOTIF-007 moved from
-"unimplemented" to tested this session). Genuinely unimplemented:
+2. **Two pre-existing `gosec` findings**, present since before the current
+   round of work and confirmed not introduced by it (verified via
+   `git stash`): G705 in `internal/api/invoices.go:222`, G710 in
+   `internal/staffui/screens.go`. Both need a real triage — suppress with a
+   reason, or fix. Note that earlier docs claiming "lint: 0 issues" were
+   wrong.
 
-- `FR-NOTIF-003` / `FR-FUP-005` — notify when FUP throttle is applied (same
-  missing-trigger shape FR-NOTIF-007 had)
-- `FR-NET-003` — IPv6 prefix recording; the column exists in migration 010 and
-  nothing writes it
-- `FR-FRN-003` — consolidated P&L across LCO partners
+3. **`staff_users` has no MFA, no lockout, no password rotation, and no
+   account-creation screen** (accounts come from the seed). Migration 021
+   added a new authentication surface and none of this was ever specified,
+   so these are open decisions rather than omissions.
+
+---
+
+## Known gaps worth knowing about
+
+- **`scripts/seed_local.sql` publishes demo credentials.** Bcrypt hashes for
+  five staff accounts, with the password named in `TESTERS_MANUAL.md`
+  (`staffpassword`). Same category as the existing `testpassword` subscriber
+  hashes. Fine for a localhost demo, but this is a public repo — those
+  accounts must never exist in a real deployment.
+- **The franchise/LCO module is built but unreachable.**
+  `internal/revenue/franchise.go` has commission calculation, franchise-scoped
+  listing, and `franchise_admin`/`franchise_staff` roles — and zero routes.
+  No `/api/v1/franchises` endpoint is registered anywhere. FR-FRN-004..006
+  (SRS) covers wiring it up.
+- **The 1-hour soak (L6-005) has never been run.**
+  `./scripts/run_soak_test.sh` is committed and validated on a 90s run.
+  Needs one uninterrupted hour on a machine that will not sleep.
+- **`assigned_to` on `tickets` has no FK** — migration 009's own comment
+  promises "FK to admin_users.id added in future migration"; that migration
+  was never written and `admin_users` never existed. The real staff table is
+  `staff_users` (migration 021). The SLA engine design (DBD §6.2) adds the
+  FK that should have been there.
 
 ---
 
@@ -157,56 +109,89 @@ export COMPOSE_PROJECT_NAME=isp_bss_demo # demo_up.sh hardcodes this
 Without that variable every `docker compose` command silently targets a
 different project and reports containers as not running.
 
+### PostgreSQL HA is opt-in, not the default
+
+The base `docker-compose.yml` runs one Postgres, same as it always has.
+The Patroni/etcd HA topology is an overlay:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.pg-ha.yml up -d
+```
+
+`demo_up.sh` and the whole test suite run against the single-node stack.
+Note that `docker-compose.pg-ha.yml` uses fixed `container_name` values, so
+it cannot run side-by-side with the demo stack on one machine without a
+name/port override.
+
 ### Docker on this machine
 
 - Docker Desktop drops out mid-session. Recover:
   `powershell -Command "Start-Process 'C:\Program Files\Docker\Docker\Docker Desktop.exe'"`
   then poll `until docker info; do sleep 3; done`.
-- Registry pulls have failed with certificate errors when the host clock drifts
-  (the cert reads as not-yet-valid). Cached images still work; do not "fix" it
-  by changing the system clock.
+- Registry pulls have failed with certificate errors when the host clock
+  drifts (the cert reads as not-yet-valid). Cached images still work; do not
+  "fix" it by changing the system clock.
 
 ### Paths and Docker
 
-`MSYS_NO_PATHCONV=1` is required for most `docker run` arguments, but it means
-POSIX paths reach the Windows Docker binary unconverted. A `/tmp/...` path
-becomes `D:\tmp\...` and silently fails. Use `pwd -W` to get a Windows path for
-any `-v` mount or `-f` file argument. This exact bug made a config override
-silently not apply and produced two sessions' worth of wrong measurements.
+`MSYS_NO_PATHCONV=1` is required for most `docker run` arguments, but it
+means POSIX paths reach the Windows Docker binary unconverted. A `/tmp/...`
+path becomes `D:\tmp\...` and silently fails. Use `pwd -W` for any `-v` mount
+or `-f` file argument. This exact bug produced two sessions' worth of wrong
+measurements.
 
-### Verification that keeps finding real bugs
+### Line endings
 
-Run these before believing anything:
+This repo has `core.autocrlf=true`. Any `git stash`/`pop` round-trip
+re-CRLFs the files it touches, which makes `gofmt -l` flag entire files as
+unformatted even though nothing semantic changed. Fix with
+`sed -i 's/\r$//' <file>`; do not change the git config.
+
+### The demo stack's seeded Redis session expires
+
+`demo_up.sh` seeds `session:active:{id}` with a 24h TTL. A stack left running
+longer than that fails the two Playwright tests that check the "online"
+dashboard state, for reasons unrelated to whatever you just changed. Reseed
+with the same `redis-cli SET ... EX 86400` command from `demo_up.sh`.
+
+### `-race` needs a C compiler
+
+`go test -race` requires cgo. In the Git-Bash shell used for recent sessions
+`gcc` was not on `PATH`, so those runs were without `-race`. Use a shell
+where `gcc` resolves if race detection matters for what you are changing.
+
+---
+
+## Verification that keeps finding real bugs
 
 ```bash
 gofmt -l . && go build ./... && go vet -tags=integration ./...
-go test -count=1 -race -tags=integration ./...     # 17 packages (internal/tickets is new)
-golangci-lint run ./...                            # 2 known gosec issues, see above — not 0
-./scripts/check_wiring.sh                          # 12/12 wired
-npx playwright test                                # 45 browser tests
+go test -count=1 -tags=integration ./...   # 18 packages with tests
+golangci-lint run ./...                    # 2 known pre-existing issues
+./scripts/check_wiring.sh                  # 13/13 wired
+npx playwright test                        # 45 browser tests
 ```
 
-`-race` needs a C compiler on `PATH`; in this Windows/Git-Bash shell `gcc` was
-not found (`CGO_ENABLED=1` without it fails outright), so this session's runs
-were without `-race`. Whatever shell had `gcc` resolving before, use that one
-if race detection matters for what you're changing.
+`check_wiring.sh` exists because three components once shipped complete,
+tested, and never called. It is a grep, not a test, and it caught what the
+suite could not.
 
-`check_wiring.sh` exists because three components shipped complete, tested and
-never called. It is a grep, not a test, and it caught what the suite could not.
+### The pattern that keeps working
 
-### The pattern that produced most findings this session
-
-Nine defects were found by **running** something, not reading it. Several
-passed code review and failed execution:
+**Run it, don't read it.** Defects that passed code review and failed
+execution, across several sessions:
 
 - an endpoint served subscriber IPs unauthenticated while every auth test passed
 - the NFR harness reported a 100% error rate that was a daemon which never started
 - a TLS test reported a downgrade that never happened
 - a Sentinel config override silently never applied
 - three components were built, tested, and never wired
+- Patroni's bootstrap silently did not create the application database
+  (found by running migrations against a real cluster, not by reading docs)
 
-When a check could plausibly pass for the wrong reason, break it deliberately
-and confirm it fails. Every negative control run this session found something.
+When a check could plausibly pass for the wrong reason, break it
+deliberately and confirm it fails. Every negative control run so far has
+found something.
 
 ---
 
@@ -214,10 +199,14 @@ and confirm it fails. Every negative control run this session found something.
 
 | | |
 |---|---|
-| Task state | this file |
-| DoD scorecard, all findings | `DOD_STATUS_REPORT.md` |
-| Running and testing per persona | `TESTERS_MANUAL.md` |
-| Release notes | `RELEASE_NOTES.md` |
+| Roadmap and phasing | `specification_docs_v2/01_CRD_...` §1.11 |
+| All 92 FRs | `specification_docs_v2/02_SRS_...` |
+| Module designs | `specification_docs_v2/04_MDS_...` (§4.11 NAS, §4.12 PG HA, §4.13 SLA) |
+| Schema | `specification_docs_v2/06_DBD_...` |
+| Infrastructure / HA topology | `specification_docs_v2/08_IDD_...` §8.2a |
+| Incident runbook | `specification_docs_v2/12_OPS_...` |
+| DoD scorecard, findings | `DOD_STATUS_REPORT.md` |
+| Running/testing per persona | `TESTERS_MANUAL.md` |
 | Subscriber portal | `internal/portalui` → `/ui` |
 | Operations console | `internal/staffui` → `/staff` |
 | Browser tests | `e2e/portal.spec.ts`, `e2e/staff.spec.ts` |
