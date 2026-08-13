@@ -138,7 +138,11 @@ func run() error {
 		Tickets:    database.Tickets(),
 		LEA:        database.FUP(),
 		LEAAudit:   database.FUP(),
-		Health:     http.HandlerFunc(healthHandler.GetSubscriberHealth),
+		// Franchise/LCO (FR-FRN-003..006). RevenueStore satisfies both:
+		// the commission engine and the P&L reporting read the same tables.
+		Franchises:       database.Revenue(),
+		SubscriberLister: database.Revenue(),
+		Health:           http.HandlerFunc(healthHandler.GetSubscriberHealth),
 
 		RazorpayWebhookSecret: cfg.RazorpayWebhookSecret,
 	})

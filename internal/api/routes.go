@@ -16,6 +16,7 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/maaransoft/isp-bss-oss/internal/billing"
 	"github.com/maaransoft/isp-bss-oss/internal/middleware"
+	"github.com/maaransoft/isp-bss-oss/internal/revenue"
 	"github.com/maaransoft/isp-bss-oss/pkg/crypto"
 	"github.com/maaransoft/isp-bss-oss/pkg/validate"
 	"github.com/rs/zerolog/log"
@@ -83,7 +84,12 @@ type Handler struct {
 	tickets    TicketAdminQuerier
 	lea        LEAQuerier
 	leaAudit   LEAAuditRecorder
-	health     http.Handler
+	franchises FranchiseQuerier
+	// subscriberLister backs revenue.ListSubscribersHandler, which is a
+	// plain http.HandlerFunc rather than a method on Handler — so the
+	// dependency is held here and passed to it at route-registration time.
+	subscriberLister revenue.SubscriberLister
+	health           http.Handler
 
 	razorpayWebhookSecret string
 }
@@ -105,15 +111,17 @@ type HandlerDeps struct {
 	Wallet   *billing.WalletService
 	KeyStore crypto.KeyStore
 
-	Ledger     LedgerQuerier
-	Sessions   SessionReader
-	SessionCtl SessionController
-	Tasks      TaskEnqueuer
-	Invoices   InvoiceQuerier
-	PDF        PDFGenerator
-	Tickets    TicketAdminQuerier
-	LEA        LEAQuerier
-	LEAAudit   LEAAuditRecorder
+	Ledger           LedgerQuerier
+	Sessions         SessionReader
+	SessionCtl       SessionController
+	Tasks            TaskEnqueuer
+	Invoices         InvoiceQuerier
+	PDF              PDFGenerator
+	Tickets          TicketAdminQuerier
+	LEA              LEAQuerier
+	LEAAudit         LEAAuditRecorder
+	Franchises       FranchiseQuerier
+	SubscriberLister revenue.SubscriberLister
 
 	// Health serves GET /api/v1/subscribers/{id}/health (FR-OBS-004). The
 	// implementation lives in internal/health, which cannot be imported here
@@ -137,16 +145,18 @@ func NewHandler(deps HandlerDeps) *Handler {
 		walletSvc: deps.Wallet,
 		keyStore:  deps.KeyStore,
 
-		ledger:     deps.Ledger,
-		sessions:   deps.Sessions,
-		sessionCtl: deps.SessionCtl,
-		tasks:      deps.Tasks,
-		invoices:   deps.Invoices,
-		pdfGen:     deps.PDF,
-		tickets:    deps.Tickets,
-		lea:        deps.LEA,
-		leaAudit:   deps.LEAAudit,
-		health:     deps.Health,
+		ledger:           deps.Ledger,
+		sessions:         deps.Sessions,
+		sessionCtl:       deps.SessionCtl,
+		tasks:            deps.Tasks,
+		invoices:         deps.Invoices,
+		pdfGen:           deps.PDF,
+		tickets:          deps.Tickets,
+		lea:              deps.LEA,
+		leaAudit:         deps.LEAAudit,
+		franchises:       deps.Franchises,
+		subscriberLister: deps.SubscriberLister,
+		health:           deps.Health,
 
 		razorpayWebhookSecret: deps.RazorpayWebhookSecret,
 	}
@@ -223,6 +233,44 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, jwtSecret string) {
 	// LEA (API-004)
 	mux.Handle("POST /api/v1/lea/lookup",
 		nocWithLea(http.HandlerFunc(h.LEALookup)))
+
+	// Franchise / LCO (FR-FRN-003..006)
+	//
+	// Two tiers. ISP-wide staff (billing_admin, isp_owner) can onboard
+	// partners and read the consolidated view. Franchise-scoped roles reach
+	// only the per-partner routes, and only for their own partner — the
+	// handlers derive that from the caller's token, never from the path, so
+	// the id in the URL cannot widen anyone's visibility.
+	franchiseRead := func(next http.Handler) http.Handler {
+		return auth(middleware.RequireRole(
+			"billing_admin", "isp_owner",
+			"lco", "franchise_admin", "franchise_staff",
+		)(next))
+	}
+
+	mux.Handle("GET /api/v1/franchises",
+		franchiseRead(http.HandlerFunc(h.ListFranchises)))
+	mux.Handle("POST /api/v1/franchises",
+		admin(http.HandlerFunc(h.CreateFranchise)))
+	// Registered before the {franchise_id} pattern would matter: Go 1.22's
+	// mux prefers the more specific literal path, so "consolidated-pnl" is
+	// never parsed as a franchise id. Ordering here is documentation, not
+	// the mechanism.
+	mux.Handle("GET /api/v1/franchises/consolidated-pnl",
+		admin(http.HandlerFunc(h.GetConsolidatedPnL)))
+	mux.Handle("GET /api/v1/franchises/{franchise_id}/pnl",
+		franchiseRead(http.HandlerFunc(h.GetFranchisePnL)))
+
+	// Franchise-scoped subscriber listing. revenue.ListSubscribersHandler and
+	// revenue.FranchiseMiddleware have existed since v2.0 with no route
+	// mounting them; this is that mount. The middleware must wrap the
+	// handler, not the other way round — the handler reads the scope the
+	// middleware injects.
+	if h.subscriberLister != nil {
+		mux.Handle("GET /api/v1/franchises/subscribers",
+			franchiseRead(revenue.FranchiseMiddleware(
+				revenue.ListSubscribersHandler(h.subscriberLister))))
+	}
 
 	// Webhooks (no JWT — uses HMAC)
 	mux.HandleFunc("POST /webhooks/razorpay",

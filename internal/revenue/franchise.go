@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/maaransoft/isp-bss-oss/internal/middleware"
 	"github.com/shopspring/decimal"
@@ -22,6 +23,56 @@ type Franchise struct {
 	Name              string
 	CommissionRatePct decimal.Decimal
 	Status            string
+}
+
+// FranchiseRecord is the API representation of a franchise partner. Distinct
+// from Franchise, which carries only what the commission calculation needs —
+// this adds the contact and audit fields an operator listing partners wants
+// to see, and renders as JSON.
+type FranchiseRecord struct {
+	ID                int       `json:"id"`
+	Name              string    `json:"name"`
+	OwnerName         string    `json:"owner_name"`
+	MobileNumber      string    `json:"mobile_number"`
+	CommissionRatePct string    `json:"commission_rate_pct"`
+	Status            string    `json:"status"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+// FranchisePnL is one partner's profit-and-loss summary (FR-FRN-003).
+//
+// Money is carried as a string for the same reason every other monetary value
+// in this codebase is: NUMERIC read through float64 cannot represent 71.91,
+// and a P&L that does not reconcile to the paisa is not a P&L.
+type FranchisePnL struct {
+	FranchiseID       int    `json:"franchise_id"`
+	FranchiseName     string `json:"franchise_name"`
+	Status            string `json:"status"`
+	CommissionRatePct string `json:"commission_rate_pct"`
+	SubscriberCount   int    `json:"subscriber_count"`
+	RechargeCount     int    `json:"recharge_count"`
+	TotalRecharges    string `json:"total_recharges"`
+	CommissionEarned  string `json:"commission_earned"`
+	// NetToISP is what the ISP keeps after the partner's commission — the
+	// number the "consolidated P&L across all LCO partners" in CRD-FRN-001
+	// actually asks for, rather than leaving the reader to subtract.
+	NetToISP string `json:"net_to_isp"`
+}
+
+// ConsolidatedPnL aggregates every partner (FR-FRN-003).
+type ConsolidatedPnL struct {
+	Partners         []FranchisePnL `json:"partners"`
+	TotalRecharges   string         `json:"total_recharges"`
+	CommissionEarned string         `json:"commission_earned"`
+	NetToISP         string         `json:"net_to_isp"`
+}
+
+// CreateFranchiseRequest is the onboarding payload (FR-FRN-006).
+type CreateFranchiseRequest struct {
+	Name              string `json:"name"`
+	OwnerName         string `json:"owner_name"`
+	MobileNumber      string `json:"mobile_number"`
+	CommissionRatePct string `json:"commission_rate_pct"`
 }
 
 // LCOCommissionEntry is one lco_ledger row: the recharge that earned the

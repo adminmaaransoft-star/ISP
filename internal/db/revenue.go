@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/maaransoft/isp-bss-oss/internal/revenue"
@@ -232,6 +233,192 @@ func (s *RevenueStore) CalculateAndStoreLCOCommission(ctx context.Context, entry
 		return fmt.Errorf("db: store LCO commission for franchise %d: %w", entry.FranchiseID, err)
 	}
 	return nil
+}
+
+// ListFranchises returns franchise partners within a scope. A nil
+// franchiseID means unrestricted (ISP-wide) visibility; a non-nil one
+// returns at most that partner, so a franchise-scoped caller listing
+// partners sees only their own.
+//
+// FR: FR-FRN-004
+func (s *RevenueStore) ListFranchises(ctx context.Context, franchiseID *int) ([]revenue.FranchiseRecord, error) {
+	// Same NULL-guarded-predicate shape as ListSubscribers below, and for
+	// the same reason: one statement means one place the scope filter can
+	// be forgotten.
+	const q = `
+		SELECT id, name, owner_name, mobile_number, commission_rate_pct::text, status, created_at
+		FROM franchises
+		WHERE ($1::int IS NULL OR id = $1::int)
+		ORDER BY id`
+
+	rows, err := s.pool.Query(ctx, q, franchiseID)
+	if err != nil {
+		return nil, fmt.Errorf("db: list franchises: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]revenue.FranchiseRecord, 0, 16)
+	for rows.Next() {
+		var f revenue.FranchiseRecord
+		if err := rows.Scan(&f.ID, &f.Name, &f.OwnerName, &f.MobileNumber,
+			&f.CommissionRatePct, &f.Status, &f.CreatedAt); err != nil {
+			return nil, fmt.Errorf("db: scan franchise row: %w", err)
+		}
+		out = append(out, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterate franchises: %w", err)
+	}
+	return out, nil
+}
+
+// CreateFranchise onboards a partner (FR-FRN-006).
+func (s *RevenueStore) CreateFranchise(ctx context.Context, req revenue.CreateFranchiseRequest) (*revenue.FranchiseRecord, error) {
+	const q = `
+		INSERT INTO franchises (name, owner_name, mobile_number, commission_rate_pct, status)
+		VALUES ($1, $2, $3, $4::numeric, 'active')
+		RETURNING id, name, owner_name, mobile_number, commission_rate_pct::text, status, created_at`
+
+	var f revenue.FranchiseRecord
+	err := s.pool.QueryRow(ctx, q, req.Name, req.OwnerName, req.MobileNumber, req.CommissionRatePct).
+		Scan(&f.ID, &f.Name, &f.OwnerName, &f.MobileNumber, &f.CommissionRatePct, &f.Status, &f.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("db: create franchise %q: %w", req.Name, err)
+	}
+	return &f, nil
+}
+
+// franchisePnLSQL aggregates one row per franchise.
+//
+// The two aggregates come from separate subqueries rather than a single join:
+// joining subscribers and lco_ledger in one pass multiplies rows (a franchise
+// with 3 subscribers and 4 recharges yields 12), which silently inflates both
+// the subscriber count and the recharge totals. That is exactly the class of
+// error a revenue report must not make.
+//
+// COALESCE throughout so a franchise with no subscribers and no recharges
+// reports zeroes rather than being absent — an onboarded partner who has not
+// billed anyone yet is a legitimate, reportable state.
+const franchisePnLSQL = `
+	SELECT f.id,
+	       f.name,
+	       f.status,
+	       f.commission_rate_pct::text,
+	       COALESCE(subs.cnt, 0)                    AS subscriber_count,
+	       COALESCE(led.cnt, 0)                     AS recharge_count,
+	       -- ::numeric(14,2) before ::text on every one of these, not just
+	       -- ::text: COALESCE(numeric_column, 0) promotes the bare integer
+	       -- literal 0 to numeric with no fixed scale, so an idle franchise
+	       -- (nothing in lco_ledger, every COALESCE falls to its default)
+	       -- rendered "0" while an active one rendered "500.00" — the same
+	       -- column reporting a different decimal format depending on
+	       -- whether the franchise has any recharges yet. Found by a test
+	       -- seeding an onboarded-but-idle partner, not by reading the SQL.
+	       COALESCE(led.total_recharges, 0)::numeric(14,2)::text AS total_recharges,
+	       COALESCE(led.commission, 0)::numeric(14,2)::text      AS commission_earned,
+	       (COALESCE(led.total_recharges, 0) - COALESCE(led.commission, 0))::numeric(14,2)::text AS net_to_isp
+	  FROM franchises f
+	  LEFT JOIN (
+	      SELECT franchise_id, count(*) AS cnt
+	        FROM subscribers
+	       WHERE franchise_id IS NOT NULL
+	       GROUP BY franchise_id
+	  ) subs ON subs.franchise_id = f.id
+	  LEFT JOIN (
+	      SELECT franchise_id,
+	             count(*)                  AS cnt,
+	             sum(recharge_amount)      AS total_recharges,
+	             sum(commission_amount)    AS commission
+	        FROM lco_ledger
+	       WHERE ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
+	         AND ($3::timestamptz IS NULL OR created_at <  $3::timestamptz)
+	       GROUP BY franchise_id
+	  ) led ON led.franchise_id = f.id
+	 WHERE ($1::int IS NULL OR f.id = $1::int)
+	 ORDER BY f.id`
+
+// GetFranchisePnL returns the P&L for one partner over an optional date
+// window. Returns (nil, nil) when the franchise does not exist — the same
+// not-found convention TicketStore.UpdateTicketAdmin uses, chosen because
+// internal/db imports internal/api (not the reverse), so a sentinel error
+// declared here could not be compared against in the HTTP handler.
+//
+// A missing franchise must not be reported as an all-zero row: "no such
+// partner" and "onboarded but has billed nothing" are different answers.
+//
+// FR: FR-FRN-003
+func (s *RevenueStore) GetFranchisePnL(ctx context.Context, franchiseID int, from, to *time.Time) (*revenue.FranchisePnL, error) {
+	rows, err := s.listPnL(ctx, &franchiseID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return &rows[0], nil
+}
+
+// ListConsolidatedPnL returns every partner's P&L plus the ISP-wide totals
+// (FR-FRN-003 — "the parent ISP sees a consolidated P&L across all LCO
+// partners", CRD-FRN-001).
+func (s *RevenueStore) ListConsolidatedPnL(ctx context.Context, from, to *time.Time) (*revenue.ConsolidatedPnL, error) {
+	partners, err := s.listPnL(ctx, nil, from, to)
+	if err != nil {
+		return nil, err
+	}
+
+	// Totals are summed in Go from the same decimal values the per-partner
+	// rows report, not recomputed in a second query: two queries could
+	// disagree if a recharge lands between them, and a consolidated total
+	// that does not equal the sum of its parts is worse than no total.
+	totalRecharges, commission, net := decimal.Zero, decimal.Zero, decimal.Zero
+	for _, p := range partners {
+		r, err := parseDecimal(p.TotalRecharges)
+		if err != nil {
+			return nil, err
+		}
+		c, err := parseDecimal(p.CommissionEarned)
+		if err != nil {
+			return nil, err
+		}
+		n, err := parseDecimal(p.NetToISP)
+		if err != nil {
+			return nil, err
+		}
+		totalRecharges = totalRecharges.Add(r)
+		commission = commission.Add(c)
+		net = net.Add(n)
+	}
+
+	return &revenue.ConsolidatedPnL{
+		Partners:         partners,
+		TotalRecharges:   totalRecharges.StringFixed(2),
+		CommissionEarned: commission.StringFixed(2),
+		NetToISP:         net.StringFixed(2),
+	}, nil
+}
+
+func (s *RevenueStore) listPnL(ctx context.Context, franchiseID *int, from, to *time.Time) ([]revenue.FranchisePnL, error) {
+	rows, err := s.pool.Query(ctx, franchisePnLSQL, franchiseID, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("db: franchise P&L: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]revenue.FranchisePnL, 0, 16)
+	for rows.Next() {
+		var p revenue.FranchisePnL
+		if err := rows.Scan(&p.FranchiseID, &p.FranchiseName, &p.Status, &p.CommissionRatePct,
+			&p.SubscriberCount, &p.RechargeCount, &p.TotalRecharges,
+			&p.CommissionEarned, &p.NetToISP); err != nil {
+			return nil, fmt.Errorf("db: scan franchise P&L row: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterate franchise P&L: %w", err)
+	}
+	return out, nil
 }
 
 // ListSubscribers returns subscribers within a franchise scope. A nil
