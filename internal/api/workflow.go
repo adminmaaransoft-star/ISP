@@ -12,6 +12,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/maaransoft/isp-bss-oss/internal/billing"
+	"github.com/maaransoft/isp-bss-oss/internal/inventory"
 	"github.com/maaransoft/isp-bss-oss/internal/middleware"
 	"github.com/maaransoft/isp-bss-oss/internal/workflow"
 )
@@ -281,12 +282,59 @@ func (h *Handler) performGatedAction(r *http.Request, req *workflow.ApprovalRequ
 			}
 		}
 		enqueuePoDIfSessionActive(ctx, h, req.SubscriberID)
+		h.openCPERecoveryTasks(ctx, req.SubscriberID, updated.Username)
 		return nil, nil
 
 	default:
 		return nil, errors.New("unknown action type: " + string(req.ActionType))
 	}
 }
+
+// openCPERecoveryTasks files a field task for each device a terminated
+// subscriber still holds (MDS §4.16).
+//
+// The device deliberately stays 'issued' rather than being auto-returned to
+// stock: flipping it would make the count FR-INV-003's reorder alerts are
+// computed from claim hardware is on the shelf while it is still in a
+// former customer's flat. Someone has to physically collect it, and that is
+// what the task tracks.
+//
+// Best-effort throughout — a subscriber whose service has been terminated
+// stays terminated whether or not the recovery paperwork could be filed.
+func (h *Handler) openCPERecoveryTasks(ctx context.Context, subscriberID int, username string) {
+	if h.inventory == nil || h.fieldTasks == nil {
+		return
+	}
+
+	issued := inventory.StatusIssued
+	devices, err := h.inventory.ListDevices(ctx, &issued, nil, &subscriberID)
+	if err != nil {
+		log.Error().Err(err).Int("subscriber_id", subscriberID).
+			Msg("api: could not list CPE for a terminated subscriber; recovery tasks not created")
+		return
+	}
+
+	for _, d := range devices {
+		sid := subscriberID
+		if _, err := h.fieldTasks.CreateFieldTask(ctx, workflow.FieldTask{
+			Title: "Recover CPE " + d.SerialNumber + " from " + username,
+			Description: "Subscriber terminated. Collect " + d.DeviceType +
+				" (serial " + d.SerialNumber + ") and mark it returned or faulty in inventory.",
+			SubscriberID: &sid,
+			AssignedTo:   cpeRecoveryQueue,
+			CreatedBy:    middleware.SubjectFromContext(ctx),
+		}); err != nil {
+			log.Error().Err(err).Str("serial", d.SerialNumber).
+				Msg("api: could not create a CPE recovery task")
+		}
+	}
+}
+
+// cpeRecoveryQueue is where unassigned recovery work lands. field_tasks
+// assigns to a username rather than a role (DBD §6.2), and termination has
+// no way to pick a specific technician — so it goes to a queue name a
+// dispatcher reassigns from, rather than being guessed at here.
+const cpeRecoveryQueue = "field_queue"
 
 type rejectRequest struct {
 	Reason string `json:"reason"`

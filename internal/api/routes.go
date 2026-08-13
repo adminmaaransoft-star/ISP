@@ -90,6 +90,8 @@ type Handler struct {
 	subCache   SubscriberCacheInvalidator
 	approvals  ApprovalQuerier
 	fieldTasks FieldTaskQuerier
+	leads      LeadQuerier
+	inventory  InventoryQuerier
 	// subscriberLister backs revenue.ListSubscribersHandler, which is a
 	// plain http.HandlerFunc rather than a method on Handler — so the
 	// dependency is held here and passed to it at route-registration time.
@@ -132,6 +134,8 @@ type HandlerDeps struct {
 	SubCache         SubscriberCacheInvalidator
 	Approvals        ApprovalQuerier
 	FieldTasks       FieldTaskQuerier
+	Leads            LeadQuerier
+	Inventory        InventoryQuerier
 
 	// Health serves GET /api/v1/subscribers/{id}/health (FR-OBS-004). The
 	// implementation lives in internal/health, which cannot be imported here
@@ -171,6 +175,8 @@ func NewHandler(deps HandlerDeps) *Handler {
 		subCache:         deps.SubCache,
 		approvals:        deps.Approvals,
 		fieldTasks:       deps.FieldTasks,
+		leads:            deps.Leads,
+		inventory:        deps.Inventory,
 		health:           deps.Health,
 
 		razorpayWebhookSecret: deps.RazorpayWebhookSecret,
@@ -256,6 +262,57 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, jwtSecret string) {
 		staffRead(http.HandlerFunc(h.ListFieldTasks)))
 	mux.Handle("PATCH /api/v1/field-tasks/{id}",
 		csrOrTech(http.HandlerFunc(h.UpdateFieldTask)))
+
+	// CRM lead pipeline (FR-CRM-001..003 | MDS §4.16)
+	//
+	// Sales work, so csr/technician reach it alongside owners — and
+	// franchise roles reach their own pipeline, scoped from their token the
+	// same way their subscribers and P&L are. Conversion is the exception:
+	// it creates a billable subscriber, so it sits on the same
+	// billing_admin/isp_owner tier as POST /subscribers.
+	leadWrite := func(next http.Handler) http.Handler {
+		return auth(middleware.RequireRole(
+			"csr", "technician", "billing_admin", "isp_owner",
+			"lco", "franchise_admin", "franchise_staff",
+		)(next))
+	}
+
+	// Registered before {id} would matter: Go 1.22's mux prefers the more
+	// specific literal, so "funnel" is never parsed as a lead id.
+	mux.Handle("GET /api/v1/leads/funnel",
+		leadWrite(http.HandlerFunc(h.GetLeadFunnel)))
+	mux.Handle("POST /api/v1/leads",
+		leadWrite(http.HandlerFunc(h.CreateLead)))
+	mux.Handle("GET /api/v1/leads",
+		leadWrite(http.HandlerFunc(h.ListLeads)))
+	mux.Handle("GET /api/v1/leads/{id}",
+		leadWrite(http.HandlerFunc(h.GetLead)))
+	mux.Handle("PATCH /api/v1/leads/{id}",
+		leadWrite(http.HandlerFunc(h.UpdateLead)))
+	mux.Handle("POST /api/v1/leads/{id}/convert",
+		admin(http.HandlerFunc(h.ConvertLead)))
+
+	// CPE inventory (FR-INV-001..003 | MDS §4.16). Technicians handle
+	// hardware day to day; purchases and device-type catalogue changes are
+	// procurement, so they stay with billing_admin/isp_owner.
+	mux.Handle("GET /api/v1/cpe/types",
+		staffRead(http.HandlerFunc(h.ListDeviceTypes)))
+	mux.Handle("POST /api/v1/cpe/types",
+		admin(http.HandlerFunc(h.CreateDeviceType)))
+	mux.Handle("GET /api/v1/cpe/devices",
+		staffRead(http.HandlerFunc(h.ListDevices)))
+	mux.Handle("POST /api/v1/cpe/devices",
+		csrOrTech(http.HandlerFunc(h.CreateDevice)))
+	mux.Handle("POST /api/v1/cpe/devices/{serial}/issue",
+		csrOrTech(http.HandlerFunc(h.IssueDevice)))
+	mux.Handle("POST /api/v1/cpe/devices/{serial}/return",
+		csrOrTech(http.HandlerFunc(h.ReturnDevice)))
+	mux.Handle("GET /api/v1/cpe/stock",
+		staffRead(http.HandlerFunc(h.GetStockLevels)))
+	mux.Handle("GET /api/v1/cpe/purchases",
+		admin(http.HandlerFunc(h.ListPurchases)))
+	mux.Handle("POST /api/v1/cpe/purchases",
+		admin(http.HandlerFunc(h.RecordPurchase)))
 
 	// Wallets (API-003)
 	mux.Handle("POST /api/v1/wallets/recharge",
@@ -345,13 +402,50 @@ func (h *Handler) CreateSubscriber(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
+	hash, err := hashSubscriberPassword(req.Password)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "ERR_INTERNAL", "password hash failed")
 		return
 	}
 
-	rec := SubscriberRecord{
+	created, err := h.db.CreateSubscriber(r.Context(), subscriberRecordFrom(req), hash)
+	if err != nil {
+		if isUniqueViolation(err) {
+			writeError(w, http.StatusConflict, "ERR_CONFLICT", "CAF number or username already exists")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "ERR_INTERNAL", "create subscriber failed")
+		return
+	}
+
+	h.persistKYC(r.Context(), created.ID, req.Aadhaar, req.PAN)
+
+	middleware.Audit(r.Context(), "subscriber.create", strconv.Itoa(created.ID), nil)
+	writeJSON(w, http.StatusCreated, created)
+}
+
+// ── Shared subscriber-creation steps ─────────────────────────────────────────
+//
+// CreateSubscriber and ConvertLead (internal/api/crm.go) both need to hash a
+// password, build the same starting SubscriberRecord and store encrypted
+// KYC. These are extracted rather than copied: two divergent copies of a
+// PII-encryption path is exactly how one of them ends up quietly skipping
+// the encryption step (FR-SEC-002, MDS §4.16).
+
+// hashSubscriberPassword applies the bcrypt cost this codebase standardises
+// on for subscriber credentials.
+func hashSubscriberPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	if err != nil {
+		return "", err
+	}
+	return string(hash), nil
+}
+
+// subscriberRecordFrom builds the starting state every new subscriber shares:
+// active, undunned, KYC pending, empty wallet.
+func subscriberRecordFrom(req CreateSubscriberRequest) SubscriberRecord {
+	return SubscriberRecord{
 		CAFNumber:       req.CAFNumber,
 		Username:        req.Username,
 		MobileNumber:    req.MobileNumber,
@@ -363,36 +457,33 @@ func (h *Handler) CreateSubscriber(w http.ResponseWriter, r *http.Request) {
 		KYCStatus:       "pending",
 		WalletBalance:   "0.00",
 	}
+}
 
-	created, err := h.db.CreateSubscriber(r.Context(), rec, string(hash))
-	if err != nil {
-		if isUniqueViolation(err) {
-			writeError(w, http.StatusConflict, "ERR_CONFLICT", "CAF number or username already exists")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "ERR_INTERNAL", "create subscriber failed")
+// persistKYC encrypts and stores Aadhaar/PAN if either was supplied.
+//
+// Best-effort by design, matching the behaviour this path has always had: a
+// subscriber who exists without a KYC record can re-submit it, whereas
+// failing the whole creation would leave a paying customer uncreated over an
+// optional document.
+func (h *Handler) persistKYC(ctx context.Context, subscriberID int, aadhaar, pan string) {
+	if (aadhaar == "" && pan == "") || h.keyStore == nil || h.kycDB == nil {
 		return
 	}
-
-	// Encrypt PII if provided
-	if (req.Aadhaar != "" || req.PAN != "") && h.keyStore != nil {
-		enc, err := crypto.NewAESEncryptor(h.keyStore)
-		if err == nil {
-			aadhaarEnc, panEnc := "", ""
-			if req.Aadhaar != "" {
-				aadhaarEnc, _ = enc.Encrypt(req.Aadhaar)
-			}
-			if req.PAN != "" {
-				panEnc, _ = enc.Encrypt(req.PAN)
-			}
-			if err := h.kycDB.UpsertKYC(r.Context(), created.ID, aadhaarEnc, panEnc, h.keyStore.ActiveVersion()); err != nil {
-				log.Warn().Err(err).Msg("api: KYC persist failed; subscriber created without KYC")
-			}
-		}
+	enc, err := crypto.NewAESEncryptor(h.keyStore)
+	if err != nil {
+		log.Warn().Err(err).Msg("api: KYC encryptor unavailable; subscriber created without KYC")
+		return
 	}
-
-	middleware.Audit(r.Context(), "subscriber.create", strconv.Itoa(created.ID), nil)
-	writeJSON(w, http.StatusCreated, created)
+	aadhaarEnc, panEnc := "", ""
+	if aadhaar != "" {
+		aadhaarEnc, _ = enc.Encrypt(aadhaar) //nolint:errcheck // logged via the persist error below
+	}
+	if pan != "" {
+		panEnc, _ = enc.Encrypt(pan) //nolint:errcheck
+	}
+	if err := h.kycDB.UpsertKYC(ctx, subscriberID, aadhaarEnc, panEnc, h.keyStore.ActiveVersion()); err != nil {
+		log.Warn().Err(err).Msg("api: KYC persist failed; subscriber created without KYC")
+	}
 }
 
 // GetSubscriber handles GET /api/v1/subscribers/{id}.

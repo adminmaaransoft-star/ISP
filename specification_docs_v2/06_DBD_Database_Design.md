@@ -387,6 +387,68 @@ Deliberately independent of `tickets` — CRD-EXP-002 asks for task assignment
 (subscriber-facing support vs. internal staff coordination) with different
 lifecycles (no SLA engine, no routing rules here).
 
+### Table: `leads` *(new — FR-CRM-001..003, migration 027)*
+**Module:** MOD-CRM | MDS §4.16
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `full_name` | `VARCHAR(200)` | NOT NULL | |
+| `mobile_number` | `VARCHAR(20)` | NOT NULL | E.164, same `chk_leads_mobile_e164` rule as subscribers/franchises (migration 020) |
+| `email` | `VARCHAR(255)` | NULLABLE | |
+| `source` | `VARCHAR(50)` | NOT NULL | `walk_in`, `referral`, `website`, `campaign`, `franchise`, `other` — the dimension FR-CRM-003 reports conversion rate by |
+| `status` | `VARCHAR(20)` | NOT NULL DEFAULT `new` CHECK IN (`new`,`contacted`,`qualified`,`converted`,`lost`) | |
+| `franchise_id` | `INTEGER` | FK → franchises.id NULLABLE | Leads are franchise-scoped like subscribers, so an LCO's pipeline stays theirs |
+| `assigned_to_username` | `VARCHAR(100)` | NULLABLE | Sales owner |
+| `notes` | `TEXT` | NULLABLE | |
+| `lost_reason` | `TEXT` | NULLABLE | |
+| `converted_subscriber_id` | `INTEGER` | FK → subscribers.id NULLABLE | Set atomically with `status='converted'` |
+| `created_at` / `updated_at` | `TIMESTAMPTZ` | DEFAULT NOW() | `set_updated_at()` trigger |
+| `converted_at` | `TIMESTAMPTZ` | NULLABLE | |
+| `CONSTRAINT chk_lead_converted_has_subscriber` | | a `converted` lead must carry `converted_subscriber_id`, and a non-converted one must not | Makes "converted but pointing at nothing" unstorable — the state FR-CRM-003's conversion rate would otherwise silently miscount |
+
+### Table: `cpe_device_types` *(new — FR-INV-001, FR-INV-003, migration 027)*
+**Module:** MOD-INV | MDS §4.16
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `name` | `VARCHAR(100)` | NOT NULL UNIQUE | e.g. "TP-Link Archer C6" |
+| `vendor` | `VARCHAR(100)` | NOT NULL | |
+| `reorder_threshold` | `INTEGER` | NOT NULL DEFAULT 5 CHECK >= 0 | In-stock count at or below which FR-INV-003's low-stock alert fires |
+| `created_at` | `TIMESTAMPTZ` | DEFAULT NOW() | |
+
+### Table: `cpe_devices` *(new — FR-INV-001..002, migration 027)*
+**Module:** MOD-INV | MDS §4.16
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `device_type_id` | `INTEGER` | NOT NULL, FK → cpe_device_types.id | |
+| `serial_number` | `VARCHAR(100)` | NOT NULL UNIQUE | The physical identity; uniqueness is what stops one router being tracked twice |
+| `mac_address` | `VARCHAR(17)` | NULLABLE UNIQUE | |
+| `status` | `VARCHAR(20)` | NOT NULL DEFAULT `in_stock` CHECK IN (`in_stock`,`issued`,`returned`,`faulty`) | |
+| `location` | `VARCHAR(100)` | NULLABLE | Warehouse / van / office |
+| `subscriber_id` | `INTEGER` | FK → subscribers.id NULLABLE | Current holder; cleared on return (MDS §4.16 — current state only, no assignment ledger) |
+| `issued_at` | `TIMESTAMPTZ` | NULLABLE | |
+| `notes` | `TEXT` | NULLABLE | |
+| `created_at` / `updated_at` | `TIMESTAMPTZ` | DEFAULT NOW() | `set_updated_at()` trigger |
+| `CONSTRAINT chk_cpe_issued_has_subscriber` | | `status='issued'` requires `subscriber_id`, and any other status forbids it | An "issued to nobody" or "in stock but assigned" row is not a state the warehouse can actually be in |
+
+### Table: `cpe_purchases` *(new — FR-INV-003, migration 027)*
+**Module:** MOD-INV | MDS §4.16
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `device_type_id` | `INTEGER` | NOT NULL, FK → cpe_device_types.id | |
+| `vendor` | `VARCHAR(100)` | NOT NULL | Recorded per purchase as well as per type: the same model is often sourced from different distributors |
+| `quantity` | `INTEGER` | NOT NULL CHECK > 0 | |
+| `unit_cost` | `NUMERIC(12,2)` | NOT NULL CHECK >= 0 | |
+| `invoice_ref` | `VARCHAR(100)` | NULLABLE | |
+| `purchased_by_username` | `VARCHAR(100)` | NOT NULL | |
+| `purchased_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT NOW() | |
+
 ### Table: `revenue_snapshots` *(new — FR-REV-001)*
 **Module:** MOD-REV
 

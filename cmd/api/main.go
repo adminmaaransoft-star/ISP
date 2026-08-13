@@ -153,7 +153,12 @@ func run() error {
 		// migration and a store, but nothing else.
 		Approvals:  database.Workflow(),
 		FieldTasks: database.Workflow(),
-		Health:     http.HandlerFunc(healthHandler.GetSubscriberHealth),
+		// CRM lead pipeline and CPE inventory (FR-CRM, FR-INV). Separate
+		// stores: they share a migration and the conversion moment, nothing
+		// else.
+		Leads:     database.CRM(),
+		Inventory: database.Inventory(),
+		Health:    http.HandlerFunc(healthHandler.GetSubscriberHealth),
 
 		RazorpayWebhookSecret: cfg.RazorpayWebhookSecret,
 	})

@@ -164,6 +164,12 @@ func (d *DB) NAS() *NASStore { return &NASStore{pool: d.pool} }
 // api.FieldTaskQuerier.
 func (d *DB) Workflow() *WorkflowStore { return &WorkflowStore{pool: d.pool} }
 
+// CRM returns the store satisfying api.LeadQuerier.
+func (d *DB) CRM() *CRMStore { return &CRMStore{pool: d.pool} }
+
+// Inventory returns the store satisfying api.InventoryQuerier.
+func (d *DB) Inventory() *InventoryStore { return &InventoryStore{pool: d.pool} }
+
 // ── Money helpers ───────────────────────────────────────────────────────────
 
 // parseDecimal converts a NUMERIC-as-text column into a decimal.
@@ -181,6 +187,10 @@ func parseDecimal(s string) (decimal.Decimal, error) {
 	}
 	return d, nil
 }
+
+// decimalFromInt lifts a count into a decimal so it can multiply money
+// without the result ever passing through float64.
+func decimalFromInt(n int) decimal.Decimal { return decimal.NewFromInt(int64(n)) }
 
 // ── Query helpers ───────────────────────────────────────────────────────────
 

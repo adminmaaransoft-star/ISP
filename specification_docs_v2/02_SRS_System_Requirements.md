@@ -174,17 +174,17 @@
 
 | FR ID | Requirement | CRD Ref | Module |
 |---|---|---|---|
-| FR-CRM-001 | Track prospects (pre-subscriber leads) with contact info, source, and status through a pipeline (new → contacted → converted/lost) | CRD-EXP-002 | new module |
-| FR-CRM-002 | Converting a lead to a subscriber must carry over prospect data and record the conversion for funnel reporting | CRD-EXP-002 | new module |
-| FR-CRM-003 | Report lead-to-subscriber conversion rate and pipeline funnel by source/stage | CRD-EXP-002 | new module |
+| FR-CRM-001 | Track prospects (pre-subscriber leads) with contact info, source, and status through a pipeline (new → contacted → qualified → converted/lost), franchise-scoped like subscribers | CRD-EXP-002 | MDS §4.16 |
+| FR-CRM-002 | Converting a lead to a subscriber must carry over prospect data, create the subscriber and mark the lead converted in one transaction, and be safe against two staff converting the same lead concurrently | CRD-EXP-002 | MDS §4.16 |
+| FR-CRM-003 | Report lead-to-subscriber conversion rate and pipeline funnel by source/stage | CRD-EXP-002 | MDS §4.16 |
 
 ### Inventory / CPE Management *(new — gap CRD-EXP-002, v3)*
 
 | FR ID | Requirement | CRD Ref | Module |
 |---|---|---|---|
-| FR-INV-001 | Track CPE inventory: device type, serial number, vendor, warehouse/location, and status (in-stock / issued / returned / faulty) | CRD-EXP-002 | new module |
-| FR-INV-002 | Issuing a CPE during onboarding must link the device serial number to the subscriber record | CRD-EXP-002 | new module |
-| FR-INV-003 | Track vendor purchase records and low-stock alerts per device type | CRD-EXP-002 | new module |
+| FR-INV-001 | Track CPE inventory: device type, serial number, vendor, warehouse/location, and status (in-stock / issued / returned / faulty) | CRD-EXP-002 | MDS §4.16 |
+| FR-INV-002 | Issuing a CPE during onboarding must link the device serial number to the subscriber record, and one device must never be issuable to two subscribers | CRD-EXP-002 | MDS §4.16 |
+| FR-INV-003 | Track vendor purchase records and low-stock alerts per device type, evaluated at issuance/purchase time rather than by polling | CRD-EXP-002 | MDS §4.16 |
 
 ### Task & Approval Workflows *(new — gap CRD-EXP-002, v3)*
 
@@ -277,8 +277,8 @@
 | Partner / 3rd-Party Integration *(v3)* | 3 | new module | TBD — Module design pending |
 | Mobile *(v3)* | 2 | MDS §4.9 (extend) | TBD — Module design pending |
 | Helpdesk / SLA *(v3)* | 3 | MDS §4.13 | TBD — Module design complete (2026-08-12), implementation/tests pending |
-| CRM / Lead Management *(v3)* | 3 | new module | TBD — Module design pending |
-| Inventory / CPE *(v3)* | 3 | new module | TBD — Module design pending |
+| CRM / Lead Management *(v3)* | 3 | MDS §4.16 | TST INT-CRM-001..003 |
+| Inventory / CPE *(v3)* | 3 | MDS §4.16 | TST INT-INV-001..003 |
 | Task & Approval Workflows *(v3)* | 2 | MDS §4.15 | TST INT-WFL-001..003 |
 | Announcements *(v3)* | 2 | MDS §4.7 (extend) | TBD — Module design pending |
 | General Reporting *(v3)* | 3 | MDS §4.8 (extend) | TBD — Module design pending |

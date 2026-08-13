@@ -945,3 +945,115 @@ POST /approvals/{id}/reject  → RejectApprovalRequest (atomic) — never execut
   `action_type`) — an approval that executed the underlying action and had
   it fail (e.g. balance moved between request and approval) is the one case
   where an operator must look, not just reconcile later.
+
+## 4.16 Module 16: CRM Lead Pipeline & CPE Inventory *(new — gap CRD-EXP-002, FR-CRM-001..003, FR-INV-001..003)*
+
+**Module ID:** MOD-CRM, MOD-INV | **SAD Ref:** SAD-COMP-004 | **FR:** FR-CRM-001..003, FR-INV-001..003
+
+### Why these two ship together
+
+They are separate domains — a sales pipeline and a hardware warehouse — and
+they get separate packages (`internal/crm`, `internal/inventory`) and
+separate stores. What couples them is one moment: a lead converting into a
+paying subscriber is the same moment a CPE leaves the shelf and goes to that
+subscriber's flat. FR-CRM-002 ("converting a lead must carry over prospect
+data") and FR-INV-002 ("issuing a CPE during onboarding must link the serial
+to the subscriber") are two halves of one transaction boundary, and
+designing them a phase apart would mean designing that boundary twice.
+
+### The conversion handoff, and the race it has to survive
+
+`CreateSubscriber` today validates, bcrypts the password, inserts the
+subscriber, then encrypts and stores KYC — with KYC deliberately best-effort
+(a failure is logged, the subscriber still exists). Conversion cannot simply
+call it and then mark the lead, because that sequence has a failure mode
+subscriber creation alone does not: **two staff converting the same lead
+concurrently produces two real, billable subscribers from one prospect**, and
+FR-CRM-003's conversion rate then counts that lead twice.
+
+So conversion claims the lead first, with the same atomic conditional UPDATE
+MDS §4.15 uses for approval decisions:
+
+```sql
+UPDATE leads SET status='converted', converted_subscriber_id=...
+ WHERE id=$1 AND status <> 'converted'
+```
+
+Only one caller matches a not-yet-converted row; the loser is told the lead
+is already converted rather than going on to create a second subscriber. The
+claim and the subscriber insert run in **one transaction** (both stores share
+the pool, so `inTx` spans them), which is stricter than the existing
+subscriber/KYC pairing — and deliberately so: a half-finished KYC record is
+recoverable by re-submitting, whereas a duplicate subscriber has already been
+issued a username, a CAF number and a bill.
+
+**A dedicated `POST /leads/{id}/convert` rather than an optional `lead_id` on
+`POST /subscribers`.** The endpoint carries over the lead's name, mobile and
+email and asks only for what a subscriber needs and a lead does not
+(username, password, caf_number, plan_id, registered_state). Threading a
+`lead_id` through the existing endpoint instead would leave the carry-over to
+the caller — who could pass a mobile number that disagrees with the lead's,
+quietly breaking the provenance FR-CRM-002 exists to record — and would make
+"did this create a conversion?" invisible in the response.
+
+**The shared work is extracted, not duplicated.** Validation, bcrypt and KYC
+encryption move into one internal helper both `CreateSubscriber` and
+`ConvertLead` call. Two copies of the password-hashing and PII-encryption
+path is exactly the kind of drift that ends with one of them quietly missing
+an encryption step.
+
+### CPE issuance: optional at conversion, and never fatal to it
+
+Conversion accepts an optional `cpe_serial`. When present, the device is
+claimed with the same conditional-update pattern (`WHERE status='in_stock'`),
+which is what stops one physical router from being issued to two subscribers.
+
+Crucially, a CPE failure does **not** roll back the subscriber. Once the
+conversion transaction commits, that person is a customer who can be billed
+and can authenticate; refusing to create them because the warehouse was out
+of stock would be the tail wagging the dog. An issuance failure is reported
+in the response and logged, leaving the device to be issued later through
+`POST /cpe/{serial}/issue` — the same endpoint used when no serial was named
+at conversion at all.
+
+### Low-stock alerting is event-driven, not another scanner
+
+This codebase has four polling scanners (FUP, dunning, SLA, auto-renewal),
+and a fifth would be the obvious-looking choice. It would also be wrong here:
+stock levels change *only* when a device is issued or a purchase is recorded,
+both of which are already code paths we control. Checking the threshold at
+those two points is exact and immediate, where a 15-minute poll would be
+strictly later and mostly redundant work. `GET /cpe/low-stock` serves the
+dashboard view of the same computation.
+
+### Assignment history: current state only, and what that costs
+
+`cpe_devices` carries the current `subscriber_id`, cleared on return. There
+is no per-assignment ledger, so "every device this subscriber has ever held"
+is not answerable from the schema — only "what they hold now," plus whatever
+the audit log recorded at issuance time. FR-INV-002 asks to link a serial to
+a subscriber, which this satisfies; a full `cpe_assignments` history table is
+a reasonable later addition and is called out here so its absence is a
+recorded decision rather than an oversight.
+
+### Termination opens a recovery task rather than silently restocking
+
+When an approved termination executes (MDS §4.15), any CPE still issued to
+that subscriber gets a `field_tasks` row assigning device recovery to the
+technician queue — reusing FR-WFL-002 rather than inventing a second
+work-tracking mechanism. The device deliberately stays `issued` until someone
+physically confirms it is back: auto-flipping it to `returned` would make the
+stock count claim hardware is on the shelf while it is still in a former
+customer's flat, and that number is what FR-INV-003's reorder alerts are
+computed from.
+
+### Key Metrics
+
+- `crm_leads_total` (counter, labels: `status`) — pipeline movement; the
+  funnel in FR-CRM-003 is computed from the table, this tracks the flow
+- `crm_lead_conversion_conflicts_total` (counter) — concurrent conversions
+  refused by the atomic claim. Expected to be near-zero; a rising value means
+  two operators are working the same leads
+- `inventory_cpe_issued_total` / `inventory_low_stock_types` (counter /
+  gauge) — issuance volume, and how many device types are currently under
+  their reorder threshold

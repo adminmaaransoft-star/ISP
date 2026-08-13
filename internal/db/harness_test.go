@@ -38,6 +38,18 @@ var truncateOrder = []string{
 	"tickets",
 	"notification_log",
 	"notification_templates",
+	// Workflow (migration 026) and CRM/inventory (027). Most of these would
+	// be taken by CASCADE from subscribers anyway, but cpe_device_types
+	// references nothing that is truncated, so it would survive between
+	// tests and collide on its unique name — listing them all keeps the
+	// dependency order this slice documents actually true.
+	"payment_refunds",
+	"approval_requests",
+	"field_tasks",
+	"leads",
+	"cpe_purchases",
+	"cpe_devices",
+	"cpe_device_types",
 	"wallet_ledgers",
 	"invoices",
 	"gst_rates",
