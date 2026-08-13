@@ -821,3 +821,127 @@ directly rather than waiting up to an hour for the dunning scanner to notice.
 - `billing_lifecycle_actions_total` (counter, labels: `action` =
   plan_change/terminate/adjustment/refund) — staff-lifecycle action volume,
   the same shape as `billing_dunning_transitions_total`
+
+## 4.15 Module 15: Task & Approval Workflows *(new — gap BO-007, FR-WFL-001..002)*
+
+**Module ID:** MOD-WFL | **SAD Ref:** SAD-COMP-004 (extends MOD-BILLC) | **FR:** FR-WFL-001..002
+
+### What this closes
+
+CRD-EXP-002 asks for "second-approver sign-off" before a sensitive account
+action takes effect — named examples: large wallet credits, plan downgrades,
+termination. MDS §4.14 built exactly the three highest-stakes actions this
+would gate (staff wallet credit, refund, termination) as immediate,
+single-operator actions with no second party in the loop: a single
+`billing_admin` token can move money or end an account unilaterally, with
+only an audit-log entry after the fact. This module inserts a second,
+distinct approver *before* the action executes, not just a record of it
+having happened.
+
+### Scope: which actions are gated, and why not more
+
+Gated: **wallet credit adjustments**, **refunds**, and **termination** — the
+three the task explicitly names. Debit adjustments are left ungated:
+a debit only ever *reduces* what a subscriber can spend and is typically
+itself a correction of an earlier erroneous credit, so gating it would add
+friction to the safer direction of the same feature while leaving the
+risky direction (crediting money, or ending service) exactly as gated as
+before. Plan-change is left ungated too, even though CRD-EXP-002 mentions
+"plan downgrades": FR-LC-001 (MDS §4.14) already computes the new
+`plan_expiry` deterministically from both plans' price and validity — there
+is no free-form amount an operator chooses, which is the specific risk a
+second approver exists to catch. Extending the gate to plan-change is a
+reasonable future step but not one this pass forces.
+
+### Design decisions, and why
+
+**A request-then-decide model, not a hold-and-notify one.** The three gated
+endpoints (`POST /subscribers/{id}/adjustments` with `direction=credit`,
+`/refunds`, `/terminate`) now create an `approval_requests` row and return
+`202 Accepted` instead of performing the action. Nothing happens to the
+wallet or the subscriber's status until a second, different staff member
+calls `POST /approvals/{id}/approve`. This is the only way to honor "before
+taking effect" literally — a design that executed first and asked for
+sign-off after would be an audit trail, not an approval gate.
+
+**The self-approval guarantee is enforced twice, not once.** The API handler
+checks `decider != requested_by` before attempting anything; the schema
+carries the identical rule as `CONSTRAINT chk_approval_distinct_approver`.
+Neither is redundant: the app check produces a clean 403 for the normal
+case, while the constraint is what makes self-approval structurally
+impossible even from a future code path (a script, a different handler, a
+bug) that forgets to check.
+
+**Claiming a request is a single atomic conditional UPDATE, because two
+approvers can race.** `ClaimApprovalRequest` runs `UPDATE approval_requests
+SET status='approved', decided_by_username=$actor ... WHERE id=$1 AND
+status='pending'`. Only one of two concurrent `/approve` calls on the same
+request can match `status='pending'`; the loser sees zero rows affected and
+is told the request was already decided, rather than both callers going on
+to execute the underlying wallet debit or credit twice. Reject uses the
+identical atomic claim, straight to `rejected`, for the same reason —
+a reject racing an approve must not let both happen.
+
+**`approved` is a persisted, not transient, intermediate status.** Between
+the claim and the underlying action actually executing (`FinalizeApprovalExecution`
+writing `executed` or `execution_failed`), a request can be observed sitting
+at `approved`. This is deliberate: if the process crashes in that window,
+the request is left in an honest, inspectable state — "someone approved
+this and execution did not finish" — rather than either silently retried
+(risking a double execution) or silently lost (the approver's decision
+disappearing). Recovering a stuck `approved` row is an operational action,
+not something this module automates, matching FR-BIL-009's "log for
+reconciliation, do not auto-retry a money movement" precedent.
+
+**Money-moving execution reuses `billing.WalletService.Post` and the
+existing refund/lifecycle stores unchanged.** The approval flow is purely
+what decides *whether and when* the action runs; it is not a parallel
+implementation of what the action does. `wallet_ledgers.adjusted_by_username`
+is set to the *requester*, with the approver's identity folded into the
+ledger description (`"... (approved by X)"`) — the ledger attributes the
+transaction to whoever's judgment call it fundamentally was, while the
+`approval_requests` row itself is the complete, queryable record of both
+parties for any dispute.
+
+**Field-task assignment (FR-WFL-002) is a separate, much simpler table with
+no approval gate of its own.** CRD's own wording — "independent of the
+ticket system" — is the whole design brief: `field_tasks` is a flat
+assign/track/complete record (`open → in_progress → completed/cancelled`)
+with no SLA engine, no routing rules, and no relationship to
+`approval_requests` beyond living in the same migration. Building it as an
+extension of `tickets` would couple two features (subscriber-facing
+support, and internal staff coordination) that the CRD is explicit about
+keeping apart.
+
+**Both new tables use free-form `*_username` columns, not `staff_users.id`
+foreign keys.** Every JWT already carries the acting staff member's username
+in `Subject` (`middleware.SubjectFromContext`) with no numeric staff id
+anywhere in the claims. Resolving that to `staff_users.id` on every gated
+call would be new lookup machinery this module does not otherwise need —
+the same call MDS §4.14 already made for `wallet_ledgers.adjusted_by_username`
+and `payment_refunds.refunded_by_username`, extended here for consistency.
+
+### Write-path integration
+
+```
+POST /subscribers/{id}/adjustments (credit)  ─┐
+POST /subscribers/{id}/refunds                ├─→ approval_requests (status=pending) ─→ 202
+POST /subscribers/{id}/terminate              ─┘
+
+POST /approvals/{id}/approve → ClaimApprovalRequest (atomic, self-approval blocked)
+                              → executeApprovedAction (WalletService.Post / TerminateSubscriber)
+                              → FinalizeApprovalExecution (executed | execution_failed)
+
+POST /approvals/{id}/reject  → RejectApprovalRequest (atomic) — never executes
+```
+
+### Key Metrics
+
+- `billing_lifecycle_actions_total` (MDS §4.14) gains two new label values
+  per gated action — `*_requested` at creation and `*_approved` at
+  execution — so the funnel from request to execution is visible without a
+  new metric family.
+- `workflow_approval_execution_failures_total` (counter, labels:
+  `action_type`) — an approval that executed the underlying action and had
+  it fail (e.g. balance moved between request and approval) is the one case
+  where an operator must look, not just reconcile later.

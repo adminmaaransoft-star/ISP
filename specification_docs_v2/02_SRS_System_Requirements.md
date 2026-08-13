@@ -190,8 +190,8 @@
 
 | FR ID | Requirement | CRD Ref | Module |
 |---|---|---|---|
-| FR-WFL-001 | Support configurable approval workflows for sensitive actions (large wallet credits, plan downgrades, termination) requiring second-approver sign-off before taking effect | CRD-EXP-002 | new module |
-| FR-WFL-002 | Support ad hoc field-task assignment independent of the ticket system, with due dates and completion tracking | CRD-EXP-002 | new module |
+| FR-WFL-001 | Sensitive account actions (staff wallet credit, refund, termination) must require second-approver sign-off — created as a pending request, and taking effect only when a different staff member approves it — with self-approval blocked at both the API and the schema | CRD-EXP-002 | MDS §4.15 |
+| FR-WFL-002 | Support ad hoc field-task assignment independent of the ticket system, with due dates and completion tracking | CRD-EXP-002 | MDS §4.15 |
 
 ### Announcements *(new — gap CRD-EXP-002, v3)*
 
@@ -279,7 +279,7 @@
 | Helpdesk / SLA *(v3)* | 3 | MDS §4.13 | TBD — Module design complete (2026-08-12), implementation/tests pending |
 | CRM / Lead Management *(v3)* | 3 | new module | TBD — Module design pending |
 | Inventory / CPE *(v3)* | 3 | new module | TBD — Module design pending |
-| Task & Approval Workflows *(v3)* | 2 | new module | TBD — Module design pending |
+| Task & Approval Workflows *(v3)* | 2 | MDS §4.15 | TST INT-WFL-001..003 |
 | Announcements *(v3)* | 2 | MDS §4.7 (extend) | TBD — Module design pending |
 | General Reporting *(v3)* | 3 | MDS §4.8 (extend) | TBD — Module design pending |
 | Document Storage *(v3)* | 1 | new module | TBD — Module design pending |

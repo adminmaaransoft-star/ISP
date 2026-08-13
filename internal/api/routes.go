@@ -88,6 +88,8 @@ type Handler struct {
 	lifecycle  LifecycleQuerier
 	refunds    RefundQuerier
 	subCache   SubscriberCacheInvalidator
+	approvals  ApprovalQuerier
+	fieldTasks FieldTaskQuerier
 	// subscriberLister backs revenue.ListSubscribersHandler, which is a
 	// plain http.HandlerFunc rather than a method on Handler — so the
 	// dependency is held here and passed to it at route-registration time.
@@ -128,6 +130,8 @@ type HandlerDeps struct {
 	Lifecycle        LifecycleQuerier
 	Refunds          RefundQuerier
 	SubCache         SubscriberCacheInvalidator
+	Approvals        ApprovalQuerier
+	FieldTasks       FieldTaskQuerier
 
 	// Health serves GET /api/v1/subscribers/{id}/health (FR-OBS-004). The
 	// implementation lives in internal/health, which cannot be imported here
@@ -165,6 +169,8 @@ func NewHandler(deps HandlerDeps) *Handler {
 		lifecycle:        deps.Lifecycle,
 		refunds:          deps.Refunds,
 		subCache:         deps.SubCache,
+		approvals:        deps.Approvals,
+		fieldTasks:       deps.FieldTasks,
 		health:           deps.Health,
 
 		razorpayWebhookSecret: deps.RazorpayWebhookSecret,
@@ -222,6 +228,34 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, jwtSecret string) {
 		admin(http.HandlerFunc(h.CreateAdjustment)))
 	mux.Handle("POST /api/v1/subscribers/{id}/refunds",
 		admin(http.HandlerFunc(h.CreateRefund)))
+
+	// Approval workflow (FR-WFL-001 | MDS §4.15)
+	//
+	// Reachable by the same billing_admin/isp_owner tier that files the
+	// requests: the guarantee this module provides is that the approver is a
+	// *different person*, enforced per-request against the token's subject,
+	// not that they hold a higher role. A separate approver role would be a
+	// different (and additional) control, and one CRD-EXP-002 does not ask
+	// for — "second-approver sign-off" is about two people, not two tiers.
+	mux.Handle("GET /api/v1/approvals",
+		admin(http.HandlerFunc(h.ListApprovals)))
+	mux.Handle("GET /api/v1/approvals/{id}",
+		admin(http.HandlerFunc(h.GetApproval)))
+	mux.Handle("POST /api/v1/approvals/{id}/approve",
+		admin(http.HandlerFunc(h.ApproveRequest)))
+	mux.Handle("POST /api/v1/approvals/{id}/reject",
+		admin(http.HandlerFunc(h.RejectRequest)))
+
+	// Field tasks (FR-WFL-002 | MDS §4.15). Internal staff coordination, so
+	// the wider staff tier can see and update their own queue; creating and
+	// assigning work stays with csr/technician/owner, matching how tickets
+	// are already gated.
+	mux.Handle("POST /api/v1/field-tasks",
+		csrOrTech(http.HandlerFunc(h.CreateFieldTask)))
+	mux.Handle("GET /api/v1/field-tasks",
+		staffRead(http.HandlerFunc(h.ListFieldTasks)))
+	mux.Handle("PATCH /api/v1/field-tasks/{id}",
+		csrOrTech(http.HandlerFunc(h.UpdateFieldTask)))
 
 	// Wallets (API-003)
 	mux.Handle("POST /api/v1/wallets/recharge",

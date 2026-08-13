@@ -160,6 +160,10 @@ func (d *DB) Tickets() *TicketStore { return &TicketStore{pool: d.pool} }
 // NAS returns the store satisfying nas.DeviceStore.
 func (d *DB) NAS() *NASStore { return &NASStore{pool: d.pool} }
 
+// Workflow returns the store satisfying api.ApprovalQuerier and
+// api.FieldTaskQuerier.
+func (d *DB) Workflow() *WorkflowStore { return &WorkflowStore{pool: d.pool} }
+
 // ── Money helpers ───────────────────────────────────────────────────────────
 
 // parseDecimal converts a NUMERIC-as-text column into a decimal.

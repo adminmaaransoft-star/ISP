@@ -343,6 +343,50 @@ unlike a missing SLA policy, an unrouted ticket is a normal, expected
 outcome (not every category/franchise combination needs an explicit rule),
 not a configuration error.
 
+### Table: `approval_requests` *(new — FR-WFL-001, migration 026)*
+**Module:** MOD-WFL | MDS §4.15
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `action_type` | `VARCHAR(30)` | NOT NULL CHECK IN (`wallet_credit`,`refund`,`terminate`) | |
+| `subscriber_id` | `INTEGER` | NOT NULL, FK → subscribers.id | |
+| `amount` | `NUMERIC(12,2)` | NULLABLE | Required (>0) for `wallet_credit`/`refund`; forbidden for `terminate` — `chk_approval_amount_by_type` |
+| `reason` | `TEXT` | NOT NULL | |
+| `status` | `VARCHAR(20)` | NOT NULL DEFAULT `pending` CHECK IN (`pending`,`approved`,`rejected`,`executed`,`execution_failed`) | `approved` is the atomic-claim state between decision and execution completing (MDS §4.15) |
+| `requested_by_username` | `VARCHAR(100)` | NOT NULL | |
+| `decided_by_username` | `VARCHAR(100)` | NULLABLE | |
+| `decision_reason` | `TEXT` | NULLABLE | Required by the API for a reject; not asked of an approve |
+| `execution_error` | `TEXT` | NULLABLE | Set only when status = `execution_failed` |
+| `ledger_entry_id` | `INTEGER` | FK → wallet_ledgers.id NULLABLE | Set on successful `wallet_credit`/`refund` execution |
+| `created_at` | `TIMESTAMPTZ` | DEFAULT NOW() | |
+| `decided_at` | `TIMESTAMPTZ` | NULLABLE | |
+| `CONSTRAINT chk_approval_distinct_approver` | | `decided_by_username IS NULL OR decided_by_username <> requested_by_username` | The second-approver guarantee, enforced at the schema level as well as in the handler |
+| `CONSTRAINT chk_approval_amount_by_type` | | see Amount above | |
+
+### Table: `field_tasks` *(new — FR-WFL-002, migration 026)*
+**Module:** MOD-WFL | MDS §4.15
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `title` | `VARCHAR(200)` | NOT NULL | |
+| `description` | `TEXT` | NULLABLE | |
+| `subscriber_id` | `INTEGER` | FK → subscribers.id NULLABLE | Not every ad hoc task is about one subscriber |
+| `franchise_id` | `INTEGER` | FK → franchises.id NULLABLE | |
+| `assigned_to_username` | `VARCHAR(100)` | NOT NULL | |
+| `created_by_username` | `VARCHAR(100)` | NOT NULL | |
+| `status` | `VARCHAR(20)` | NOT NULL DEFAULT `open` CHECK IN (`open`,`in_progress`,`completed`,`cancelled`) | |
+| `due_date` | `DATE` | NULLABLE | |
+| `created_at` | `TIMESTAMPTZ` | DEFAULT NOW() | |
+| `updated_at` | `TIMESTAMPTZ` | DEFAULT NOW() | `set_updated_at()` trigger (migration 003) |
+| `completed_at` | `TIMESTAMPTZ` | NULLABLE | Set when status transitions to `completed` |
+
+Deliberately independent of `tickets` — CRD-EXP-002 asks for task assignment
+"independent of the ticket system," and the two serve different audiences
+(subscriber-facing support vs. internal staff coordination) with different
+lifecycles (no SLA engine, no routing rules here).
+
 ### Table: `revenue_snapshots` *(new — FR-REV-001)*
 **Module:** MOD-REV
 

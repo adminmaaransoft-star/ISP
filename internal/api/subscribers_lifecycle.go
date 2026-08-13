@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/billing"
 	"github.com/maaransoft/isp-bss-oss/internal/fup"
 	"github.com/maaransoft/isp-bss-oss/internal/middleware"
+	"github.com/maaransoft/isp-bss-oss/internal/workflow"
 )
 
 // Subscriber lifecycle endpoints — FR-BIL-008..011, FR-LC-001..003 | MDS §4.14.
@@ -167,44 +169,47 @@ func computePlanChangeExpiry(info *PlanChangeInfo, now time.Time) time.Time {
 
 // ── FR-LC-002: Termination ──────────────────────────────────────────────────
 
+// terminateRequest is the POST /api/v1/subscribers/{id}/terminate body.
+// A reason is required because this endpoint no longer acts directly: it
+// files an approval request somebody else has to judge, and they need to
+// know what they are signing off on.
+type terminateRequest struct {
+	Reason string `json:"reason"`
+}
+
 // TerminateSubscriber handles POST /api/v1/subscribers/{id}/terminate.
 //
-// Sets status to terminated and enqueues a PoD to any active session —
-// distinct from suspension, which only throttles. Irreversible: there is no
-// "un-terminate" action.
+// Gated behind second-approver sign-off (FR-WFL-001): this files a pending
+// approval request and returns 202. The actual status change and PoD run in
+// performGatedAction once a different staff member approves.
 //
-// FR: FR-LC-002 | MDS §4.14
+// FR: FR-LC-002, FR-WFL-001 | MDS §4.14, §4.15
 func (h *Handler) TerminateSubscriber(w http.ResponseWriter, r *http.Request) {
 	id, err := pathInt(r, "id")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "ERR_BAD_REQUEST", "invalid id")
 		return
 	}
-	if h.lifecycle == nil {
+	if h.lifecycle == nil || h.approvals == nil {
 		writeError(w, http.StatusServiceUnavailable, "ERR_UNAVAILABLE", "lifecycle store not configured")
 		return
 	}
 
-	updated, err := h.lifecycle.TerminateSubscriber(r.Context(), id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "ERR_INTERNAL", "termination failed")
+	var body terminateRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "ERR_BAD_REQUEST", err.Error())
 		return
 	}
-	if updated == nil {
-		writeError(w, http.StatusNotFound, "ERR_SUBSCRIBER_NOT_FOUND", "subscriber not found")
+	if body.Reason == "" {
+		writeError(w, http.StatusUnprocessableEntity, "ERR_VALIDATION", "reason is required")
 		return
 	}
 
-	if h.subCache != nil {
-		if err := h.subCache.InvalidateSubscriber(r.Context(), updated.Username); err != nil {
-			log.Error().Err(err).Int("subscriber_id", id).Msg("api: auth-cache invalidation failed after termination")
-		}
-	}
-	enqueuePoDIfSessionActive(r.Context(), h, id)
-
-	billing.LifecycleActionsTotal.WithLabelValues("terminate").Inc()
-	middleware.Audit(r.Context(), "subscriber.terminate", strconv.Itoa(id), nil)
-	writeJSON(w, http.StatusOK, updated)
+	h.requestApproval(w, r, workflow.ApprovalRequest{
+		ActionType:   workflow.ActionTerminate,
+		SubscriberID: id,
+		Reason:       body.Reason,
+	})
 }
 
 // ── FR-BIL-010: Staff adjustments ───────────────────────────────────────────
@@ -217,7 +222,13 @@ type adjustmentRequest struct {
 
 // CreateAdjustment handles POST /api/v1/subscribers/{id}/adjustments.
 //
-// FR: FR-BIL-010 | MDS §4.14
+// A credit is gated behind second-approver sign-off (FR-WFL-001) and returns
+// 202; a debit executes immediately. The asymmetry is deliberate (MDS §4.15):
+// a debit only ever reduces what a subscriber can spend and is usually itself
+// a correction of an earlier erroneous credit, so gating it would add friction
+// to the safer direction of the same feature.
+//
+// FR: FR-BIL-010, FR-WFL-001 | MDS §4.14, §4.15
 func (h *Handler) CreateAdjustment(w http.ResponseWriter, r *http.Request) {
 	id, err := pathInt(r, "id")
 	if err != nil {
@@ -245,6 +256,20 @@ func (h *Handler) CreateAdjustment(w http.ResponseWriter, r *http.Request) {
 	amount, err := decimal.NewFromString(req.Amount)
 	if err != nil || amount.LessThanOrEqual(decimal.Zero) {
 		writeError(w, http.StatusUnprocessableEntity, "ERR_VALIDATION", "amount must be a positive decimal")
+		return
+	}
+
+	if req.Direction == "credit" {
+		if h.approvals == nil {
+			writeError(w, http.StatusServiceUnavailable, "ERR_UNAVAILABLE", "approval store not configured")
+			return
+		}
+		h.requestApproval(w, r, workflow.ApprovalRequest{
+			ActionType:   workflow.ActionWalletCredit,
+			SubscriberID: id,
+			Amount:       amountPtr(amount),
+			Reason:       req.Reason,
+		})
 		return
 	}
 
@@ -284,14 +309,18 @@ type refundRequest struct {
 
 // CreateRefund handles POST /api/v1/subscribers/{id}/refunds.
 //
-// FR: FR-BIL-011 | MDS §4.14
+// Gated behind second-approver sign-off (FR-WFL-001): this files a pending
+// approval request and returns 202. The wallet debit and payment_refunds row
+// are written in performGatedAction once a different staff member approves.
+//
+// FR: FR-BIL-011, FR-WFL-001 | MDS §4.14, §4.15
 func (h *Handler) CreateRefund(w http.ResponseWriter, r *http.Request) {
 	id, err := pathInt(r, "id")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "ERR_BAD_REQUEST", "invalid id")
 		return
 	}
-	if h.walletSvc == nil || h.refunds == nil {
+	if h.walletSvc == nil || h.refunds == nil || h.approvals == nil {
 		writeError(w, http.StatusServiceUnavailable, "ERR_UNAVAILABLE", "refund processing not configured")
 		return
 	}
@@ -311,44 +340,11 @@ func (h *Handler) CreateRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	staffUsername := middleware.SubjectFromContext(r.Context())
-	tx, err := h.walletSvc.Post(r.Context(), billing.PostRequest{
-		SubscriberID:   id,
-		Amount:         amount,
-		Direction:      "debit",
-		CounterAccount: billing.AccountAdjustmentClearing,
-		AdjustedBy:     staffUsername,
-		Description:    "refund: " + req.Reason,
-	})
-	if errors.Is(err, billing.ErrInsufficientBalance) {
-		writeError(w, http.StatusUnprocessableEntity, "ERR_VALIDATION", "cannot refund more than the current wallet balance")
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "ERR_INTERNAL", "refund failed")
-		return
-	}
-
-	refundID, err := h.refunds.CreateRefund(r.Context(), id, tx.ID, amount, req.Reason, staffUsername)
-	if err != nil {
-		// The wallet debit above already committed and must not be undone
-		// just because the refund record failed — the ledger leg is itself
-		// a true and complete record of the money movement; log for
-		// reconciliation rather than leaving a refunded subscriber's wallet
-		// debited with no record, matching the same "money moved, log the
-		// rest" pattern renewalProcessor.ApplyRenewal uses (cmd/api/main.go).
-		log.Error().Err(err).Int("subscriber_id", id).Int("ledger_entry_id", tx.ID).
-			Msg("api: refund record failed after wallet debit committed")
-		writeError(w, http.StatusInternalServerError, "ERR_INTERNAL", "refund debit succeeded but the refund record failed; contact support")
-		return
-	}
-
-	billing.LifecycleActionsTotal.WithLabelValues("refund").Inc()
-	middleware.Audit(r.Context(), "subscriber.refund", strconv.Itoa(id), map[string]any{
-		"amount": amount.StringFixed(2), "reason": req.Reason, "refund_id": refundID,
-	})
-	writeJSON(w, http.StatusCreated, map[string]string{
-		"refund_id": strconv.Itoa(refundID), "transaction_id": strconv.Itoa(tx.ID), "wallet_balance": tx.BalanceAfter.StringFixed(2),
+	h.requestApproval(w, r, workflow.ApprovalRequest{
+		ActionType:   workflow.ActionRefund,
+		SubscriberID: id,
+		Amount:       amountPtr(amount),
+		Reason:       req.Reason,
 	})
 }
 

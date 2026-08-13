@@ -59,8 +59,9 @@ type stubLifecycle struct {
 	terminated   *api.SubscriberRecord
 	terminateErr error
 
-	lastNewPlanID int
-	lastNewExpiry time.Time
+	lastNewPlanID  int
+	lastNewExpiry  time.Time
+	terminateCalls int
 }
 
 func (s *stubLifecycle) GetPlanChangeInfo(_ context.Context, _, newPlanID int) (*api.PlanChangeInfo, error) {
@@ -82,6 +83,7 @@ func (s *stubLifecycle) SetSubscriberPlan(_ context.Context, id, newPlanID int, 
 }
 
 func (s *stubLifecycle) TerminateSubscriber(_ context.Context, id int) (*api.SubscriberRecord, error) {
+	s.terminateCalls++
 	if s.terminateErr != nil {
 		return nil, s.terminateErr
 	}
@@ -278,60 +280,64 @@ func TestChangeSubscriberPlan_ActiveSession_EnqueuesCoA(t *testing.T) {
 	}
 }
 
-// ── Termination (FR-LC-002) ─────────────────────────────────────────────────
+// ── Termination (FR-LC-002, now gated by FR-WFL-001) ────────────────────────
 
-func TestTerminateSubscriber_SetsStatusAndEnqueuesPoD(t *testing.T) {
+// TestTerminateSubscriber_FilesApprovalRequestRatherThanTerminating is the
+// core of the FR-WFL-001 gate: the endpoint that used to end an account
+// outright now only files a request. Nothing must reach the lifecycle store
+// or the task queue until a second staff member approves.
+func TestTerminateSubscriber_FilesApprovalRequestRatherThanTerminating(t *testing.T) {
 	lc := &stubLifecycle{}
 	tasks := &stubTaskEnqueuer{}
 	cache := &stubSubCache{}
+	approvals := newStubApprovals()
 	h := api.NewHandler(api.HandlerDeps{
 		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(&stubWallet{}),
-		Lifecycle: lc, SubCache: cache,
+		Lifecycle: lc, SubCache: cache, Approvals: approvals,
 		Sessions: &stubSessionReader{session: &health.SessionSummary{NasIP: "10.0.0.5"}},
 		Tasks:    tasks,
 	})
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux, itJWTSecret)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/subscribers/9/terminate", nil)
-	req.Header.Set("Authorization", "Bearer "+itRoleToken(t, "billing_admin", false))
+	body := `{"reason":"subscriber relocated"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/subscribers/9/terminate", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+itRoleTokenWithSubject(t, "billing_admin", "requester"))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d — %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("want 202 (request filed, not executed), got %d — %s", rec.Code, rec.Body.String())
 	}
-	var got api.SubscriberRecord
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("decode: %v", err)
+	if lc.terminateCalls != 0 {
+		t.Error("the subscriber must NOT have been terminated before a second approver signed off")
 	}
-	if got.Status != "terminated" {
-		t.Errorf("status = %q, want terminated", got.Status)
+	if len(tasks.snapshot()) != 0 {
+		t.Error("no PoD may be enqueued before approval")
 	}
-	tasksGot := tasks.snapshot()
-	if len(tasksGot) != 1 || tasksGot[0].Type() != "network:pod_send" {
-		t.Fatalf("want exactly 1 network:pod_send task, got %+v", tasksGot)
+	if len(cache.invalidated) != 0 {
+		t.Error("no auth-cache invalidation may happen before approval")
 	}
-	if len(cache.invalidated) != 1 || cache.invalidated[0] != "terminated_sub" {
-		t.Errorf("auth-cache invalidation = %v, want exactly [terminated_sub]", cache.invalidated)
+	if len(approvals.byID) != 1 {
+		t.Fatalf("want exactly 1 approval request filed, got %d", len(approvals.byID))
 	}
 }
 
-func TestTerminateSubscriber_UnknownSubscriber_404(t *testing.T) {
+func TestTerminateSubscriber_RequiresReason_422(t *testing.T) {
 	h := api.NewHandler(api.HandlerDeps{
 		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(&stubWallet{}),
-		Lifecycle: &stubLifecycleAlwaysNotFound{},
+		Lifecycle: &stubLifecycle{}, Approvals: newStubApprovals(),
 	})
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux, itJWTSecret)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/subscribers/404/terminate", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/subscribers/9/terminate", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer "+itRoleToken(t, "billing_admin", false))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("want 404, got %d — %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("want 422 without a reason, got %d — %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -352,21 +358,63 @@ func (s *stubLifecycleAlwaysNotFound) TerminateSubscriber(context.Context, int) 
 
 // ── Adjustments (FR-BIL-010) ────────────────────────────────────────────────
 
-func TestCreateAdjustment_CreditSucceeds(t *testing.T) {
+// TestCreateAdjustment_CreditFilesApprovalRequest: a credit moves money into
+// a subscriber's wallet, so FR-WFL-001 gates it — 202 and a pending request,
+// with the wallet untouched until somebody else approves.
+func TestCreateAdjustment_CreditFilesApprovalRequest(t *testing.T) {
+	wallet := &stubWalletFunded{balance: decimal.NewFromInt(100)}
+	approvals := newStubApprovals()
 	h := api.NewHandler(api.HandlerDeps{
-		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(&stubWalletFunded{balance: decimal.NewFromInt(100)}),
+		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(wallet),
+		Approvals: approvals,
 	})
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux, itJWTSecret)
 
 	body := `{"amount":"50.00","direction":"credit","reason":"goodwill credit"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/subscribers/9/adjustments", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+itRoleToken(t, "billing_admin", false))
+	req.Header.Set("Authorization", "Bearer "+itRoleTokenWithSubject(t, "billing_admin", "requester"))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("want 202 (credit is gated), got %d — %s", rec.Code, rec.Body.String())
+	}
+	if wallet.rechargeIDCounter != 0 {
+		t.Error("no money may move before a second approver signs off")
+	}
+	if len(approvals.byID) != 1 {
+		t.Fatalf("want exactly 1 approval request filed, got %d", len(approvals.byID))
+	}
+}
+
+// TestCreateAdjustment_DebitExecutesImmediately pins the deliberate
+// asymmetry (MDS §4.15): a debit reduces what a subscriber can spend and is
+// usually itself a correction, so it is not gated.
+func TestCreateAdjustment_DebitExecutesImmediately(t *testing.T) {
+	wallet := &stubWalletFunded{balance: decimal.NewFromInt(100)}
+	approvals := newStubApprovals()
+	h := api.NewHandler(api.HandlerDeps{
+		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(wallet),
+		Approvals: approvals,
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, itJWTSecret)
+
+	body := `{"amount":"50.00","direction":"debit","reason":"correcting an earlier over-credit"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/subscribers/9/adjustments", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+itRoleTokenWithSubject(t, "billing_admin", "requester"))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusCreated {
-		t.Fatalf("want 201, got %d — %s", rec.Code, rec.Body.String())
+		t.Fatalf("want 201 (debit is not gated), got %d — %s", rec.Code, rec.Body.String())
+	}
+	if wallet.rechargeIDCounter != 1 {
+		t.Error("a debit must execute immediately, not file a request")
+	}
+	if len(approvals.byID) != 0 {
+		t.Error("a debit must not file an approval request")
 	}
 }
 
@@ -427,13 +475,18 @@ func TestCreateAdjustment_InvalidDirection_422(t *testing.T) {
 	}
 }
 
-// ── Refunds (FR-BIL-011) ─────────────────────────────────────────────────────
+// ── Refunds (FR-BIL-011, now gated by FR-WFL-001) ───────────────────────────
 
-func TestCreateRefund_Succeeds(t *testing.T) {
+// TestCreateRefund_FilesApprovalRequestRatherThanRefunding: a refund moves
+// money out of the wallet, so it is gated. Neither the wallet debit nor the
+// payment_refunds row may be written before approval.
+func TestCreateRefund_FilesApprovalRequestRatherThanRefunding(t *testing.T) {
 	refunds := &stubRefunds{}
+	wallet := &stubWalletFunded{balance: decimal.NewFromInt(500)}
+	approvals := newStubApprovals()
 	h := api.NewHandler(api.HandlerDeps{
-		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(&stubWalletFunded{balance: decimal.NewFromInt(500)}),
-		Refunds: refunds,
+		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(wallet),
+		Refunds: refunds, Approvals: approvals,
 	})
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux, itJWTSecret)
@@ -444,63 +497,44 @@ func TestCreateRefund_Succeeds(t *testing.T) {
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("want 201, got %d — %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("want 202 (refund is gated), got %d — %s", rec.Code, rec.Body.String())
 	}
-	if refunds.lastSubscriberID != 9 || !refunds.lastAmount.Equal(decimal.NewFromInt(200)) {
-		t.Errorf("refund record: subscriber=%d amount=%s, want 9 and 200", refunds.lastSubscriberID, refunds.lastAmount)
+	if wallet.rechargeIDCounter != 0 {
+		t.Error("no wallet debit may happen before a second approver signs off")
 	}
-	if refunds.lastRefundedBy != "priya.billing" {
-		t.Errorf("refund record staff attribution: want %q, got %q", "priya.billing", refunds.lastRefundedBy)
+	if refunds.lastSubscriberID != 0 {
+		t.Error("no payment_refunds row may be written before approval")
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got["status"] != "pending" {
+		t.Errorf("filed request status = %v, want pending", got["status"])
+	}
+	if got["requested_by"] != "priya.billing" {
+		t.Errorf("requested_by = %v, want priya.billing", got["requested_by"])
 	}
 }
 
-// TestCreateRefund_ExceedsBalance_422 verifies a refund cannot take the
-// wallet negative — the same overdraft guard as adjustments, applied to
-// refunds since both go through WalletService.Post.
-func TestCreateRefund_ExceedsBalance_422(t *testing.T) {
+func TestCreateRefund_RequiresReason_422(t *testing.T) {
 	h := api.NewHandler(api.HandlerDeps{
-		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(&stubWallet{}), // balance always 0
-		Refunds: &stubRefunds{},
+		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(&stubWalletFunded{balance: decimal.NewFromInt(500)}),
+		Refunds: &stubRefunds{}, Approvals: newStubApprovals(),
 	})
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux, itJWTSecret)
 
-	body := `{"amount":"200.00","reason":"duplicate recharge"}`
+	body := `{"amount":"200.00","reason":""}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/subscribers/9/refunds", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+itRoleToken(t, "billing_admin", false))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnprocessableEntity {
-		t.Errorf("want 422 for a refund exceeding balance, got %d — %s", rec.Code, rec.Body.String())
-	}
-}
-
-// TestCreateRefund_RecordFailsAfterWalletDebit is the negative control for
-// the "money moved, log the rest" pattern (MDS §4.14): the wallet debit must
-// not be undone just because the payment_refunds row failed to write, since
-// the ledger leg is itself a true record of the money movement.
-func TestCreateRefund_RecordFailsAfterWalletDebit(t *testing.T) {
-	wallet := &stubWalletFunded{balance: decimal.NewFromInt(500)}
-	h := api.NewHandler(api.HandlerDeps{
-		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(wallet),
-		Refunds: &stubRefunds{err: context.DeadlineExceeded},
-	})
-	mux := http.NewServeMux()
-	h.RegisterRoutes(mux, itJWTSecret)
-
-	body := `{"amount":"200.00","reason":"duplicate recharge"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/subscribers/9/refunds", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+itRoleToken(t, "billing_admin", false))
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("want 500 when the refund record fails, got %d — %s", rec.Code, rec.Body.String())
-	}
-	if wallet.rechargeIDCounter != 1 {
-		t.Error("the wallet debit must still have been written even though the refund record failed")
+		t.Errorf("want 422 without a reason, got %d", rec.Code)
 	}
 }
 
@@ -513,7 +547,7 @@ func TestLifecycleRoutes_ForbiddenForCSR(t *testing.T) {
 	h := api.NewHandler(api.HandlerDeps{
 		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(&stubWallet{}),
 		Lifecycle: &stubLifecycle{info: &api.PlanChangeInfo{OldValidityDays: 30, NewValidityDays: 30}},
-		Refunds:   &stubRefunds{},
+		Refunds:   &stubRefunds{}, Approvals: newStubApprovals(),
 	})
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux, itJWTSecret)
@@ -522,7 +556,7 @@ func TestLifecycleRoutes_ForbiddenForCSR(t *testing.T) {
 		method, path, body string
 	}{
 		{http.MethodPost, "/api/v1/subscribers/9/plan-change", `{"new_plan_id":1}`},
-		{http.MethodPost, "/api/v1/subscribers/9/terminate", ``},
+		{http.MethodPost, "/api/v1/subscribers/9/terminate", `{"reason":"x"}`},
 		{http.MethodPost, "/api/v1/subscribers/9/adjustments", `{"amount":"10","direction":"credit","reason":"x"}`},
 		{http.MethodPost, "/api/v1/subscribers/9/refunds", `{"amount":"10","reason":"x"}`},
 	}
@@ -540,7 +574,7 @@ func TestLifecycleRoutes_ForbiddenForCSR(t *testing.T) {
 func TestLifecycleRoutes_UnconfiguredStoreReturns503(t *testing.T) {
 	h := api.NewHandler(api.HandlerDeps{
 		DB: &stubDB{}, KYC: &stubKYC{}, Wallet: billing.NewWalletService(&stubWallet{}),
-		// Lifecycle and Refunds left nil.
+		// Lifecycle, Refunds and Approvals left nil.
 	})
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux, itJWTSecret)
@@ -549,8 +583,10 @@ func TestLifecycleRoutes_UnconfiguredStoreReturns503(t *testing.T) {
 		method, path, body string
 	}{
 		{http.MethodPost, "/api/v1/subscribers/9/plan-change", `{"new_plan_id":1}`},
-		{http.MethodPost, "/api/v1/subscribers/9/terminate", ``},
+		{http.MethodPost, "/api/v1/subscribers/9/terminate", `{"reason":"x"}`},
 		{http.MethodPost, "/api/v1/subscribers/9/refunds", `{"amount":"10","reason":"x"}`},
+		{http.MethodPost, "/api/v1/approvals/1/approve", ``},
+		{http.MethodPost, "/api/v1/approvals/1/reject", `{"reason":"x"}`},
 	}
 	for _, tc := range reqs {
 		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))

@@ -148,7 +148,12 @@ func run() error {
 		Lifecycle: database.API(),
 		Refunds:   database.Billing(),
 		SubCache:  &subCacheInvalidator{rc: redisClient},
-		Health:    http.HandlerFunc(healthHandler.GetSubscriberHealth),
+		// Task & approval workflows (FR-WFL-001..002). WorkflowStore
+		// satisfies both queriers — approvals and field tasks share a
+		// migration and a store, but nothing else.
+		Approvals:  database.Workflow(),
+		FieldTasks: database.Workflow(),
+		Health:     http.HandlerFunc(healthHandler.GetSubscriberHealth),
 
 		RazorpayWebhookSecret: cfg.RazorpayWebhookSecret,
 	})
