@@ -85,6 +85,9 @@ type Handler struct {
 	lea        LEAQuerier
 	leaAudit   LEAAuditRecorder
 	franchises FranchiseQuerier
+	lifecycle  LifecycleQuerier
+	refunds    RefundQuerier
+	subCache   SubscriberCacheInvalidator
 	// subscriberLister backs revenue.ListSubscribersHandler, which is a
 	// plain http.HandlerFunc rather than a method on Handler — so the
 	// dependency is held here and passed to it at route-registration time.
@@ -122,6 +125,9 @@ type HandlerDeps struct {
 	LEAAudit         LEAAuditRecorder
 	Franchises       FranchiseQuerier
 	SubscriberLister revenue.SubscriberLister
+	Lifecycle        LifecycleQuerier
+	Refunds          RefundQuerier
+	SubCache         SubscriberCacheInvalidator
 
 	// Health serves GET /api/v1/subscribers/{id}/health (FR-OBS-004). The
 	// implementation lives in internal/health, which cannot be imported here
@@ -156,6 +162,9 @@ func NewHandler(deps HandlerDeps) *Handler {
 		leaAudit:         deps.LEAAudit,
 		franchises:       deps.Franchises,
 		subscriberLister: deps.SubscriberLister,
+		lifecycle:        deps.Lifecycle,
+		refunds:          deps.Refunds,
+		subCache:         deps.SubCache,
 		health:           deps.Health,
 
 		razorpayWebhookSecret: deps.RazorpayWebhookSecret,
@@ -203,6 +212,16 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, jwtSecret string) {
 		admin(http.HandlerFunc(h.UpdateSubscriber)))
 	mux.Handle("GET /api/v1/subscribers/{id}/health",
 		staffRead(http.HandlerFunc(h.GetSubscriberHealth)))
+
+	// Subscriber lifecycle (FR-LC-001..003, FR-BIL-010..011 | MDS §4.14)
+	mux.Handle("POST /api/v1/subscribers/{id}/plan-change",
+		admin(http.HandlerFunc(h.ChangeSubscriberPlan)))
+	mux.Handle("POST /api/v1/subscribers/{id}/terminate",
+		admin(http.HandlerFunc(h.TerminateSubscriber)))
+	mux.Handle("POST /api/v1/subscribers/{id}/adjustments",
+		admin(http.HandlerFunc(h.CreateAdjustment)))
+	mux.Handle("POST /api/v1/subscribers/{id}/refunds",
+		admin(http.HandlerFunc(h.CreateRefund)))
 
 	// Wallets (API-003)
 	mux.Handle("POST /api/v1/wallets/recharge",

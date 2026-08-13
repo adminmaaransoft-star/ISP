@@ -13,3 +13,10 @@ import "time"
 func SetScannerClock(s *DunningScanner, now func() time.Time) {
 	s.now = now
 }
+
+// SetRecurringBillingScannerClock is the auto-renewal scanner's equivalent of
+// SetScannerClock, for the same reason: max(now, currentExpiry) needs a fixed
+// instant to make the boundary deterministic.
+func SetRecurringBillingScannerClock(s *RecurringBillingScanner, now func() time.Time) {
+	s.now = now
+}

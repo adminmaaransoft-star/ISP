@@ -39,6 +39,7 @@ COMPONENTS=(
     "NewScanner:FUP scanner (throttles subscribers over quota)"
     "NewDeadLetterMonitor:dead-letter monitor (surfaces stuck tasks)"
     "NewDunningScanner:dunning scanner (reminders and suspensions)"
+    "NewRecurringBillingScanner:auto-renewal scanner (charges from wallet balance)"
     "NewReconcileScheduler:nightly revenue reconciliation"
     "NewDunningNoticeHandler:dunning notification worker"
     "NewPaymentReceiptHandler:payment receipt worker"

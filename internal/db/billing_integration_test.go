@@ -4,7 +4,9 @@ package db_test
 
 import (
 	"context"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/maaransoft/isp-bss-oss/internal/billing"
 	"github.com/shopspring/decimal"
@@ -310,4 +312,137 @@ func TestFR_BIL_001_BillingStore_Invoices(t *testing.T) {
 			t.Error("expected chk_gst_logic to reject an invoice with both tax kinds")
 		}
 	})
+}
+
+// TestFR_BIL_009_BillingStore_ListRenewalCandidates verifies the auto-renewal
+// candidate query: expired AND funded, excluding terminated subscribers,
+// subscribers who are not yet due, and subscribers who are due but cannot
+// cover the price.
+//
+// FR-BIL-009 | MDS §4.14
+func TestFR_BIL_009_BillingStore_ListRenewalCandidates(t *testing.T) {
+	database, pool := newTestDB(t)
+	ctx := context.Background()
+
+	seedPlan(ctx, t, pool, 1, "P", "100M/100M", 0, "", "500.00")
+	past := time.Now().Add(-24 * time.Hour)
+	future := time.Now().Add(24 * time.Hour)
+
+	// Funded and expired: the one candidate that must come back.
+	seedSubscriber(ctx, t, pool, 1, seedOpts{Username: "funded_expired", Balance: "600.00", PlanExpiry: &past})
+	// Expired but underfunded: must not renew into an overdraft.
+	seedSubscriber(ctx, t, pool, 2, seedOpts{Username: "underfunded_expired", Balance: "100.00", PlanExpiry: &past})
+	// Funded but not yet due.
+	seedSubscriber(ctx, t, pool, 3, seedOpts{Username: "funded_future", Balance: "600.00", PlanExpiry: &future})
+	// Funded, expired, but already left — must not be renewed back to life.
+	seedSubscriber(ctx, t, pool, 4, seedOpts{Username: "funded_terminated", Balance: "600.00", PlanExpiry: &past, Status: "terminated"})
+	// Exactly the plan price: >= must include the boundary, not just >.
+	seedSubscriber(ctx, t, pool, 5, seedOpts{Username: "exact_balance", Balance: "500.00", PlanExpiry: &past})
+
+	store := database.Billing()
+	candidates, err := store.ListRenewalCandidates(ctx)
+	if err != nil {
+		t.Fatalf("ListRenewalCandidates: %v", err)
+	}
+
+	got := map[int]bool{}
+	for _, c := range candidates {
+		got[c.SubscriberID] = true
+		if c.SubscriberID == 1 {
+			if !c.PlanPrice.Equal(mustDecimal(t, "500.00")) {
+				t.Errorf("subscriber 1 plan price: want 500.00, got %s", c.PlanPrice)
+			}
+			if c.PlanValidityDays != 30 {
+				t.Errorf("subscriber 1 validity_days: want 30, got %d", c.PlanValidityDays)
+			}
+		}
+	}
+	if !got[1] {
+		t.Error("funded, expired subscriber must be a candidate")
+	}
+	if !got[5] {
+		t.Error("a subscriber whose balance exactly equals the plan price must be a candidate")
+	}
+	if got[2] {
+		t.Error("an underfunded subscriber must not be a candidate")
+	}
+	if got[3] {
+		t.Error("a subscriber not yet due must not be a candidate")
+	}
+	if got[4] {
+		t.Error("a terminated subscriber must not be a candidate")
+	}
+}
+
+// TestFR_BIL_008_BillingStore_GetInvoiceInputs verifies the renewal-invoice
+// helper reads the subscriber's own state (registered_state) and current
+// plan's volume, not stale or hardcoded values.
+//
+// FR-BIL-008 | MDS §4.14
+func TestFR_BIL_008_BillingStore_GetInvoiceInputs(t *testing.T) {
+	database, pool := newTestDB(t)
+	ctx := context.Background()
+
+	seedPlan(ctx, t, pool, 1, "P", "100M/100M", 0, "", "799.00")
+	seedSubscriber(ctx, t, pool, 1, seedOpts{Username: "ka_sub", RegisteredSt: "KA"})
+
+	state, volumeGB, err := database.Billing().GetInvoiceInputs(ctx, 1)
+	if err != nil {
+		t.Fatalf("GetInvoiceInputs: %v", err)
+	}
+	if state != "KA" {
+		t.Errorf("registered_state: want KA, got %q", state)
+	}
+	if volumeGB != 3300 {
+		t.Errorf("plan volume_gb: want 3300 (seedPlan's fixed value), got %d", volumeGB)
+	}
+
+	if _, _, err := database.Billing().GetInvoiceInputs(ctx, 999999); err == nil {
+		t.Error("want an error for an unknown subscriber")
+	}
+}
+
+// TestFR_BIL_011_BillingStore_CreateRefund verifies a refund's business
+// record persists and is traceable to the wallet ledger row it corresponds
+// to — the whole reason payment_refunds carries ledger_entry_id rather than
+// standing alone.
+//
+// FR-BIL-011 | MDS §4.14
+func TestFR_BIL_011_BillingStore_CreateRefund(t *testing.T) {
+	database, pool := newTestDB(t)
+	ctx := context.Background()
+
+	seedPlan(ctx, t, pool, 1, "P", "100M/100M", 0, "", "799.00")
+	seedSubscriber(ctx, t, pool, 1, seedOpts{Username: "refund_sub", Balance: "500.00"})
+
+	wallet := billing.NewWalletService(database.Billing())
+	tx, err := wallet.Post(ctx, billing.PostRequest{
+		SubscriberID: 1, Amount: mustDecimal(t, "200.00"), Direction: "debit",
+		CounterAccount: billing.AccountAdjustmentClearing, AdjustedBy: "billing_admin_1",
+		Description: "refund: duplicate recharge",
+	})
+	if err != nil {
+		t.Fatalf("Post (refund debit leg): %v", err)
+	}
+
+	refundID, err := database.Billing().CreateRefund(ctx, 1, tx.ID, mustDecimal(t, "200.00"), "duplicate recharge", "billing_admin_1")
+	if err != nil {
+		t.Fatalf("CreateRefund: %v", err)
+	}
+	if refundID == 0 {
+		t.Error("refund must carry a generated id")
+	}
+
+	ledgerRef := scanString(ctx, t, pool, `SELECT ledger_entry_id::text FROM payment_refunds WHERE id = $1`, refundID)
+	if ledgerRef != strconv.Itoa(tx.ID) {
+		t.Errorf("ledger_entry_id: want %d (the debit leg Post wrote), got %s", tx.ID, ledgerRef)
+	}
+	status := scanString(ctx, t, pool, `SELECT status FROM payment_refunds WHERE id = $1`, refundID)
+	if status != "processed" {
+		t.Errorf("status: want processed (no live gateway refund API), got %q", status)
+	}
+	balance := scanString(ctx, t, pool, `SELECT wallet_balance::text FROM subscribers WHERE id = 1`)
+	if got := mustDecimal(t, balance); !got.Equal(mustDecimal(t, "300.00")) {
+		t.Errorf("wallet_balance after refund: want 300.00 (500-200), got %s", got)
+	}
 }

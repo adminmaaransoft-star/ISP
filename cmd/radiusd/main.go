@@ -177,6 +177,24 @@ func run() error {
 		log.Info().Msg("radiusd: dunning scanner stopped")
 	}()
 
+	// ── Auto-renewal scanner ─────────────────────────────────────────────────
+
+	// Charges a subscriber for their current plan out of an already-funded
+	// wallet balance the moment plan_expiry lapses, rather than leaving them
+	// to dunning's purely time-based schedule while their money sits
+	// uncharged. Runs every 15 minutes — shorter than dunning's hourly tick
+	// — so it reliably gets a chance to renew a funded subscriber first
+	// (MDS §4.14, FR-BIL-009).
+	autoRenewalScanner := billing.NewRecurringBillingScanner(
+		database.Billing(), billing.NewWalletService(database.Billing()))
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Info().Msg("radiusd: auto-renewal scanner started")
+		autoRenewalScanner.Run(ctx)
+		log.Info().Msg("radiusd: auto-renewal scanner stopped")
+	}()
+
 	// ── Nightly revenue reconciliation ──────────────────────────────────────
 
 	// ReconcileJob shipped complete, tested, and documented as running nightly

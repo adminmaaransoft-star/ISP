@@ -142,7 +142,13 @@ func run() error {
 		// the commission engine and the P&L reporting read the same tables.
 		Franchises:       database.Revenue(),
 		SubscriberLister: database.Revenue(),
-		Health:           http.HandlerFunc(healthHandler.GetSubscriberHealth),
+		// Subscriber lifecycle (FR-LC-001..003, FR-BIL-010..011). APIStore
+		// satisfies LifecycleQuerier; BillingStore satisfies RefundQuerier
+		// (it already owns wallet_ledgers, which payment_refunds references).
+		Lifecycle: database.API(),
+		Refunds:   database.Billing(),
+		SubCache:  &subCacheInvalidator{rc: redisClient},
+		Health:    http.HandlerFunc(healthHandler.GetSubscriberHealth),
 
 		RazorpayWebhookSecret: cfg.RazorpayWebhookSecret,
 	})
@@ -155,7 +161,11 @@ func run() error {
 		razorpayClient,
 		cfg.PortalJWTSecret,
 	)
-	portalHandler.SetRenewalProcessor(&renewalProcessor{wallet: walletSvc, planExpiry: database.Portal()})
+	portalHandler.SetRenewalProcessor(&renewalProcessor{
+		wallet:     walletSvc,
+		planExpiry: database.Portal(),
+		invoicing:  database.Billing(),
+	})
 
 	portalUIHandler := portalui.NewHandler(portalui.Deps{
 		Subscribers:    database.Portal(),
@@ -258,12 +268,21 @@ func run() error {
 	return nil
 }
 
+// renewalInvoicer is the subset of *db.BillingStore ApplyRenewal needs to
+// generate the GST invoice for a completed renewal (FR-BIL-008).
+type renewalInvoicer interface {
+	GetInvoiceInputs(ctx context.Context, subscriberID int) (registeredState string, planVolumeGB int, err error)
+	CreateInvoice(ctx context.Context, inv billing.Invoice) (int, error)
+	GetActiveGstRate(ctx context.Context) (billing.GstRate, error)
+}
+
 // renewalProcessor credits a completed portal renewal through the wallet
-// service, which supplies the idempotency the gateway callback needs, and
-// extends the subscriber's plan_expiry to match.
+// service, which supplies the idempotency the gateway callback needs,
+// extends the subscriber's plan_expiry to match, and invoices the cycle.
 type renewalProcessor struct {
 	wallet     *billing.WalletService
 	planExpiry portal.PlanExpiryStore
+	invoicing  renewalInvoicer
 }
 
 func (p *renewalProcessor) ApplyRenewal(ctx context.Context, subscriberID int, amount decimal.Decimal, paymentID string) (*portal.RenewalPayment, error) {
@@ -286,7 +305,58 @@ func (p *renewalProcessor) ApplyRenewal(ctx context.Context, subscriberID int, a
 		}
 	}
 
+	// Same reasoning: the payment already landed, so a failure here is
+	// logged for reconciliation rather than treated as the renewal failing.
+	if p.invoicing != nil {
+		if err := createRenewalInvoice(ctx, p.invoicing, subscriberID, amount); err != nil {
+			log.Error().Err(err).Int("subscriber_id", subscriberID).Msg("renewal: invoice creation failed")
+		}
+	}
+
 	return &portal.RenewalPayment{TransactionID: tx.ID, Balance: tx.BalanceAfter}, nil
+}
+
+// createRenewalInvoice builds and persists the GST invoice for one renewal
+// cycle. base_amount is the amount actually charged (what the subscriber
+// paid via the Razorpay payment link), not the plan's list price — those can
+// differ, and the invoice must reflect the real transaction.
+//
+// FR: FR-BIL-008 | MDS §4.14
+func createRenewalInvoice(ctx context.Context, inv renewalInvoicer, subscriberID int, amount decimal.Decimal) error {
+	registeredState, planVolumeGB, err := inv.GetInvoiceInputs(ctx, subscriberID)
+	if err != nil {
+		return fmt.Errorf("get invoice inputs: %w", err)
+	}
+	rate, err := inv.GetActiveGstRate(ctx)
+	if err != nil {
+		return fmt.Errorf("get active gst rate: %w", err)
+	}
+
+	invoice := billing.CalculateGstInvoice(amount, registeredState, rate)
+	invoice.SubscriberID = subscriberID
+	invoice.GbIncluded = planVolumeGB
+	invoice.GbUsed = decimal.Zero
+
+	if _, err := inv.CreateInvoice(ctx, invoice); err != nil {
+		return fmt.Errorf("create invoice: %w", err)
+	}
+	return nil
+}
+
+// subCacheInvalidator invalidates a subscriber's RADIUS auth-cache entry
+// after a lifecycle action (plan change, termination). It talks to Redis
+// directly rather than via cache.SubscriberCache: that type also carries a
+// radius.DBQuerier for cache-miss fallback, which only the AAA daemon needs
+// — the API service has no reason to construct one just to delete a key.
+type subCacheInvalidator struct {
+	rc redis.UniversalClient
+}
+
+func (s *subCacheInvalidator) InvalidateSubscriber(ctx context.Context, username string) error {
+	if err := s.rc.Del(ctx, cache.SubscriberCacheKey(username)).Err(); err != nil {
+		return fmt.Errorf("invalidate subscriber cache: %w", err)
+	}
+	return nil
 }
 
 // extendPlanExpiry computes and applies the new plan_expiry for a renewal:

@@ -4,6 +4,7 @@ package db_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -499,6 +500,148 @@ func TestFR_SUB_003_PortalStore_GetPlanRenewalInfo(t *testing.T) {
 	t.Run("an unknown subscriber id returns an error", func(t *testing.T) {
 		if _, _, err := store.GetPlanRenewalInfo(ctx, 999); err == nil {
 			t.Error("expected an error for an unknown subscriber id")
+		}
+	})
+}
+
+// ── Lifecycle (FR-LC-001..002) ──────────────────────────────────────────────
+
+// TestFR_LC_001_APIStore_GetPlanChangeInfo verifies the two plans' price and
+// validity are read correctly (not swapped) and that an unknown subscriber
+// vs. an unknown plan id are distinguishable — the handler needs 404 for one
+// and 422 for the other.
+func TestFR_LC_001_APIStore_GetPlanChangeInfo(t *testing.T) {
+	database, pool := newTestDB(t)
+	ctx := context.Background()
+
+	seedPlan(ctx, t, pool, 1, "Old", "50M/50M", 0, "", "500.00") // validity_days = 30 (seedPlan's fixed value)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO plans (id, name, rate_limit_string, volume_gb, fup_threshold_bytes, price, validity_days)
+		VALUES (2, 'New', '100M/100M', 3300, 0, 1000.00, 60)`); err != nil {
+		t.Fatalf("seed plan 2: %v", err)
+	}
+	expiry := time.Now().Add(10 * 24 * time.Hour).UTC()
+	seedSubscriber(ctx, t, pool, 1, seedOpts{Username: "planchange@isp", PlanExpiry: &expiry})
+
+	store := database.API()
+
+	t.Run("both plans' price and validity are read, not swapped", func(t *testing.T) {
+		info, err := store.GetPlanChangeInfo(ctx, 1, 2)
+		if err != nil {
+			t.Fatalf("GetPlanChangeInfo: %v", err)
+		}
+		if info == nil {
+			t.Fatal("want a non-nil result for a known subscriber and plan")
+		}
+		if info.Username != "planchange@isp" {
+			t.Errorf("username: got %q", info.Username)
+		}
+		if !info.OldPrice.Equal(mustDecimal(t, "500.00")) || info.OldValidityDays != 30 {
+			t.Errorf("old plan: want price=500.00 validity=30, got price=%s validity=%d", info.OldPrice, info.OldValidityDays)
+		}
+		if !info.NewPrice.Equal(mustDecimal(t, "1000.00")) || info.NewValidityDays != 60 {
+			t.Errorf("new plan: want price=1000.00 validity=60, got price=%s validity=%d", info.NewPrice, info.NewValidityDays)
+		}
+		if info.CurrentExpiry == nil || !info.CurrentExpiry.Truncate(time.Second).Equal(expiry.Truncate(time.Second)) {
+			t.Errorf("current_expiry: want %v, got %v", expiry, info.CurrentExpiry)
+		}
+	})
+
+	t.Run("unknown subscriber returns (nil, nil)", func(t *testing.T) {
+		info, err := store.GetPlanChangeInfo(ctx, 999999, 2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if info != nil {
+			t.Errorf("want nil for an unknown subscriber, got %+v", info)
+		}
+	})
+
+	t.Run("unknown plan returns ErrInvalidPlan", func(t *testing.T) {
+		_, err := store.GetPlanChangeInfo(ctx, 1, 999999)
+		if !errors.Is(err, api.ErrInvalidPlan) {
+			t.Errorf("want ErrInvalidPlan for an unknown new_plan_id, got %v", err)
+		}
+	})
+}
+
+// TestFR_LC_001_APIStore_SetSubscriberPlan verifies plan_id and plan_expiry
+// move together in the one statement the proration handler relies on.
+func TestFR_LC_001_APIStore_SetSubscriberPlan(t *testing.T) {
+	database, pool := newTestDB(t)
+	ctx := context.Background()
+
+	seedPlan(ctx, t, pool, 1, "Old", "50M/50M", 0, "", "500.00")
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO plans (id, name, rate_limit_string, volume_gb, fup_threshold_bytes, price, validity_days)
+		VALUES (2, 'New', '100M/100M', 3300, 0, 1000.00, 60)`); err != nil {
+		t.Fatalf("seed plan 2: %v", err)
+	}
+	seedSubscriber(ctx, t, pool, 1, seedOpts{Username: "setplan@isp"})
+
+	store := database.API()
+	newExpiry := time.Now().Add(45 * 24 * time.Hour).UTC()
+
+	rec, err := store.SetSubscriberPlan(ctx, 1, 2, newExpiry)
+	if err != nil {
+		t.Fatalf("SetSubscriberPlan: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("want a non-nil record")
+	}
+	if rec.PlanID != 2 {
+		t.Errorf("plan_id: want 2, got %d", rec.PlanID)
+	}
+	if rec.PlanExpiry == nil || !rec.PlanExpiry.Truncate(time.Second).Equal(newExpiry.Truncate(time.Second)) {
+		t.Errorf("plan_expiry: want %v, got %v", newExpiry, rec.PlanExpiry)
+	}
+
+	t.Run("unknown subscriber returns (nil, nil)", func(t *testing.T) {
+		rec, err := store.SetSubscriberPlan(ctx, 999999, 2, newExpiry)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rec != nil {
+			t.Errorf("want nil for an unknown subscriber, got %+v", rec)
+		}
+	})
+}
+
+// TestFR_LC_002_APIStore_TerminateSubscriber verifies termination sets status
+// only — plan_id and wallet_balance, which a refund or historical reporting
+// may still need to read, must survive termination untouched.
+func TestFR_LC_002_APIStore_TerminateSubscriber(t *testing.T) {
+	database, pool := newTestDB(t)
+	ctx := context.Background()
+
+	seedPlan(ctx, t, pool, 1, "P", "100M/100M", 0, "", "799.00")
+	seedSubscriber(ctx, t, pool, 1, seedOpts{Username: "terminate@isp", Balance: "250.00"})
+
+	store := database.API()
+	rec, err := store.TerminateSubscriber(ctx, 1)
+	if err != nil {
+		t.Fatalf("TerminateSubscriber: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("want a non-nil record")
+	}
+	if rec.Status != "terminated" {
+		t.Errorf("status: want terminated, got %q", rec.Status)
+	}
+	if rec.PlanID != 1 {
+		t.Errorf("plan_id must survive termination unchanged, got %d", rec.PlanID)
+	}
+	if rec.WalletBalance != "250.00" {
+		t.Errorf("wallet_balance must survive termination unchanged, want 250.00, got %s", rec.WalletBalance)
+	}
+
+	t.Run("unknown subscriber returns (nil, nil)", func(t *testing.T) {
+		rec, err := store.TerminateSubscriber(ctx, 999999)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rec != nil {
+			t.Errorf("want nil for an unknown subscriber, got %+v", rec)
 		}
 	})
 }

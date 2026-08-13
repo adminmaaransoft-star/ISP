@@ -31,6 +31,18 @@
 | FR-BIL-005 | Wallet recharge endpoint must enforce `transaction_token` idempotency | CRD-PAY-001 | DDS §5.6 |
 | FR-BIL-006 | System must generate GSTR-1 compatible export: HSN summary, B2B/B2C split, state-wise breakdown | CRD §1.3 | MDS §4.3 |
 | FR-BIL-007 | Invoices must include plain-language usage summary (GB used / GB included) for subscriber clarity | CRD PER-006 | MDS §4.3 |
+| FR-BIL-008 | Every plan renewal that extends `plan_expiry` via a wallet debit (portal one-tap renewal or auto-renewal) must generate a GST invoice for that cycle | BO-007 | MDS §4.14 |
+| FR-BIL-009 | Subscribers whose plan has expired and whose wallet balance covers the plan price must be auto-renewed from that balance before dunning escalates them, rather than suspended while funded | BO-007 | MDS §4.14 |
+| FR-BIL-010 | Staff must be able to post a manual wallet credit or debit adjustment against a subscriber, distinct from a recharge, attributed to the issuing staff member with a required reason, and audit-logged | BO-007 | MDS §4.14 |
+| FR-BIL-011 | Staff must be able to issue a refund against a subscriber's wallet balance, tracked with its own status distinct from a wallet ledger adjustment, and audit-logged | BO-007 | MDS §4.14 |
+
+### Subscriber Lifecycle Management *(new — gap BO-007)*
+
+| FR ID | Requirement | CRD Ref | Module |
+|---|---|---|---|
+| FR-LC-001 | A staff-initiated plan change must recompute `plan_expiry` with proration for unused value on the old plan, invalidate the subscriber's Redis auth-cache entry, and enqueue a CoA to any active session — closing FR-AAA-007, which was specified but never implemented | BO-007, CRD-EXP-001 | MDS §4.14 |
+| FR-LC-002 | Subscriber termination must be a dedicated action that sets status to `terminated` and enqueues a PoD (forced disconnect) to any active session, distinct from suspension (which only throttles) | BO-007 | MDS §4.14 |
+| FR-LC-003 | All lifecycle-affecting actions (plan change, termination, adjustment, refund) must be audit-logged with staff attribution | BO-007, CRD-REG-001 | MDS §4.14 |
 
 ### FUP & Session Management
 

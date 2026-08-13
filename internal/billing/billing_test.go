@@ -184,6 +184,13 @@ func TestDunningToSubscriberStatus(t *testing.T) {
 		{billing.DunningGracePeriod, billing.DunningActive, "active"},
 		{billing.DunningSoftSuspended, billing.DunningActive, "active"},
 		{billing.DunningHardSuspended, billing.DunningActive, "active"},
+		// Renewing while still in a reminder stage (MDS §4.14's auto-renewal
+		// restore path, and any plan renewal generally) must also be able to
+		// walk back to active — these three edges were missing until fixed
+		// alongside the auto-renewal scanner.
+		{billing.DunningRemind7d, billing.DunningActive, "active"},
+		{billing.DunningRemind3d, billing.DunningActive, "active"},
+		{billing.DunningRemind1d, billing.DunningActive, "active"},
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.from)+"->"+string(tc.to), func(t *testing.T) {

@@ -592,3 +592,232 @@ check a box.
 - `tickets_unrouted_total` (gauge) — tickets with no matching
   `ticket_routing_rules` row, i.e. sitting in the general queue with no
   role signal at all
+
+## 4.14 Module 14: Billing Lifecycle — Auto-Renewal, Adjustments, Refunds & Subscriber Lifecycle *(new — gap BO-007, "subscriber lifecycle management, invoice generation, recurring billing, and payment adjustments")*
+
+**Module ID:** MOD-BILLC | **SAD Ref:** SAD-COMP-004 (extends MOD-BIL) | **FR:** FR-BIL-008..011, FR-LC-001..003
+
+### What exists today, and the gaps
+
+Three pieces of infrastructure this module depends on were already built and
+tested in isolation, each with a caller missing exactly the way
+`DunningScanner` was missing before MDS §4.13:
+
+1. `billing.CalculateGstInvoice` and `db.BillingStore.CreateInvoice` compute
+   and persist a correct GST invoice — but nothing in the renewal path calls
+   them. A subscriber can renew via the portal (`portal.RenewalProcessor`)
+   and receive service, with no invoice ever created for that charge.
+2. `billing.WalletService.Recharge` posts a double-entry credit — but the
+   only way a subscriber's wallet balance is ever consumed is a direct,
+   side-effect-free `SET wallet_balance` that does not exist yet either: no
+   code path debits the wallet for a plan renewal. Renewal today is entirely
+   "top up the wallet, then separately push `plan_expiry` out" — never "pay
+   for the plan out of what's already there."
+3. `billing.NextDunningState` is, by design, a pure function of `plan_expiry`
+   vs. `now` (MDS §4.13's design note), with no awareness of
+   `wallet_balance`. That decoupling is correct for what dunning does — but
+   it means a subscriber who tops up their wallet with more than enough to
+   cover their next cycle, then does nothing else, is suspended on schedule
+   anyway. Nothing converts "has the money" into "renewed."
+
+Separately, `UpdateSubscriber` (`internal/db/subscribers.go:167`) —
+the handler behind `PATCH /api/v1/subscribers/{id}` — accepts a bare
+`plan_id` change and applies it as a single `SET` with zero side effects: no
+proration, no Redis auth-cache invalidation, no CoA. This is the exact gap
+SRS FR-AAA-007 already specifies ("A plan change or top-up must invalidate
+the subscriber's Redis auth-cache entry and enqueue a CoA... so the new rate
+limit applies without waiting for reauthentication") but which no code path
+actually implements. This module closes it via a dedicated endpoint rather
+than by changing `PATCH`'s existing contract (see below).
+
+### Scope note: not Razorpay auto-charge
+
+The CRD is explicit that v1 is prepaid-only; there is no stored payment
+instrument and no Razorpay auto-debit mandate anywhere in this codebase.
+"Recurring billing" here means **auto-renewal from an existing wallet
+balance** — if a subscriber has already topped up enough to cover their next
+cycle, the system renews them automatically from that balance rather than
+making them take a manual action, or worse, suspending them while their
+money sits uncharged in the wallet. This is both a real reading of what
+"recurring billing" can mean in a prepaid-wallet architecture, and a genuine
+correctness gap (item 3 above) that predates this module.
+
+### Design decisions, and why
+
+**Invoice creation is folded into every path that extends `plan_expiry`
+through a wallet debit — portal renewal and the new auto-renewal scanner
+— not into `WalletService.Recharge` itself.** `Recharge` is also used for
+plain wallet top-ups that are not, by themselves, a renewal (a subscriber
+topping up ahead of when they intend to use it). Invoicing at the recharge
+boundary would create an invoice for money that has not yet paid for
+anything. Invoicing at the point `plan_expiry` actually advances ties the
+invoice to the thing it is supposed to represent: one cycle of service.
+
+**A new `WalletService.Post` method is added alongside `Recharge`, not
+inside it.** `Recharge` is FR-BIL-003/005's tested, idempotent, always-credit
+entry point and is left untouched. `Post` is the general primitive
+auto-renewal debits, staff adjustments, and refunds all need: an arbitrary
+direction (credit or debit) against `AccountSubscriberWallet`, with a
+caller-supplied counter account. It reuses the existing
+`WalletQuerier.RecordRecharge` DB primitive unchanged — that method already
+takes an arbitrary debit/credit leg pair and writes them atomically with the
+new balance; nothing about it is actually recharge-specific except the name.
+
+**Two new ledger accounts, not a parallel taxonomy.** `wallet_ledgers.account`
+gains `revenue_clearing` (the counter-leg for a plan charge consumed from the
+wallet — auto-renewal or, in a future pass, staff-recorded cash renewal) and
+`adjustment_clearing` (the counter-leg for staff-issued credits, debits, and
+refunds). `(account, entry_type, description)` already disambiguates every
+posting; a separate `reason`/`source` enum column would duplicate that.
+
+**A DB-level `CHECK (wallet_balance >= 0)` backstops the application-level
+balance check.** `Post`'s debit path reads the balance, computes the new
+one, and rejects the request with `ErrInsufficientBalance` before writing —
+but that read-then-write is not itself atomic against a second concurrent
+debit on the same subscriber (auto-renewal scanner and a staff adjustment
+racing, for instance). The application check is the normal path (a clean
+422); the CHECK constraint is what makes an overdraft actually impossible
+under a race, at the cost of that rare case surfacing as a 500 instead of a
+422. Both are cheap and neither replaces the other.
+
+**Auto-renewal restores `dunning_state` by extending `plan_expiry`, not by
+writing `dunning_state` directly.** Same reasoning as MDS §4.13: one
+scanner (`DunningScanner`) owns every transition of that column. Extending
+`plan_expiry` is enough — `NextDunningState` already computes `active` for a
+subscriber whose expiry has been pushed back into the future, so the very
+next `DunningScanner.Scan` walks them home.
+
+**Fixing `dunning.go` while verifying that path: `remind_7d`/`remind_3d`/
+`remind_1d` had no restore edge to `active` in `validTransitions`.**
+`NextDunningState` computes `active` as the correct target for a `remind_*`
+subscriber whose `plan_expiry` moved back out past 7 days (the switch
+statement's fall-through path, not its explicit restore branch, which only
+lists `grace_period`/`soft_suspended`/`hard_suspended`). `stepToward`
+special-cases any restore as a single hop straight to `active` regardless of
+current state, and `TransitionDunning` then rejects that hop for a `remind_*`
+subscriber because the edge was never listed — `advance` logs the error and
+the subscriber's `dunning_state` sticks at `remind_7d` forever. `status`
+stays `active` throughout (`dunningToSubscriberStatus` maps all three remind
+states to `active`), so this was invisible to any user-facing check — it
+only ever showed up as a stuck cosmetic value and a harmless recurring log
+error. It predates this module, but the new auto-renewal restore path
+exercises exactly this edge, so it is fixed here rather than left for a
+scanner that would otherwise error every single hour for any subscriber who
+renews while still in a reminder stage. Added: `remind_7d → active`,
+`remind_3d → active`, `remind_1d → active`.
+
+**Plan change is a dedicated endpoint (`POST
+/subscribers/{id}/plan-change`), not an extension of `PATCH
+/subscribers/{id}`.** The existing `PATCH` is already used for plain
+corrections (fixing a misrecorded `plan_id`, flipping `status` outside the
+dunning lifecycle) with call sites and tests that expect zero side effects.
+Overloading it to sometimes prorate, invalidate cache and fire a CoA — based
+on which field changed — makes its behavior conditional on intent that isn't
+visible in the request. A new endpoint makes "this changes what the
+subscriber owes and their live session" an explicit, auditable action
+instead of an inferred one, and closes FR-AAA-007 without touching `PATCH`'s
+existing contract.
+
+**Proration formula.** On a plan change from old→new with `now`:
+
+```
+remaining_days   = max(0, plan_expiry - now) in days
+old_daily_value  = old_plan.price / old_plan.validity_days
+credit           = remaining_days * old_daily_value      // unused value of the old plan
+new_daily_value  = new_plan.price / new_plan.validity_days
+bonus_days       = floor(credit / new_daily_value)
+new_plan_expiry  = now + new_plan.validity_days + bonus_days
+```
+
+The subscriber always gets the new plan's full validity from the moment of
+the change; unused value from the old plan is converted to bonus days on the
+new plan rather than a separate cash refund, since a staff-initiated plan
+change is not a payment event and there is no amount collected to refund
+against. A downgrade with no remaining old-plan value simply grants the new
+plan's own validity with zero bonus days.
+
+**Termination is a dedicated endpoint, not a `status` value reachable
+through `PATCH`.** `terminated` was already a legal value in the
+`subscribers.status` CHECK (migration 003) with no code path that ever wrote
+it and no PoD triggered when it did. Termination is irreversible and
+disconnects a live session (PoD, not CoA — the subscriber is not getting a
+new rate limit, they are leaving), which is different enough in
+consequence from every other status transition that it gets its own
+audited action rather than being one more value `PATCH` happens to accept.
+
+**Refunds are tracked in their own table (`payment_refunds`), separate from
+the `wallet_ledgers` posting that moves the money.** A refund is both a
+ledger event (money left the wallet) and a business event with its own
+lifecycle a wallet posting has no room to express — this deployment applies
+it synchronously (no live Razorpay refund API integration exists), so every
+refund is created with `status = 'processed'` immediately, but the column
+exists so a future asynchronous gateway refund can move through
+`requested → processed/failed` without a schema change. `payment_refunds`
+carries a `ledger_entry_id` FK to the `wallet_ledgers` row it corresponds to,
+so the two are always traceable to each other.
+
+### Write-path integration
+
+```
+Portal renewal (existing) ─┐
+                            ├─→ WalletService.{Recharge,Post} debits/credits
+Auto-renewal scanner (new)─┘        │
+                                     ▼
+                          plan_expiry advances (renewal only)
+                                     │
+                                     ▼
+                    CalculateGstInvoice → BillingStore.CreateInvoice
+                                     │
+                                     ▼
+                     next DunningScanner.Scan restores dunning_state
+```
+
+```
+Staff plan-change  → proration → SetSubscriberPlan(plan_id, plan_expiry)
+                                → cache.InvalidateSubscriber(username)
+                                → enqueue CoA (if an active session exists)
+
+Staff terminate    → status = terminated
+                                → enqueue PoD (if an active session exists)
+
+Staff adjustment   → WalletService.Post (credit or debit, adjustment_clearing)
+Staff refund       → WalletService.Post (debit, adjustment_clearing) + payment_refunds row
+```
+
+### RecurringBillingScanner
+
+Mirrors `DunningScanner`'s shape exactly (`Run`/`Scan`, injectable clock,
+Prometheus counters, per-item error logging that does not halt the batch)
+and is wired to run on a *shorter* interval (15 minutes vs. dunning's hourly)
+so it always gets a chance to renew a funded subscriber before the hourly
+dunning tick would otherwise escalate them — though because `NextDunningState`
+walks back to `active` from any suspended state once `plan_expiry` moves to
+the future, a renewal that lands after an escalation self-heals on dunning's
+next tick regardless of ordering.
+
+Candidate query: `status != 'terminated' AND plan_expiry <= NOW() AND
+wallet_balance >= plans.price` (joined on the subscriber's current plan).
+Only subscribers who have *already* reached their expiry are renewed —
+this is reactive top-up-triggered renewal, not early renewal, matching
+`portal.Renew`'s existing "renew when it's actually due" behavior.
+
+For each candidate: debit the plan price via `WalletService.Post`
+(`revenue_clearing` counter-leg), extend `plan_expiry` by the same
+`max(now, currentExpiry) + validity_days` rule `extendPlanExpiry` already
+uses for portal renewal, create the invoice, and — since a subscriber can be
+caught by this scanner while already `grace_period`/`soft_suspended`/
+`hard_suspended` (e.g. the first run after deployment, for subscribers who
+lapsed before auto-renewal existed) — call `TransitionDunning(..., active)`
+directly rather than waiting up to an hour for the dunning scanner to notice.
+
+### Key Metrics
+
+- `billing_autorenewal_total` (counter, labels: `result` = renewed/
+  insufficient_balance/error) — insufficient_balance is expected volume
+  (most candidates the query considers), not a failure signal
+- `billing_autorenewal_invoice_failures_total` (counter) — the wallet debit
+  already committed by the time invoicing runs; a failure here needs
+  reconciliation, not a retried debit
+- `billing_lifecycle_actions_total` (counter, labels: `action` =
+  plan_change/terminate/adjustment/refund) — staff-lifecycle action volume,
+  the same shape as `billing_dunning_transitions_total`

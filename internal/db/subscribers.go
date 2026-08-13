@@ -60,6 +60,7 @@ type APIStore struct{ pool dbPool }
 var (
 	_ api.SubscriberQuerier = (*APIStore)(nil)
 	_ api.KYCQuerier        = (*APIStore)(nil)
+	_ api.LifecycleQuerier  = (*APIStore)(nil)
 )
 
 const apiSubscriberColumns = `
@@ -181,6 +182,90 @@ func (s *APIStore) UpdateSubscriber(ctx context.Context, id int, planID *int, st
 	}
 	if err != nil {
 		return nil, fmt.Errorf("db: update subscriber %d: %w", id, err)
+	}
+	return rec, nil
+}
+
+// GetPlanChangeInfo loads what plan-change proration needs: both plans'
+// price/validity and the subscriber's current plan_expiry.
+//
+// Two queries rather than one join: the new plan id is caller-supplied and
+// may not exist, and a LEFT JOIN would make "unknown plan" and "plan exists
+// but has NULL somewhere" indistinguishable from the row shape alone.
+func (s *APIStore) GetPlanChangeInfo(ctx context.Context, subscriberID, newPlanID int) (*api.PlanChangeInfo, error) {
+	const subQ = `
+		SELECT s.username, s.plan_expiry, p.price::text, p.validity_days
+		FROM subscribers s
+		JOIN plans p ON p.id = s.plan_id
+		WHERE s.id = $1`
+
+	info := &api.PlanChangeInfo{}
+	var oldPrice string
+	err := s.pool.QueryRow(ctx, subQ, subscriberID).Scan(
+		&info.Username, &info.CurrentExpiry, &oldPrice, &info.OldValidityDays)
+	if isNoRows(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db: get plan change info for subscriber %d: %w", subscriberID, err)
+	}
+	if info.OldPrice, err = parseDecimal(oldPrice); err != nil {
+		return nil, err
+	}
+
+	const planQ = `SELECT price::text, validity_days FROM plans WHERE id = $1`
+	var newPrice string
+	err = s.pool.QueryRow(ctx, planQ, newPlanID).Scan(&newPrice, &info.NewValidityDays)
+	if isNoRows(err) {
+		return nil, api.ErrInvalidPlan
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db: get new plan %d: %w", newPlanID, err)
+	}
+	if info.NewPrice, err = parseDecimal(newPrice); err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+// SetSubscriberPlan applies a plan change: new plan_id and the caller-computed
+// (already prorated) plan_expiry, in one statement.
+func (s *APIStore) SetSubscriberPlan(ctx context.Context, subscriberID, newPlanID int, newExpiry time.Time) (*api.SubscriberRecord, error) {
+	const q = `
+		WITH upd AS (
+			UPDATE subscribers
+			SET plan_id = $2, plan_expiry = $3
+			WHERE id = $1
+			RETURNING *
+		)
+		SELECT ` + apiSubscriberColumns + ` FROM upd s`
+
+	rec, err := scanAPISubscriber(s.pool.QueryRow(ctx, q, subscriberID, newPlanID, newExpiry))
+	if isNoRows(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db: change plan for subscriber %d: %w", subscriberID, err)
+	}
+	return rec, nil
+}
+
+// TerminateSubscriber sets status to terminated. Irreversible: there is no
+// code path that ever writes a subscriber back out of this state.
+func (s *APIStore) TerminateSubscriber(ctx context.Context, subscriberID int) (*api.SubscriberRecord, error) {
+	const q = `
+		WITH upd AS (
+			UPDATE subscribers SET status = 'terminated' WHERE id = $1
+			RETURNING *
+		)
+		SELECT ` + apiSubscriberColumns + ` FROM upd s`
+
+	rec, err := scanAPISubscriber(s.pool.QueryRow(ctx, q, subscriberID))
+	if isNoRows(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db: terminate subscriber %d: %w", subscriberID, err)
 	}
 	return rec, nil
 }

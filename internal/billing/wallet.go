@@ -2,6 +2,7 @@ package billing
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/shopspring/decimal"
@@ -11,7 +12,21 @@ import (
 const (
 	AccountSubscriberWallet = "subscriber_wallet"
 	AccountGatewayClearing  = "payment_gateway_clearing"
+	// AccountRevenueClearing is the counter-leg for a plan charge consumed
+	// from the wallet (auto-renewal) — MDS §4.14.
+	AccountRevenueClearing = "revenue_clearing"
+	// AccountAdjustmentClearing is the counter-leg for staff-issued wallet
+	// credits, debits and refunds — MDS §4.14.
+	AccountAdjustmentClearing = "adjustment_clearing"
 )
+
+// ErrInsufficientBalance is returned by Post when a debit would take the
+// wallet below zero. The application-level check that returns this is the
+// normal path (a clean 4xx for the caller); a DB-level CHECK constraint on
+// subscribers.wallet_balance is the backstop for the race this check cannot
+// close on its own (two concurrent debits both reading the same starting
+// balance) — see MDS §4.14.
+var ErrInsufficientBalance = errors.New("billing: insufficient wallet balance")
 
 // WalletQuerier is the DB interface required by WalletService.
 type WalletQuerier interface {
@@ -39,12 +54,13 @@ type Transaction struct {
 type WalletEntry struct {
 	SubscriberID     int
 	FranchiseID      *int
-	Account          string // subscriber_wallet | payment_gateway_clearing
+	Account          string // subscriber_wallet | payment_gateway_clearing | revenue_clearing | adjustment_clearing
 	EntryType        string // credit | debit
 	Amount           decimal.Decimal
 	BalanceAfter     decimal.Decimal
 	TransactionToken *string // nil = no idempotency key (cash, or counter-leg)
 	Description      string
+	AdjustedBy       string // staff username; empty for non-staff-initiated legs
 }
 
 // RechargePosting is the atomic unit a recharge writes: both ledger legs plus
@@ -134,6 +150,109 @@ func (s *WalletService) Recharge(ctx context.Context, req RechargeRequest) (*Tra
 	tx, err := s.db.RecordRecharge(ctx, posting)
 	if err != nil {
 		return nil, fmt.Errorf("billing: record recharge: %w", err)
+	}
+	tx.BalanceAfter = newBalance
+	return tx, nil
+}
+
+// PostRequest carries the inputs for an arbitrary-direction wallet posting:
+// auto-renewal charges, staff adjustments, and refunds.
+type PostRequest struct {
+	SubscriberID     int
+	FranchiseID      *int
+	Amount           decimal.Decimal // always positive; Direction says which way it moves
+	Direction        string          // "credit" (wallet balance increases) or "debit" (decreases)
+	CounterAccount   string          // AccountRevenueClearing or AccountAdjustmentClearing
+	TransactionToken string          // optional idempotency key
+	AdjustedBy       string          // staff username; empty for non-staff-initiated postings
+	Description      string
+}
+
+// Post performs an arbitrary-direction double-entry wallet posting: a
+// subscriber_wallet leg (credit or debit, per Direction) and a matching
+// counter leg against CounterAccount. Unlike Recharge, which always credits
+// the wallet, Post is the shared primitive auto-renewal debits, staff
+// adjustments and refunds all need — MDS §4.14. It reuses the same
+// WalletQuerier.RecordRecharge DB primitive Recharge uses: that method
+// already writes an arbitrary debit/credit leg pair atomically with the new
+// balance, so nothing about it is actually recharge-specific except the name.
+func (s *WalletService) Post(ctx context.Context, req PostRequest) (*Transaction, error) {
+	if req.Amount.LessThanOrEqual(decimal.Zero) {
+		return nil, fmt.Errorf("billing: post amount must be positive, got %s", req.Amount)
+	}
+	if req.Direction != "credit" && req.Direction != "debit" {
+		return nil, fmt.Errorf("billing: post direction must be \"credit\" or \"debit\", got %q", req.Direction)
+	}
+
+	if req.TransactionToken != "" {
+		existing, err := s.db.GetTransactionByToken(ctx, req.TransactionToken)
+		if err == nil && existing != nil {
+			return existing, nil
+		}
+	}
+
+	currentBalance, err := s.db.GetSubscriberBalance(ctx, req.SubscriberID)
+	if err != nil {
+		return nil, fmt.Errorf("billing: get balance: %w", err)
+	}
+
+	var newBalance decimal.Decimal
+	if req.Direction == "credit" {
+		newBalance = currentBalance.Add(req.Amount)
+	} else {
+		newBalance = currentBalance.Sub(req.Amount)
+		if newBalance.IsNegative() {
+			return nil, ErrInsufficientBalance
+		}
+	}
+
+	var tokenPtr *string
+	if req.TransactionToken != "" {
+		t := req.TransactionToken
+		tokenPtr = &t
+	}
+
+	// RecordRecharge inserts whatever is in the Debit/Credit struct fields
+	// using each WalletEntry's own EntryType — the field names are really
+	// "tokenless leg" (Debit) and "token-bearing leg that becomes the
+	// returned Transaction" (Credit), not a claim that Credit.EntryType is
+	// always "credit". The wallet leg always goes in Credit (so a caller
+	// gets back the wallet-affecting row's own id/description, not the
+	// counter leg's) with its real direction as EntryType; only which
+	// physical row ends up counted as a ledger "credit" vs "debit" comes
+	// from that field, same as every other caller of this DB primitive.
+	counterEntryType := "debit"
+	if req.Direction == "debit" {
+		counterEntryType = "credit"
+	}
+	posting := RechargePosting{
+		SubscriberID: req.SubscriberID,
+		NewBalance:   newBalance,
+		Credit: WalletEntry{
+			SubscriberID:     req.SubscriberID,
+			FranchiseID:      req.FranchiseID,
+			Account:          AccountSubscriberWallet,
+			EntryType:        req.Direction,
+			Amount:           req.Amount,
+			BalanceAfter:     newBalance,
+			TransactionToken: tokenPtr,
+			Description:      req.Description,
+			AdjustedBy:       req.AdjustedBy,
+		},
+		Debit: WalletEntry{
+			SubscriberID: req.SubscriberID,
+			FranchiseID:  req.FranchiseID,
+			Account:      req.CounterAccount,
+			EntryType:    counterEntryType,
+			Amount:       req.Amount,
+			BalanceAfter: newBalance,
+			Description:  "counter-entry: " + req.Description,
+		},
+	}
+
+	tx, err := s.db.RecordRecharge(ctx, posting)
+	if err != nil {
+		return nil, fmt.Errorf("billing: record posting: %w", err)
 	}
 	tx.BalanceAfter = newBalance
 	return tx, nil

@@ -160,18 +160,38 @@ sla_policies, category_priority_defaults, ticket_routing_rules ── (standalon
 | `CONSTRAINT chk_gst_logic` | | `(cgst_amount>0 AND igst_amount=0) OR (igst_amount>0 AND cgst_amount=0) OR (cgst_amount=0 AND igst_amount=0)` | |
 
 ### Table: `wallet_ledgers`
-**FR:** FR-BIL-003, FR-BIL-005, FR-REV-002 | **Module:** MOD-BIL
+**FR:** FR-BIL-003, FR-BIL-005, FR-BIL-009..011, FR-REV-002 | **Module:** MOD-BIL, MOD-BILLC
 
 | Column | Type | Constraints | Description |
 |---|---|---|---|
 | `id` | `SERIAL` | PK | |
 | `subscriber_id` | `INTEGER` | FK → subscribers.id | |
 | `franchise_id` | `INTEGER` | FK → franchises.id NULLABLE | For LCO tracking |
+| `account` | `VARCHAR(40)` | NOT NULL DEFAULT `subscriber_wallet` | `subscriber_wallet`, `payment_gateway_clearing`, `revenue_clearing` *(new — migration 025)*, `adjustment_clearing` *(new — migration 025)* |
 | `entry_type` | `VARCHAR(20)` | NOT NULL | `credit`, `debit` |
 | `amount` | `NUMERIC(12,2)` | NOT NULL | |
 | `balance_after` | `NUMERIC(12,2)` | NOT NULL | Running balance snapshot |
 | `transaction_token` | `VARCHAR(100)` | UNIQUE NULLABLE | Idempotency key |
 | `description` | `TEXT` | | |
+| `adjusted_by_username` | `VARCHAR(100)` | NULLABLE *(new — migration 025)* | Staff username for adjustment/refund legs; NULL for recharge, auto-renewal and other non-staff-initiated postings |
+| `created_at` | `TIMESTAMPTZ` | DEFAULT NOW() | |
+
+`subscribers.wallet_balance` gains `CONSTRAINT chk_wallet_balance_nonneg
+CHECK (wallet_balance >= 0)` *(new — migration 025)* — the hard backstop
+behind `WalletService.Post`'s application-level balance check (MDS §4.14).
+
+### Table: `payment_refunds` *(new — FR-BIL-011, migration 025)*
+**Module:** MOD-BILLC
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `subscriber_id` | `INTEGER` | FK → subscribers.id NOT NULL | |
+| `ledger_entry_id` | `INTEGER` | FK → wallet_ledgers.id NOT NULL | The wallet debit leg this refund posted |
+| `amount` | `NUMERIC(12,2)` | NOT NULL CHECK > 0 | |
+| `reason` | `TEXT` | NOT NULL | |
+| `status` | `VARCHAR(20)` | NOT NULL DEFAULT `processed` CHECK IN (`requested`,`processed`,`failed`) | This deployment has no live gateway refund API, so every refund is written as `processed` at creation; the column exists so a future asynchronous gateway refund can move through the full lifecycle without a schema change |
+| `refunded_by_username` | `VARCHAR(100)` | NOT NULL | Staff attribution |
 | `created_at` | `TIMESTAMPTZ` | DEFAULT NOW() | |
 
 ### Table: `subscriber_session_history`

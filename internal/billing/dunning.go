@@ -39,6 +39,13 @@ var validTransitions = []DunningTransition{
 	{DunningGracePeriod, DunningActive, "payment received"},
 	{DunningSoftSuspended, DunningActive, "payment received"},
 	{DunningHardSuspended, DunningActive, "payment received"},
+	// A subscriber can renew while still in a reminder stage — service was
+	// never disrupted (dunningToSubscriberStatus maps all three to "active"),
+	// but the state itself must still be able to walk back or NextDunningState
+	// computing "active" for a far-future plan_expiry has nowhere to land.
+	{DunningRemind7d, DunningActive, "payment received"},
+	{DunningRemind3d, DunningActive, "payment received"},
+	{DunningRemind1d, DunningActive, "payment received"},
 }
 
 // DunningQuerier is the DB interface needed by the dunning state machine.

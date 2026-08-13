@@ -17,10 +17,12 @@ import (
 type BillingStore struct{ pool dbPool }
 
 var (
-	_ billing.WalletQuerier  = (*BillingStore)(nil)
-	_ billing.DunningQuerier = (*BillingStore)(nil)
-	_ api.LedgerQuerier      = (*BillingStore)(nil)
-	_ api.InvoiceQuerier     = (*BillingStore)(nil)
+	_ billing.WalletQuerier      = (*BillingStore)(nil)
+	_ billing.DunningQuerier     = (*BillingStore)(nil)
+	_ billing.RenewalScanQuerier = (*BillingStore)(nil)
+	_ api.LedgerQuerier          = (*BillingStore)(nil)
+	_ api.InvoiceQuerier         = (*BillingStore)(nil)
+	_ api.RefundQuerier          = (*BillingStore)(nil)
 )
 
 // GetSubscriberBalance reads the current wallet balance.
@@ -83,8 +85,8 @@ func (s *BillingStore) RecordRecharge(ctx context.Context, p billing.RechargePos
 	const insertLeg = `
 		INSERT INTO wallet_ledgers (
 			subscriber_id, franchise_id, account, entry_type,
-			amount, balance_after, transaction_token, description
-		) VALUES ($1,$2,$3,$4,$5::numeric,$6::numeric,$7,$8)
+			amount, balance_after, transaction_token, description, adjusted_by_username
+		) VALUES ($1,$2,$3,$4,$5::numeric,$6::numeric,$7,$8,NULLIF($9,''))
 		RETURNING id`
 
 	const updateBalance = `UPDATE subscribers SET wallet_balance = $2::numeric WHERE id = $1`
@@ -97,6 +99,7 @@ func (s *BillingStore) RecordRecharge(ctx context.Context, p billing.RechargePos
 		if _, err := dbTx.Exec(ctx, insertLeg,
 			p.Debit.SubscriberID, p.Debit.FranchiseID, p.Debit.Account, p.Debit.EntryType,
 			p.Debit.Amount.String(), p.Debit.BalanceAfter.String(), nil, p.Debit.Description,
+			p.Debit.AdjustedBy,
 		); err != nil {
 			return fmt.Errorf("db: insert debit leg: %w", err)
 		}
@@ -105,7 +108,7 @@ func (s *BillingStore) RecordRecharge(ctx context.Context, p billing.RechargePos
 		if err := dbTx.QueryRow(ctx, insertLeg,
 			p.Credit.SubscriberID, p.Credit.FranchiseID, p.Credit.Account, p.Credit.EntryType,
 			p.Credit.Amount.String(), p.Credit.BalanceAfter.String(), p.Credit.TransactionToken,
-			p.Credit.Description,
+			p.Credit.Description, p.Credit.AdjustedBy,
 		).Scan(&creditID); err != nil {
 			return fmt.Errorf("db: insert credit leg: %w", err)
 		}
@@ -215,6 +218,107 @@ func (s *BillingStore) SetSubscriberDunningState(ctx context.Context, subscriber
 		return fmt.Errorf("db: subscriber %d: %w", subscriberID, ErrNotFound)
 	}
 	return nil
+}
+
+// ListRenewalCandidates returns subscribers whose plan has already expired
+// and whose wallet balance covers their current plan's price — the auto-
+// renewal scanner's candidate set (FR-BIL-009).
+//
+// Terminated subscribers are excluded for the same reason ListDunningCandidates
+// excludes them: they have left, and there is nothing to renew them into.
+func (s *BillingStore) ListRenewalCandidates(ctx context.Context) ([]billing.RenewalCandidate, error) {
+	const q = `
+		SELECT s.id, s.username, s.franchise_id, s.registered_state, s.dunning_state,
+		       p.name, p.price::text, p.validity_days, p.volume_gb, s.plan_expiry
+		  FROM subscribers s
+		  JOIN plans p ON p.id = s.plan_id
+		 WHERE s.status <> 'terminated'
+		   AND s.plan_expiry IS NOT NULL
+		   AND s.plan_expiry <= NOW()
+		   AND s.wallet_balance >= p.price`
+
+	rows, err := s.pool.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("db: list renewal candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var out []billing.RenewalCandidate
+	for rows.Next() {
+		var (
+			c     billing.RenewalCandidate
+			state string
+			price string
+		)
+		if err := rows.Scan(
+			&c.SubscriberID, &c.Username, &c.FranchiseID, &c.RegisteredState, &state,
+			&c.PlanName, &price, &c.PlanValidityDays, &c.PlanVolumeGB, &c.PlanExpiry,
+		); err != nil {
+			return nil, fmt.Errorf("db: scan renewal candidate: %w", err)
+		}
+		c.DunningState = billing.DunningState(state)
+		if c.PlanPrice, err = parseDecimal(price); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterate renewal candidates: %w", err)
+	}
+	return out, nil
+}
+
+// SetPlanExpiry extends a subscriber's plan validity after a successful
+// auto-renewal. Mirrors PortalStore.SetPlanExpiry (used by portal renewal) —
+// kept as its own method on BillingStore rather than a shared cross-store
+// dependency, matching how every other store in this package owns its own
+// small queries against the pool it already holds.
+func (s *BillingStore) SetPlanExpiry(ctx context.Context, subscriberID int, expiry time.Time) error {
+	const q = `UPDATE subscribers SET plan_expiry = $2 WHERE id = $1`
+	if _, err := s.pool.Exec(ctx, q, subscriberID, expiry); err != nil {
+		return fmt.Errorf("db: set plan expiry for subscriber %d: %w", subscriberID, err)
+	}
+	return nil
+}
+
+// CreateRefund persists a refund's business record, linked to the wallet
+// ledger row WalletService.Post wrote for the debit. This deployment has no
+// live gateway refund API, so every refund is written as already processed.
+//
+// FR: FR-BIL-011 | DBD §6.2 payment_refunds
+func (s *BillingStore) CreateRefund(ctx context.Context, subscriberID, ledgerEntryID int, amount decimal.Decimal, reason, refundedBy string) (int, error) {
+	const q = `
+		INSERT INTO payment_refunds (subscriber_id, ledger_entry_id, amount, reason, status, refunded_by_username)
+		VALUES ($1, $2, $3::numeric, $4, 'processed', $5)
+		RETURNING id`
+
+	var id int
+	err := s.pool.QueryRow(ctx, q, subscriberID, ledgerEntryID, amount.String(), reason, refundedBy).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("db: create refund for subscriber %d: %w", subscriberID, err)
+	}
+	return id, nil
+}
+
+// GetInvoiceInputs returns the two subscriber-specific inputs a renewal
+// invoice needs beyond the amount actually charged: the state that decides
+// intrastate vs interstate GST, and the current plan's data volume for
+// FR-BIL-007's usage summary.
+func (s *BillingStore) GetInvoiceInputs(ctx context.Context, subscriberID int) (registeredState string, planVolumeGB int, err error) {
+	const q = `
+		SELECT s.registered_state, p.volume_gb
+		FROM subscribers s
+		JOIN plans p ON p.id = s.plan_id
+		WHERE s.id = $1`
+
+	err = s.pool.QueryRow(ctx, q, subscriberID).Scan(&registeredState, &planVolumeGB)
+	if isNoRows(err) {
+		return "", 0, fmt.Errorf("db: subscriber %d: %w", subscriberID, ErrNotFound)
+	}
+	if err != nil {
+		return "", 0, fmt.Errorf("db: get invoice inputs for subscriber %d: %w", subscriberID, err)
+	}
+	return registeredState, planVolumeGB, nil
 }
 
 // CreateInvoice persists a computed GST invoice.
