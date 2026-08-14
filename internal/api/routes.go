@@ -75,23 +75,25 @@ type Handler struct {
 	walletSvc *billing.WalletService
 	keyStore  crypto.KeyStore
 
-	ledger     LedgerQuerier
-	sessions   SessionReader
-	sessionCtl SessionController
-	tasks      TaskEnqueuer
-	invoices   InvoiceQuerier
-	pdfGen     PDFGenerator
-	tickets    TicketAdminQuerier
-	lea        LEAQuerier
-	leaAudit   LEAAuditRecorder
-	franchises FranchiseQuerier
-	lifecycle  LifecycleQuerier
-	refunds    RefundQuerier
-	subCache   SubscriberCacheInvalidator
-	approvals  ApprovalQuerier
-	fieldTasks FieldTaskQuerier
-	leads      LeadQuerier
-	inventory  InventoryQuerier
+	ledger        LedgerQuerier
+	sessions      SessionReader
+	sessionCtl    SessionController
+	tasks         TaskEnqueuer
+	invoices      InvoiceQuerier
+	pdfGen        PDFGenerator
+	tickets       TicketAdminQuerier
+	lea           LEAQuerier
+	leaAudit      LEAAuditRecorder
+	franchises    FranchiseQuerier
+	lifecycle     LifecycleQuerier
+	refunds       RefundQuerier
+	subCache      SubscriberCacheInvalidator
+	approvals     ApprovalQuerier
+	fieldTasks    FieldTaskQuerier
+	leads         LeadQuerier
+	inventory     InventoryQuerier
+	announcements AnnouncementQuerier
+	pushTokens    PushTokenQuerier
 	// subscriberLister backs revenue.ListSubscribersHandler, which is a
 	// plain http.HandlerFunc rather than a method on Handler — so the
 	// dependency is held here and passed to it at route-registration time.
@@ -136,6 +138,8 @@ type HandlerDeps struct {
 	FieldTasks       FieldTaskQuerier
 	Leads            LeadQuerier
 	Inventory        InventoryQuerier
+	Announcements    AnnouncementQuerier
+	PushTokens       PushTokenQuerier
 
 	// Health serves GET /api/v1/subscribers/{id}/health (FR-OBS-004). The
 	// implementation lives in internal/health, which cannot be imported here
@@ -177,6 +181,8 @@ func NewHandler(deps HandlerDeps) *Handler {
 		fieldTasks:       deps.FieldTasks,
 		leads:            deps.Leads,
 		inventory:        deps.Inventory,
+		announcements:    deps.Announcements,
+		pushTokens:       deps.PushTokens,
 		health:           deps.Health,
 
 		razorpayWebhookSecret: deps.RazorpayWebhookSecret,
@@ -313,6 +319,26 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, jwtSecret string) {
 		admin(http.HandlerFunc(h.ListPurchases)))
 	mux.Handle("POST /api/v1/cpe/purchases",
 		admin(http.HandlerFunc(h.RecordPurchase)))
+
+	// Announcements (FR-ANN-001..002 | MDS §4.17). Composing a broadcast to
+	// the whole subscriber base is an owner/billing-tier action; the portal
+	// banner feed is subscriber-authenticated and handled separately below.
+	mux.Handle("POST /api/v1/announcements",
+		admin(http.HandlerFunc(h.CreateAnnouncement)))
+	mux.Handle("GET /api/v1/announcements",
+		staffRead(http.HandlerFunc(h.ListAnnouncements)))
+	mux.Handle("POST /api/v1/announcements/{id}/send",
+		admin(http.HandlerFunc(h.SendAnnouncement)))
+
+	// Subscriber-facing: the banner feed and push-token registration both
+	// derive their subscriber from the token, never from a path or body.
+	subscriberSelf := func(next http.Handler) http.Handler {
+		return auth(middleware.RequireRole("subscriber")(next))
+	}
+	mux.Handle("GET /api/v1/announcements/portal",
+		subscriberSelf(http.HandlerFunc(h.GetPortalAnnouncements)))
+	mux.Handle("POST /api/v1/push-tokens",
+		subscriberSelf(http.HandlerFunc(h.RegisterPushToken)))
 
 	// Wallets (API-003)
 	mux.Handle("POST /api/v1/wallets/recharge",

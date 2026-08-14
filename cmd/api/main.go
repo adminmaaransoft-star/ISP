@@ -158,7 +158,10 @@ func run() error {
 		// else.
 		Leads:     database.CRM(),
 		Inventory: database.Inventory(),
-		Health:    http.HandlerFunc(healthHandler.GetSubscriberHealth),
+		// Announcements and push-token registration (FR-ANN, FR-NOTIF-013).
+		Announcements: database.Announcements(),
+		PushTokens:    database.Notifications(),
+		Health:        http.HandlerFunc(healthHandler.GetSubscriberHealth),
 
 		RazorpayWebhookSecret: cfg.RazorpayWebhookSecret,
 	})

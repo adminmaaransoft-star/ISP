@@ -14,6 +14,11 @@ type stubNotifDB struct {
 	subscriber    *notifications.Subscriber
 	loggedEntries []notifications.NotificationLog
 	statusUpdates map[string]string
+	pushTokens    []string
+}
+
+func (s *stubNotifDB) ListPushTokens(_ context.Context, _ int) ([]string, error) {
+	return s.pushTokens, nil
 }
 
 func (s *stubNotifDB) GetSubscriber(_ context.Context, _ int) (*notifications.Subscriber, error) {

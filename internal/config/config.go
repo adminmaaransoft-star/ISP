@@ -70,6 +70,19 @@ type Config struct {
 	SMSAPIKey   string
 	SMSSenderID string
 
+	// Email (FR-NOTIF-012). An unset SMTPHost leaves the channel
+	// unconfigured, which Dispatcher reports per-send rather than failing
+	// startup — the same rule Gotenberg and Razorpay follow.
+	SMTPHost     string
+	SMTPPort     int
+	SMTPUsername string
+	SMTPPassword string
+	SMTPFrom     string
+
+	// Push (FR-NOTIF-013), via OneSignal.
+	OneSignalAppID  string
+	OneSignalAPIKey string
+
 	// Integrations
 	GotenbergURL        string
 	PagerDutyRoutingKey string
@@ -129,6 +142,15 @@ func Load(service string) (*Config, error) {
 		SMSProvider: env("SMS_GATEWAY_PROVIDER", "msg91"),
 		SMSAPIKey:   env("SMS_GATEWAY_API_KEY", ""),
 		SMSSenderID: env("SMS_GATEWAY_SENDER_ID", "BSSOSS"),
+
+		SMTPHost:     env("SMTP_HOST", ""),
+		SMTPPort:     envInt("SMTP_PORT", 587),
+		SMTPUsername: env("SMTP_USERNAME", ""),
+		SMTPPassword: env("SMTP_PASSWORD", ""),
+		SMTPFrom:     env("SMTP_FROM", "no-reply@isp.local"),
+
+		OneSignalAppID:  env("ONESIGNAL_APP_ID", ""),
+		OneSignalAPIKey: env("ONESIGNAL_API_KEY", ""),
 
 		GotenbergURL:        env("GOTENBERG_URL", ""),
 		PagerDutyRoutingKey: env("PAGERDUTY_ROUTING_KEY", ""),
@@ -231,6 +253,8 @@ func (c *Config) Redact() map[string]string {
 		"razorpay_key_secret":    setOrUnset(c.RazorpayKeySecret),
 		"whatsapp_token":         setOrUnset(c.WhatsAppAccessToken),
 		"sms_api_key":            setOrUnset(c.SMSAPIKey),
+		"smtp_password":          setOrUnset(c.SMTPPassword),
+		"onesignal_api_key":      setOrUnset(c.OneSignalAPIKey),
 		"pagerduty_key":          setOrUnset(c.PagerDutyRoutingKey),
 		"gotenberg_url":          c.GotenbergURL,
 	}

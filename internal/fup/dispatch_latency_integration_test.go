@@ -34,6 +34,10 @@ const dispatchBudget = 5 * time.Second
 // itLatencyNotifDB is a NotifQuerier that captures the notification_log row
 // the WhatsApp client writes, so the test can read the real SentAt value the
 // production code stamps rather than a timestamp the test invented.
+func (d *itLatencyNotifDB) ListPushTokens(_ context.Context, _ int) ([]string, error) {
+	return nil, nil
+}
+
 type itLatencyNotifDB struct {
 	mu       sync.Mutex
 	phone    string

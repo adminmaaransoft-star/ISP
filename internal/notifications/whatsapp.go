@@ -24,6 +24,15 @@ var (
 		Name: "notification_dispatch_total",
 		Help: "Notifications dispatched by channel, template, and status",
 	}, []string{"channel", "template_id", "status"})
+
+	// MissingDestinationTotal counts subscribers a channel could not reach
+	// because they have no address or token for it. This is the number that
+	// says whether a channel is worth paying for — a push provider reaching
+	// 4% of the base is a different decision from one reaching 60%.
+	MissingDestinationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "notifications_missing_destination_total",
+		Help: "Notifications not sent because the subscriber has no destination on that channel",
+	}, []string{"channel"})
 )
 
 // NotificationLog is the minimal representation for persistence.
@@ -34,24 +43,33 @@ type NotificationLog struct {
 	TriggeredByEvent  string
 	ProviderMessageID string
 	DeliveryStatus    string
-	SentAt            time.Time
+	// FailureReason records why a delivery did not happen — an unreachable
+	// subscriber (no email address, no device token) as much as a provider
+	// rejection, so "we never sent it" and "we sent it and it bounced" stay
+	// distinguishable in the log.
+	FailureReason string
+	SentAt        time.Time
 }
 
 // NotificationTask is the input for the Dispatcher.
 type NotificationTask struct {
 	SubscriberID int
-	Channel      string // whatsapp | sms | email
+	Channel      string // whatsapp | sms | email | push
 	TemplateID   string
 	TriggerEvent string
 	Class        string // marketing | transactional
 	Variables    []string
 	ToPhone      string // E.164
+	// Subject is the email subject line and the push notification heading.
+	// WhatsApp and SMS have no equivalent and ignore it.
+	Subject string
 }
 
 // Subscriber holds the fields needed for dispatch decisions.
 type Subscriber struct {
 	ID           int
 	MobileNumber string // E.164
+	Email        string // empty = unreachable by email
 	DndOptOut    bool
 }
 
@@ -62,6 +80,10 @@ type NotifQuerier interface {
 	// UpdateDeliveryStatus advances a logged notification to the status reported
 	// by the provider's delivery callback.
 	UpdateDeliveryStatus(ctx context.Context, providerMessageID, status string) error
+	// ListPushTokens returns every device token registered for a subscriber.
+	// An empty slice is a normal state, not an error: most subscribers never
+	// install the app.
+	ListPushTokens(ctx context.Context, subscriberID int) ([]string, error)
 }
 
 // templateNames maps internal template IDs to the template names registered

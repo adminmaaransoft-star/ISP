@@ -170,6 +170,9 @@ func (d *DB) CRM() *CRMStore { return &CRMStore{pool: d.pool} }
 // Inventory returns the store satisfying api.InventoryQuerier.
 func (d *DB) Inventory() *InventoryStore { return &InventoryStore{pool: d.pool} }
 
+// Announcements returns the store satisfying api.AnnouncementQuerier.
+func (d *DB) Announcements() *AnnouncementStore { return &AnnouncementStore{pool: d.pool} }
+
 // ── Money helpers ───────────────────────────────────────────────────────────
 
 // parseDecimal converts a NUMERIC-as-text column into a decimal.

@@ -1057,3 +1057,101 @@ computed from.
 - `inventory_cpe_issued_total` / `inventory_low_stock_types` (counter /
   gauge) — issuance volume, and how many device types are currently under
   their reorder threshold
+
+## 4.17 Module 17: Notification Channel Completion & Announcements *(new — gap CRD-EXP-003, CRD-EXP-002; FR-NOTIF-012..013, FR-ANN-001..002)*
+
+**Module ID:** MOD-NOTIF (extends §4.7) | **FR:** FR-NOTIF-012, FR-NOTIF-013, FR-ANN-001..002
+
+### What was actually missing
+
+MDS §4.7 describes a four-channel notification service. `Dispatcher.Dispatch`
+implements two: its `switch task.Channel` has a `whatsapp` case, an `sms`
+case, and a `default` that returns "unsupported channel". `NotificationTask.Channel`
+has carried the comment `whatsapp | sms | email` since v2, and
+`notification_log.channel`'s CHECK has allowed `email` since migration 008 —
+so an email notification could be *logged* but never *sent*. Push was not
+represented anywhere.
+
+This module closes both channels and then uses all four for the thing they
+were always for: a staff-composed broadcast (FR-ANN-001).
+
+### Design decisions, and why
+
+**Both new channels degrade rather than fail startup.** SMTP and OneSignal
+credentials are optional config, exactly like Gotenberg and Razorpay: an
+unconfigured channel returns a clear error from `Dispatch` and the process
+still serves every other channel. A deployment that has not bought a push
+provider yet should not lose dunning SMS.
+
+**Destination resolution moves into the dispatcher, per channel.** WhatsApp
+and SMS both address a phone; email needs `subscribers.email`, and push needs
+a device token that a subscriber may have several of (one per phone/tablet)
+or none of. Rather than widening `NotificationTask` with an
+address-per-channel, `Dispatch` resolves the destination from the subscriber
+record for whichever channel it is routing to — the caller keeps saying
+"notify subscriber 42", which is the only thing every call site actually
+knows.
+
+**A missing destination is a logged failure, not an error.** A subscriber
+with no email address, or no registered push token, is a normal state — most
+subscribers will never install the app. Returning an error would send the
+Asynq task into retry-and-dead-letter for a condition retrying cannot fix,
+so these are written to `notification_log` as `failed` with a reason and
+return nil. This is the same judgment `PoDHandler` makes with
+`asynq.SkipRetry` for a subscriber with no live session.
+
+**Push tokens are a table, not a column.** `subscriber_push_tokens` carries
+`(subscriber_id, token, platform)` with the token unique — one subscriber can
+register several devices, and the same physical device re-registering must
+update rather than duplicate. This is also the storage FR-MOB-001 needs when
+the mobile app lands, so it is built once here rather than twice.
+
+### Announcements: a segment query, then the existing fan-out
+
+**An announcement is not a new delivery mechanism.** FR-ANN-002 asks that it
+reuse the DND and `notification_log` machinery, and the cleanest reading of
+that is that the announcement layer's only jobs are (a) deciding *who*, and
+(b) enqueuing one ordinary notification task per recipient per channel.
+Everything after that — suppression, sending, logging, delivery callbacks —
+is the path that already exists and is already tested.
+
+**Segments are three optional filters, not a query language.** CRD-EXP-002
+names franchise, plan and area. `franchise_id` and `plan_id` are columns;
+"area" has no representation in this schema at all (there is no address or
+region on `subscribers`), so it is deliberately **not** implemented rather
+than approximated by something that would look like area targeting and
+quietly not be. `status` is offered instead, since "tell every suspended
+subscriber about the payment portal outage" is the operationally common case.
+The absent area filter is recorded here so it reads as a known gap.
+
+**Marketing class by default, which is what makes DND meaningful.**
+Announcements are created as `marketing` unless explicitly marked
+`transactional`, so `Dispatcher`'s existing check (`sub.DndOptOut &&
+task.Class == "marketing"`) suppresses them for opted-out subscribers and
+records `suppressed_dnd`. A network-maintenance notice can be marked
+transactional deliberately — which is a decision a human makes and the audit
+log records, not a default that quietly overrides everyone's opt-out.
+
+**The portal banner is not a dispatched channel.** `notification_log.channel`
+is constrained to actually-sent channels; a banner is *displayed*, not sent,
+and has no delivery status to track. It is a boolean on the announcement plus
+a portal read endpoint, so the banner cannot pollute delivery statistics with
+rows that were never transmitted anywhere.
+
+**Fan-out is bounded and recorded, not fire-and-forget.** `POST
+/announcements/{id}/send` claims the announcement with the same conditional
+UPDATE pattern used for approvals and lead conversion (`WHERE status='draft'`),
+so a double-click cannot broadcast twice to the same segment. The recipient
+count is written back on completion, which is both the operator's receipt and
+the thing that makes a partially-failed send visible.
+
+### Key Metrics
+
+- `notifications_dispatched_total` gains `email` and `push` label values —
+  the existing per-channel counter needs no new family
+- `notifications_missing_destination_total` (counter, labels: `channel`) —
+  subscribers who could not be reached because they have no address or token
+  for that channel; the number that tells you whether a channel is worth
+  buying
+- `announcements_sent_total` / `announcement_recipients_total` (counters) —
+  broadcast volume and reach

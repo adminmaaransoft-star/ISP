@@ -79,8 +79,8 @@
 | FR-NOTIF-009 | Every outbound notification must create a `notification_log` record with: channel, template ID, subscriber ID, event, timestamp, delivery status, failure reason | CRD-NOTIF-002 | DBD §6.2 |
 | FR-NOTIF-010 | WhatsApp messages must use pre-approved Business API templates; template ID must be stored in notification config | CRD-NOTIF-001 | MDS §4.7 |
 | FR-NOTIF-011 | System must store WhatsApp delivery status callbacks: sent → delivered → read / failed | CRD-NOTIF-001 | DBD §6.2 |
-| FR-NOTIF-012 | System must support email as a notification channel alongside WhatsApp and SMS | CRD-EXP-003 | MDS §4.7 |
-| FR-NOTIF-013 | System must support push notifications (OneSignal or FCM/APNs) for mobile app users, sharing the same DND/notification_log path as other channels | CRD-EXP-003 | MDS §4.7 |
+| FR-NOTIF-012 | System must support email as a notification channel alongside WhatsApp and SMS, degrading gracefully when SMTP is unconfigured | CRD-EXP-003 | MDS §4.7, §4.17 |
+| FR-NOTIF-013 | System must support push notifications (OneSignal or FCM/APNs) for mobile app users, sharing the same DND/notification_log path as other channels, with per-device token registration | CRD-EXP-003 | MDS §4.7, §4.17 |
 
 ### Observability
 
@@ -197,8 +197,8 @@
 
 | FR ID | Requirement | CRD Ref | Module |
 |---|---|---|---|
-| FR-ANN-001 | Staff can compose and broadcast an announcement to all subscribers or a filtered segment (franchise, plan, area) via WhatsApp/SMS/email/portal banner | CRD-EXP-002 | new module |
-| FR-ANN-002 | Announcement delivery reuses the existing DND/notification_log machinery for auditability | CRD-EXP-002 | MDS §4.7 |
+| FR-ANN-001 | Staff can compose and broadcast an announcement to all subscribers or a filtered segment (franchise, plan, status) via WhatsApp/SMS/email/push and/or a portal banner. Area targeting is deferred: `subscribers` carries no address/region column (MDS §4.17) | CRD-EXP-002 | MDS §4.17 |
+| FR-ANN-002 | Announcement delivery reuses the existing DND/notification_log machinery for auditability, and defaults to marketing class so opt-out is honoured | CRD-EXP-002 | MDS §4.7, §4.17 |
 
 ### General Reporting *(new — gap CRD-EXP-002, v3)*
 
@@ -280,7 +280,7 @@
 | CRM / Lead Management *(v3)* | 3 | MDS §4.16 | TST INT-CRM-001..003 |
 | Inventory / CPE *(v3)* | 3 | MDS §4.16 | TST INT-INV-001..003 |
 | Task & Approval Workflows *(v3)* | 2 | MDS §4.15 | TST INT-WFL-001..003 |
-| Announcements *(v3)* | 2 | MDS §4.7 (extend) | TBD — Module design pending |
+| Announcements *(v3)* | 2 | MDS §4.17 | TST INT-ANN-001..002 |
 | General Reporting *(v3)* | 3 | MDS §4.8 (extend) | TBD — Module design pending |
 | Document Storage *(v3)* | 1 | new module | TBD — Module design pending |
 | CPE Auto-Provisioning *(v3)* | 3 | new module | TBD — Module design pending |

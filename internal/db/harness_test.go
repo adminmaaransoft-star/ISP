@@ -47,6 +47,11 @@ var truncateOrder = []string{
 	"approval_requests",
 	"field_tasks",
 	"leads",
+	// Migration 028. announcements references franchises/plans and would
+	// survive a subscribers-only cascade, so it is listed explicitly for the
+	// same reason cpe_device_types is.
+	"announcements",
+	"subscriber_push_tokens",
 	"cpe_purchases",
 	"cpe_devices",
 	"cpe_device_types",

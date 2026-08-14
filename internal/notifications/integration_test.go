@@ -29,6 +29,10 @@ import (
 
 // itNotifStore models the notification_log table and the subscriber row the
 // dispatcher reads its DND flag from.
+func (s *itNotifStore) ListPushTokens(_ context.Context, _ int) ([]string, error) {
+	return nil, nil
+}
+
 type itNotifStore struct {
 	mu         sync.Mutex
 	subscriber *notifications.Subscriber

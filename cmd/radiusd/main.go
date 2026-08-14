@@ -241,14 +241,20 @@ func run() error {
 	dunningNoticeHandler := billing.NewDunningNoticeHandler(dispatcher)
 	paymentReceiptHandler := billing.NewPaymentReceiptHandler(dispatcher)
 	ticketUpdateHandler := tickets.NewUpdateHandler(dispatcher)
+	announcementHandler := notifications.NewAnnouncementHandler(dispatcher)
 
 	workerServer := asynq.NewServer(asynqRedis, asynq.Config{
 		Concurrency: workerConcurrency,
 		// network_commands outranks notifications: a CoA that restores a
 		// subscriber's speed matters more than the message telling them about it.
+		//
+		// announcements sits lowest deliberately (MDS §4.17): a
+		// 50,000-recipient marketing blast must never queue in front of a
+		// payment receipt or a suspension notice.
 		Queues: map[string]int{
 			"network_commands": 6,
 			"notifications":    3,
+			"announcements":    1,
 			"default":          1,
 		},
 		ErrorHandler: asynq.ErrorHandlerFunc(func(_ context.Context, task *asynq.Task, err error) {
@@ -263,6 +269,7 @@ func run() error {
 	workerMux.Handle(billing.TaskTypeDunningNotice, dunningNoticeHandler)
 	workerMux.Handle(billing.TaskTypePaymentReceipt, paymentReceiptHandler)
 	workerMux.Handle(tickets.TaskTypeTicketUpdate, ticketUpdateHandler)
+	workerMux.Handle(notifications.TaskTypeAnnouncement, announcementHandler)
 
 	if err := workerServer.Start(workerMux); err != nil {
 		return fmt.Errorf("start Asynq workers: %w", err)
@@ -351,7 +358,27 @@ func newDispatcher(cfg *config.Config, database *db.DB) *notifications.Dispatche
 		log.Warn().Msg("radiusd: SMS credentials unset — SMS notifications will fail")
 	}
 
-	return notifications.NewDispatcher(store, whatsapp, sms)
+	dispatcher := notifications.NewDispatcher(store, whatsapp, sms)
+
+	// Email and push follow the same rule as the two above: an unconfigured
+	// channel is a warning, never a startup failure. A deployment that has
+	// not bought a push provider should not lose dunning SMS (MDS §4.17).
+	if cfg.SMTPHost != "" {
+		dispatcher.SetEmailSender(notifications.NewSMTPClient(notifications.SMTPConfig{
+			Host: cfg.SMTPHost, Port: cfg.SMTPPort,
+			Username: cfg.SMTPUsername, Password: cfg.SMTPPassword, From: cfg.SMTPFrom,
+		}))
+	} else {
+		log.Warn().Msg("radiusd: SMTP_HOST unset — email notifications will fail")
+	}
+
+	if cfg.OneSignalAppID != "" && cfg.OneSignalAPIKey != "" {
+		dispatcher.SetPushSender(notifications.NewOneSignalClient(cfg.OneSignalAppID, cfg.OneSignalAPIKey))
+	} else {
+		log.Warn().Msg("radiusd: OneSignal credentials unset — push notifications will fail")
+	}
+
+	return dispatcher
 }
 
 // logAlerter reports dead-letter conditions to the log when PagerDuty is not

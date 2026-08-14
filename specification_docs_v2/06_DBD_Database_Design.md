@@ -387,6 +387,47 @@ Deliberately independent of `tickets` — CRD-EXP-002 asks for task assignment
 (subscriber-facing support vs. internal staff coordination) with different
 lifecycles (no SLA engine, no routing rules here).
 
+### Table: `announcements` *(new — FR-ANN-001..002, migration 028)*
+**Module:** MOD-NOTIF | MDS §4.17
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `title` | `VARCHAR(200)` | NOT NULL | |
+| `body` | `TEXT` | NOT NULL | |
+| `channels` | `TEXT[]` | NOT NULL CHECK non-empty, each ∈ (`whatsapp`,`sms`,`email`,`push`) | Which dispatched channels to fan out to; the portal banner is separate (below) |
+| `class` | `VARCHAR(20)` | NOT NULL DEFAULT `marketing` CHECK IN (`marketing`,`transactional`) | Marketing is the default so DND opt-out is honoured unless a human deliberately says otherwise |
+| `segment_franchise_id` | `INTEGER` | FK → franchises.id NULLABLE | NULL = all franchises |
+| `segment_plan_id` | `INTEGER` | FK → plans.id NULLABLE | NULL = all plans |
+| `segment_status` | `VARCHAR(20)` | NULLABLE | NULL = all statuses |
+| `show_in_portal` | `BOOLEAN` | NOT NULL DEFAULT FALSE | Banner display; not a `notification_log` channel because nothing is transmitted |
+| `status` | `VARCHAR(20)` | NOT NULL DEFAULT `draft` CHECK IN (`draft`,`sending`,`sent`,`failed`) | `sending` is the atomic claim that stops a double-click broadcasting twice |
+| `recipient_count` | `INTEGER` | NOT NULL DEFAULT 0 | Written back on completion — the operator's receipt |
+| `created_by_username` | `VARCHAR(100)` | NOT NULL | |
+| `created_at` / `sent_at` | `TIMESTAMPTZ` | DEFAULT NOW() / NULLABLE | |
+
+Area targeting from CRD-EXP-002 is deliberately absent: `subscribers` carries
+no address or region column, so an "area" filter would have to be
+approximated by something that looks like area targeting and is not (MDS §4.17).
+
+### Table: `subscriber_push_tokens` *(new — FR-NOTIF-013, FR-MOB-001, migration 028)*
+**Module:** MOD-NOTIF | MDS §4.17
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `subscriber_id` | `INTEGER` | NOT NULL, FK → subscribers.id ON DELETE CASCADE | |
+| `token` | `VARCHAR(255)` | NOT NULL UNIQUE | Provider device token; unique so a re-registering device updates rather than duplicates |
+| `platform` | `VARCHAR(20)` | NOT NULL CHECK IN (`ios`,`android`,`web`) | |
+| `created_at` / `last_seen_at` | `TIMESTAMPTZ` | DEFAULT NOW() | |
+
+A table rather than a column on `subscribers`: one subscriber routinely has
+several devices, and this is the same storage FR-MOB-001 needs.
+
+`notification_log.channel`'s CHECK is widened to include `push`
+*(migration 028)* — it has allowed `whatsapp`, `sms` and `email` since
+migration 008.
+
 ### Table: `leads` *(new — FR-CRM-001..003, migration 027)*
 **Module:** MOD-CRM | MDS §4.16
 
