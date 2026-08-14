@@ -476,6 +476,46 @@ migration 008.
 | `created_at` / `updated_at` | `TIMESTAMPTZ` | DEFAULT NOW() | `set_updated_at()` trigger |
 | `CONSTRAINT chk_cpe_issued_has_subscriber` | | `status='issued'` requires `subscriber_id`, and any other status forbids it | An "issued to nobody" or "in stock but assigned" row is not a state the warehouse can actually be in |
 
+#### ACS extension to `cpe_devices` *(migration 030 — FR-CPE-001..003, MDS §4.19)*
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `oui` | `VARCHAR(6)` | NULLABLE | Vendor OUI from the Inform's DeviceId triple |
+| `product_class` | `VARCHAR(64)` | NULLABLE | |
+| `connection_request_url` | `TEXT` | NULLABLE | Recorded but **not used**: residential CPE sits behind this platform's own CGNAT, so the advertised address is usually unreachable from the ACS (MDS §4.19) |
+| `software_version` / `hardware_version` | `VARCHAR(64)` | NULLABLE | Reported each Inform; what makes a firmware-upgrade campaign targetable |
+| `last_inform_at` | `TIMESTAMPTZ` | NULLABLE | Indexed `DESC NULLS LAST` — "which devices have gone quiet" is the query the NOC actually runs |
+| `last_inform_event` | `VARCHAR(32)` | NULLABLE | Comma-joined event codes of the most recent session |
+| `provisioning_state` | `VARCHAR(24)` | NOT NULL DEFAULT `unknown` CHECK IN (`unknown`,`registered`,`provisioned`,`needs_reprovision`,`fault`) | Partial index on `needs_reprovision`/`fault` only: those are the two states an operator queries for, and indexing the healthy majority would be dead weight |
+| `last_fault` | `TEXT` | NULLABLE | Most recent CWMP fault, kept so a failed provisioning is diagnosable after the session has gone |
+| `acs_discovered` | `BOOLEAN` | NOT NULL DEFAULT FALSE | Device Informed with no warehouse record |
+| `CONSTRAINT chk_cpe_discovered_not_in_stock` | | `acs_discovered` forbids status `in_stock` | An ACS-discovered device is physically in a subscriber's home; counting it as sellable stock would overstate inventory |
+
+`cpe_device_types` also gains `provisioning_template JSONB` (NULLABLE): TR-069
+parameter paths differ per model, so holding them as data makes a new router
+model a row rather than a release.
+
+### Table: `cpe_tasks` *(new — FR-CPE-003, migration 030)*
+**Module:** MOD-CPE | MDS §4.19
+
+One queued CWMP RPC. The queue exists because CWMP is CPE-initiated: an
+operator action cannot be pushed and must wait for a session the device opens.
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | Also the CWMP `ParameterKey`/`CommandKey`, which is how a device's response is correlated back to the request |
+| `device_id` | `INTEGER` | NOT NULL, FK → cpe_devices.id ON DELETE CASCADE | |
+| `rpc_type` | `VARCHAR(32)` | NOT NULL CHECK IN (`SetParameterValues`,`GetParameterValues`,`Reboot`,`Download`,`FactoryReset`) | The RPC subset this ACS implements; the CHECK is what stops an unsupported RPC being queued and silently never delivered |
+| `params` | `JSONB` | NULLABLE | Parameter paths/values, or the firmware URL |
+| `status` | `VARCHAR(16)` | NOT NULL DEFAULT `pending` CHECK IN (`pending`,`sent`,`completed`,`failed`,`expired`) | The `pending` predicate in the claim query is the exactly-once guard (MDS §4.19) |
+| `priority` | `INTEGER` | NOT NULL DEFAULT 50 | Lower runs first: a technician-triggered reboot (10) overtakes routine provisioning |
+| `created_by` | `VARCHAR(100)` | NOT NULL | Operator username, or `acs:auto-provision` for engine-queued work — a reboot must be attributable |
+| `fault_code` / `fault_string` | `VARCHAR(16)` / `TEXT` | NULLABLE | CWMP fault the device returned |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT NOW() | Tiebreaks priority, so equal-priority tasks run FIFO |
+| `sent_at` / `completed_at` | `TIMESTAMPTZ` | NULLABLE | |
+| `expires_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT NOW() + 7 days | Expired tasks are skipped, not delivered: a reboot queued a fortnight ago arriving now is an unexplained outage |
+
+
 ### Table: `cpe_purchases` *(new — FR-INV-003, migration 027)*
 **Module:** MOD-INV | MDS §4.16
 

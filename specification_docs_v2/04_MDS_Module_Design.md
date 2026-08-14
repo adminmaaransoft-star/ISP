@@ -1249,3 +1249,158 @@ physical wireless controller has authenticated against it yet.
 - `radius_eap_sessions_lost_total` — responses arriving with a State no
   longer held. A rising value means the 60s TTL is too short for the
   network's latency, which is a tuning signal rather than a security one
+
+---
+
+## 4.19 Module 19: TR-069 ACS — CPE Provisioning & Remote Control *(new — gap CRD-EXP-003, FR-CPE-001..003)*
+
+**Module ID:** MOD-CPE | **FR:** FR-CPE-001..003 | **DBD:** §6.2 (`cpe_devices` extension, `cpe_tasks`) | **Migration:** 030
+
+### Scope, and what is deliberately outside it
+
+This is not a general-purpose ACS. It speaks six RPCs — Inform,
+GetParameterValues, SetParameterValues, Reboot, Download, FactoryReset — which
+is what FR-CPE-001..003 need. Anything depending on the full TR-069 data model
+or on vendor-specific RPCs is out of scope and better served by integrating
+GenieACS, at the cost of adding MongoDB and Node.js to a Go/Postgres/Redis
+stack.
+
+### The constraint that shapes the whole design: CWMP is CPE-initiated
+
+TR-069 has exactly one mechanism for the ACS to start a conversation — a
+**Connection Request**, an HTTP GET to a URL the device advertises. Indian
+residential CPE sits behind CGNAT (this platform allocates the CGNAT ranges
+itself, §4.9), so that URL routinely names an address no packet from the ACS
+can reach.
+
+**Connection Request is therefore not implemented, and the engine does not
+depend on it.** Every operator action is queued and delivered inside a session
+the *device* opens — a `1 BOOT` after a restart, or the routine `2 PERIODIC`
+check-in. `connection_request_url` is still recorded, because it is useful for
+the minority of deployments on public addressing and costs one column.
+
+The honest consequence is surfaced rather than hidden: NOC endpoints answer
+**202 Accepted**, never 200, with a `delivered_when` string naming the next
+CWMP session. A technician standing next to a router that has not rebooted
+should be able to read the API response and know why.
+
+### Session state machine
+
+```
+POST /tr069  Inform(events, DeviceId, ParameterList)
+   -> upsert device, record identity/firmware/last_inform_at
+   -> open session (Redis, 10 min TTL, cwmp-session cookie)
+   -> 200 InformResponse
+POST /tr069  <empty body>          # "I have nothing more to send"
+   -> claim next pending task -> 200 <RPC>       (or 204 if the queue is empty)
+POST /tr069  <RPC>Response | Fault
+   -> record outcome, then claim next task -> 200 <RPC>  (or 204)
+```
+
+Sessions live in Redis rather than process memory for the same reason EAP
+sessions do (§4.18): more than one API replica may serve consecutive POSTs of
+one session. The 10-minute TTL bounds a device that walks away mid-session.
+
+### What triggers provisioning, and what does not
+
+| Inform event | Action |
+|---|---|
+| `0 BOOTSTRAP` | provision — first contact ever, or post-factory-reset |
+| `1 BOOT` | provision — a reboot may have lost configuration |
+| `2 PERIODIC` | drain the queue only; **do not** re-provision |
+| any, device in `needs_reprovision` or `unknown` | provision |
+
+`2 PERIODIC` deliberately does not re-provision. A periodic Inform arrives
+from every managed device every few minutes; re-pushing configuration on each
+one would rewrite a subscriber's SSID on a schedule and turn a working
+deployment into a broadcast storm of SetParameterValues.
+
+`POST /cpe/devices/{serial}/reprovision` sets the *state* rather than queueing
+an RPC, so the parameter set is rebuilt from the subscriber's plan when the
+device next Informs — a plan change between button-press and check-in is
+reflected rather than baked in.
+
+### Provisioning templates live in the database
+
+TR-069 parameter paths differ per model: a TP-Link's SSID is not at a Nokia's
+path, and TR-098 and TR-181 devices disagree about the root element entirely.
+`cpe_device_types.provisioning_template` (JSONB) holds path → value-template
+pairs, so supporting a new router model is a row rather than a release.
+
+Values substitute `{{plan_name}}`, `{{ssid}}`, `{{downstream_kbps}}`,
+`{{pppoe_username}}` and friends. Shaping is derived from the plan's
+`rate_limit_string` — the same value that drives the RADIUS rate limit
+(FR-NAS-001), which is what keeps both ends of the link agreeing.
+
+**A parameter whose value renders empty is dropped, not pushed.** This is a
+safety property. Subscriber passwords are bcrypt, so `{{pppoe_password}}`
+usually has nothing to substitute, and pushing an empty PPPoE password would
+disconnect the subscriber while reporting successful provisioning. Omitting
+the parameter leaves whatever the device already has — the safe failure
+direction. Pushing PPPoE credentials needs a separately stored secret, the
+same constraint that defers FR-AAA-005.
+
+### Task delivery is exactly-once
+
+`ClaimNextTask` is the atomic conditional claim used throughout this codebase
+(§4.15, §4.16, §4.17): the `status = 'pending'` predicate inside the sub-select
+is the guard. Under READ COMMITTED a second updater that blocks on the row
+lock re-evaluates the outer WHERE when it wakes, matches nothing, and
+correctly receives `(nil, nil)`.
+
+Verified by removing that predicate: ten concurrent claimers were handed the
+same reboot — a second, unexplained outage for one subscriber. Removing
+`FOR UPDATE SKIP LOCKED` instead left the test passing, which is what
+established that the hint is a throughput optimisation and the predicate is
+the correctness mechanism.
+
+Tasks expire after seven days and expired ones are skipped rather than
+delivered. A reboot queued a fortnight ago arriving now is an unexplained
+outage too.
+
+### Unknown devices are recorded, flagged, and never counted as stock
+
+A device Informing with no warehouse record is inserted with
+`acs_discovered = TRUE` and status `returned`, and
+`chk_cpe_discovered_not_in_stock` prevents it from being counted as sellable
+inventory — an ACS-discovered device is physically in a subscriber's home, not
+on a shelf. `tr069_unknown_device_informs_total` makes a spike visible: a
+trickle is normal field swaps, a spike usually means somebody has pointed
+third-party CPE at the ACS.
+
+### Interop: declare every namespace prefix you use
+
+The RPC builders emit `xsi:type="xsd:string"` and `soap-enc:arrayType="..."`,
+and the envelope must bind `xsi`, `xsd` and `soap-enc` as well as `soap` and
+`cwmp`. An unbound prefix is a **fatal** error under the XML Namespaces spec,
+and the CWMP stacks inside real CPE are built on expat and libxml2, which
+enforce it.
+
+This was caught in live verification, not by the test suite: Go's
+`encoding/xml` treats an unknown prefix as if the prefix itself were the
+namespace URI and parses on happily, so every Go test passed against an
+envelope that a namespace-aware parser rejects with "unbound prefix" — meaning
+every real router would have refused to be provisioned. The regression test
+now asserts the property directly rather than round-tripping through a parser
+that forgives it, and live verification pipes the actual delivered envelope
+through an expat-class parser.
+
+### Verification
+
+Beyond unit and integration suites, a live run against the demo stack drives a
+real CWMP session with curl holding the session cookie: BOOTSTRAP Inform →
+provisioning SetParameterValues rendered from the live plan → acknowledgement
+→ 204; then a NOC-queued reboot delivered on the following PERIODIC check-in.
+It asserts the safety properties as well as the happy path — that the empty
+PPPoE password was dropped, that PERIODIC did not re-provision, that
+`billing_admin` is refused (403) on NOC control endpoints, and that a rogue
+serial is flagged rather than silently trusted.
+
+### Known limitations
+
+- **No real-CPE interop testing.** Verified against a simulated device and a
+  strict XML parser; no physical router has been provisioned.
+- **No Connection Request**, so operator actions land at the next check-in
+  rather than on demand — bounded by the device's periodic interval.
+- **No parameter-history ledger.** `GetParameterValues` results are recorded
+  against the task; there is no time series of what a device reported.

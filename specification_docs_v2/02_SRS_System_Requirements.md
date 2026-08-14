@@ -218,9 +218,9 @@
 
 | FR ID | Requirement | CRD Ref | Module |
 |---|---|---|---|
-| FR-CPE-001 | Run a **minimal built-in** TR-069 ACS to auto-provision CPE (SSID, PPPoE credentials, firmware) on first connect. Decision (2026-08-14): implement the RPC subset this platform needs — Inform, GetParameterValues, SetParameterValues, Reboot, Download, Connection Request — rather than integrating GenieACS, which would add MongoDB and Node.js to a Go/Postgres/Redis stack. Not a general-purpose ACS | CRD-EXP-003 | MDS §4.18 |
-| FR-CPE-002 | CPE provisioning profiles must derive from the subscriber's plan, pushing a bandwidth profile to the CPE alongside the NAS-side RADIUS limit | CRD-EXP-003 | new module |
-| FR-CPE-003 | Support remote CPE reboot/firmware-update/diagnostics via TR-069 RPCs, surfaced to NOC/technician roles | CRD-EXP-003 | new module |
+| FR-CPE-001 | ✅ Run a **minimal built-in** TR-069 ACS to auto-provision CPE (SSID, bandwidth profile, firmware) on first connect. Decision (2026-08-14): implement the RPC subset this platform needs — Inform, GetParameterValues, SetParameterValues, Reboot, Download, FactoryReset — rather than integrating GenieACS, which would add MongoDB and Node.js to a Go/Postgres/Redis stack. Not a general-purpose ACS. **Connection Request is deliberately not implemented** (see FR-CPE-003) | CRD-EXP-003 | MDS §4.19 |
+| FR-CPE-002 | ✅ CPE provisioning profiles must derive from the subscriber's plan, pushing a bandwidth profile to the CPE alongside the NAS-side RADIUS limit. Per-model parameter paths live in `cpe_device_types.provisioning_template`. **Caveat:** PPPoE credentials cannot be pushed — passwords are stored as bcrypt, so `{{pppoe_password}}` has nothing to substitute and the parameter is dropped rather than pushed empty (same constraint that defers FR-AAA-005) | CRD-EXP-003 | MDS §4.19 |
+| FR-CPE-003 | ✅ Support remote CPE reboot/firmware-update/diagnostics via TR-069 RPCs, surfaced to NOC/technician roles. **Delivery is queued, not immediate:** CWMP is CPE-initiated and residential CPE sits behind this platform's own CGNAT, so a Connection Request cannot reach it. RPCs execute inside the next device-opened session (`1 BOOT` or `2 PERIODIC`) and the endpoints answer 202 Accepted with `delivered_when` rather than implying the action has happened | CRD-EXP-003 | MDS §4.19 |
 
 ---
 

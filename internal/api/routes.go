@@ -96,6 +96,7 @@ type Handler struct {
 	pushTokens    PushTokenQuerier
 	eapEnrolment  EAPEnrolmentQuerier
 	credentials   CredentialQuerier
+	cpeControl    CPEControlQuerier
 	// subscriberLister backs revenue.ListSubscribersHandler, which is a
 	// plain http.HandlerFunc rather than a method on Handler — so the
 	// dependency is held here and passed to it at route-registration time.
@@ -144,6 +145,7 @@ type HandlerDeps struct {
 	PushTokens       PushTokenQuerier
 	EAPEnrolment     EAPEnrolmentQuerier
 	Credentials      CredentialQuerier
+	CPEControl       CPEControlQuerier
 
 	// Health serves GET /api/v1/subscribers/{id}/health (FR-OBS-004). The
 	// implementation lives in internal/health, which cannot be imported here
@@ -189,6 +191,7 @@ func NewHandler(deps HandlerDeps) *Handler {
 		pushTokens:       deps.PushTokens,
 		eapEnrolment:     deps.EAPEnrolment,
 		credentials:      deps.Credentials,
+		cpeControl:       deps.CPEControl,
 		health:           deps.Health,
 
 		razorpayWebhookSecret: deps.RazorpayWebhookSecret,
@@ -335,6 +338,23 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, jwtSecret string) {
 		admin(http.HandlerFunc(h.ListPurchases)))
 	mux.Handle("POST /api/v1/cpe/purchases",
 		admin(http.HandlerFunc(h.RecordPurchase)))
+
+	// TR-069 remote control (FR-CPE-003 | MDS §4.19). NOC and technicians:
+	// these are field-operations actions, and every one of them queues an
+	// RPC for the device's next check-in rather than acting immediately.
+	nocOrTech := func(next http.Handler) http.Handler {
+		return auth(middleware.RequireRole("noc_engineer", "technician", "isp_owner")(next))
+	}
+	mux.Handle("GET /api/v1/cpe/devices/{serial}/tasks",
+		staffRead(http.HandlerFunc(h.ListCPETasks)))
+	mux.Handle("POST /api/v1/cpe/devices/{serial}/reboot",
+		nocOrTech(http.HandlerFunc(h.RebootCPE)))
+	mux.Handle("POST /api/v1/cpe/devices/{serial}/firmware",
+		nocOrTech(http.HandlerFunc(h.UpgradeCPEFirmware)))
+	mux.Handle("POST /api/v1/cpe/devices/{serial}/parameters",
+		nocOrTech(http.HandlerFunc(h.GetCPEParameters)))
+	mux.Handle("POST /api/v1/cpe/devices/{serial}/reprovision",
+		nocOrTech(http.HandlerFunc(h.ReprovisionCPE)))
 
 	// Announcements (FR-ANN-001..002 | MDS §4.17). Composing a broadcast to
 	// the whole subscriber base is an owner/billing-tier action; the portal

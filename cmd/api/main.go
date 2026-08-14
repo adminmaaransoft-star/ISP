@@ -33,6 +33,7 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/portal"
 	"github.com/maaransoft/isp-bss-oss/internal/portalui"
 	"github.com/maaransoft/isp-bss-oss/internal/staffui"
+	"github.com/maaransoft/isp-bss-oss/internal/tr069"
 	"github.com/maaransoft/isp-bss-oss/pkg/crypto"
 	"github.com/shopspring/decimal"
 )
@@ -164,7 +165,9 @@ func run() error {
 		// EAP-MSCHAPv2 enrolment (FR-AAA-006).
 		EAPEnrolment: database.API(),
 		Credentials:  database.API(),
-		Health:       http.HandlerFunc(healthHandler.GetSubscriberHealth),
+		// TR-069 remote control (FR-CPE-003).
+		CPEControl: database.TR069(),
+		Health:     http.HandlerFunc(healthHandler.GetSubscriberHealth),
 
 		RazorpayWebhookSecret: cfg.RazorpayWebhookSecret,
 	})
@@ -224,6 +227,14 @@ func run() error {
 	// delivery statuses. Both are HMAC- or token-verified, never JWT.
 	mux.HandleFunc("GET /webhooks/whatsapp", notificationWebhook.Verify)
 	mux.HandleFunc("POST /webhooks/whatsapp/status", notificationWebhook.HandleDeliveryStatus)
+
+	// TR-069 ACS (FR-CPE-001..003 | MDS §4.19). No JWT: CWMP devices
+	// authenticate with their own HTTP credentials, not staff tokens, and
+	// the endpoint is CPE-initiated by protocol design. It identifies the
+	// device from the Inform's serial number and manages only devices it
+	// already knows or chooses to record.
+	acs := tr069.NewACS(database.TR069(), redisClient)
+	mux.Handle("POST /tr069", acs)
 
 	mux.HandleFunc("GET /readyz", readinessHandler(database, redisClient))
 

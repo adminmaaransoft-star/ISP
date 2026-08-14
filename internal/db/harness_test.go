@@ -52,6 +52,7 @@ var truncateOrder = []string{
 	// same reason cpe_device_types is.
 	"announcements",
 	"subscriber_push_tokens",
+	"cpe_tasks",
 	"cpe_purchases",
 	"cpe_devices",
 	"cpe_device_types",
