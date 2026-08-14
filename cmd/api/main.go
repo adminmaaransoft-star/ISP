@@ -161,7 +161,10 @@ func run() error {
 		// Announcements and push-token registration (FR-ANN, FR-NOTIF-013).
 		Announcements: database.Announcements(),
 		PushTokens:    database.Notifications(),
-		Health:        http.HandlerFunc(healthHandler.GetSubscriberHealth),
+		// EAP-MSCHAPv2 enrolment (FR-AAA-006).
+		EAPEnrolment: database.API(),
+		Credentials:  database.API(),
+		Health:       http.HandlerFunc(healthHandler.GetSubscriberHealth),
 
 		RazorpayWebhookSecret: cfg.RazorpayWebhookSecret,
 	})

@@ -140,6 +140,11 @@ func run() error {
 	if nasResolver != nil {
 		daemon.SetNASResolver(nasResolver)
 	}
+	// EAP-MSCHAPv2 (FR-AAA-006, MDS §4.18). Conversation state lives in
+	// Redis rather than process memory so consecutive packets of one
+	// authentication can land on different radiusd instances — which is
+	// exactly what a NAS load-balancing across servers will do.
+	daemon.SetEAPSessionStore(radius.NewEAPSessionStore(redisClient))
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

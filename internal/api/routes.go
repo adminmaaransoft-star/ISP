@@ -94,6 +94,8 @@ type Handler struct {
 	inventory     InventoryQuerier
 	announcements AnnouncementQuerier
 	pushTokens    PushTokenQuerier
+	eapEnrolment  EAPEnrolmentQuerier
+	credentials   CredentialQuerier
 	// subscriberLister backs revenue.ListSubscribersHandler, which is a
 	// plain http.HandlerFunc rather than a method on Handler — so the
 	// dependency is held here and passed to it at route-registration time.
@@ -140,6 +142,8 @@ type HandlerDeps struct {
 	Inventory        InventoryQuerier
 	Announcements    AnnouncementQuerier
 	PushTokens       PushTokenQuerier
+	EAPEnrolment     EAPEnrolmentQuerier
+	Credentials      CredentialQuerier
 
 	// Health serves GET /api/v1/subscribers/{id}/health (FR-OBS-004). The
 	// implementation lives in internal/health, which cannot be imported here
@@ -183,6 +187,8 @@ func NewHandler(deps HandlerDeps) *Handler {
 		inventory:        deps.Inventory,
 		announcements:    deps.Announcements,
 		pushTokens:       deps.PushTokens,
+		eapEnrolment:     deps.EAPEnrolment,
+		credentials:      deps.Credentials,
 		health:           deps.Health,
 
 		razorpayWebhookSecret: deps.RazorpayWebhookSecret,
@@ -230,6 +236,16 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, jwtSecret string) {
 		admin(http.HandlerFunc(h.UpdateSubscriber)))
 	mux.Handle("GET /api/v1/subscribers/{id}/health",
 		staffRead(http.HandlerFunc(h.GetSubscriberHealth)))
+
+	// EAP-MSCHAPv2 enrolment (FR-AAA-006 | MDS §4.18). Admin-tier: enrolling
+	// creates a second credential representation for that subscriber, which
+	// is a security-posture change rather than routine support work.
+	mux.Handle("GET /api/v1/subscribers/{id}/eap",
+		admin(http.HandlerFunc(h.GetEAPStatus)))
+	mux.Handle("POST /api/v1/subscribers/{id}/eap",
+		admin(http.HandlerFunc(h.EnrolEAP)))
+	mux.Handle("DELETE /api/v1/subscribers/{id}/eap",
+		admin(http.HandlerFunc(h.UnenrolEAP)))
 
 	// Subscriber lifecycle (FR-LC-001..003, FR-BIL-010..011 | MDS §4.14)
 	mux.Handle("POST /api/v1/subscribers/{id}/plan-change",

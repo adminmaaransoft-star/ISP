@@ -1155,3 +1155,97 @@ the thing that makes a partially-failed send visible.
   buying
 - `announcements_sent_total` / `announcement_recipients_total` (counters) —
   broadcast volume and reach
+
+## 4.18 Module 18: EAP-MSCHAPv2 Authentication *(new — gap CRD-EXP-001, FR-AAA-006)*
+
+**Module ID:** MOD-AAA (extends §4.1) | **FR:** FR-AAA-006 | **Defers:** FR-AAA-005
+
+### Why this sat unimplemented
+
+PAP transmits the password, so `bcrypt.CompareHashAndPassword` can verify it.
+CHAP and MS-CHAPv2 transmit a *response to a challenge*, and verifying one
+means recomputing it:
+
+```
+CHAP:      MD5(id ‖ plaintext_password ‖ challenge)   -> needs the PLAINTEXT
+MSCHAPv2:  f(NT_hash, challenges), NT_hash = MD4(UTF-16LE(pw)) -> needs the NT HASH
+```
+
+bcrypt is one-way and can answer neither. A second credential representation
+was unavoidable; the only question was which, and for whom.
+
+### The storage decision, and what it costs
+
+`subscribers.nt_hash` is **nullable and opt-in** (migration 029). NULL — the
+default for the entire existing base — means PAP against bcrypt, exactly as
+before. A row gains an NT hash only when somebody deliberately enrols it.
+
+That choice enables MS-CHAPv2 and EAP-MSCHAPv2 but **not plain CHAP**, which
+needs the plaintext. FR-AAA-005 is therefore deferred rather than
+implemented: storing reversibly-encrypted passwords for the whole subscriber
+base is a blast radius (keystore + DB dump = every plaintext password) not
+worth one legacy protocol.
+
+An NT hash is unsalted MD4 and is credential-equivalent for MSCHAPv2 if the
+database leaks. Keeping enrolment opt-in is what bounds that exposure to the
+subscribers who actually need wireless/hotspot auth.
+
+**Enrolment cannot be backfilled.** MD4(UTF-16LE(password)) needs the
+plaintext, and all we store is bcrypt — so `POST /subscribers/{id}/eap`
+requires the password to be re-presented, and verifies it against bcrypt
+first. Without that check the endpoint would be a way to *set* a second,
+divergent credential: an operator could enrol a password of their choosing
+and authenticate as the subscriber over EAP while the subscriber's own PAP
+password kept working, leaving nothing visibly wrong.
+
+### The conversation
+
+```
+Access-Request(EAP-Identity)          -> Access-Challenge(MSCHAPv2 Challenge) [challenge_issued]
+Access-Request(EAP-Response/MSCHAPv2) -> Access-Challenge(MSCHAPv2 Success)   [awaiting_success_ack]
+Access-Request(EAP-Response ack)      -> Access-Accept(+ vendor rate-limit VSAs)
+```
+
+RADIUS carries no connection, so the only thread tying three independent UDP
+exchanges into one authentication is the **State** attribute the server
+issues and the NAS echoes back. State is therefore the session key, and the
+server must remember the challenge it issued — a challenge it forgets is one
+it cannot verify against.
+
+**Session state lives in Redis, not process memory**, with a 60-second TTL. A
+NAS load-balancing across radiusd instances will send consecutive packets of
+one conversation to different processes; an in-memory map would authenticate
+only when the round trips happened to land on the same one. The short TTL is
+deliberate — every entry holds a live challenge, and expiring aggressively is
+the safe direction.
+
+**Sessions are deleted on every terminal outcome.** A completed session left
+behind keeps a used challenge alive until its TTL, and a challenge that
+outlives its single use is exactly what replay protection exists to prevent.
+Verified by removing the delete and watching a replayed success ack return a
+second Access-Accept.
+
+**The status gate and brute-force lockout apply to EAP too**, or suspension
+and rate-limiting would both be bypassable by switching auth method.
+
+### Verification
+
+The crypto is pinned against **RFC 2759 §9.2's published test vectors**
+rather than self-generated fixtures. A self-generated fixture proves the code
+agrees with itself — which it would even with the DES key expansion or the
+UTF-16LE encoding wrong. Only the RFC's own numbers prove it agrees with the
+Windows supplicants that will authenticate against it.
+
+Real-supplicant interop remains unproven until field-tested: the conversation
+is exercised end to end against a real Redis in integration tests, but no
+physical wireless controller has authenticated against it yet.
+
+### Key Metrics
+
+- `radius_eap_sessions_started_total` / `radius_eap_sessions_completed_total`
+  (labels: `result`) — the funnel from first Identity to Accept, with each
+  failure reason distinguishable (`not_enrolled` is an operational state, not
+  an attack)
+- `radius_eap_sessions_lost_total` — responses arriving with a State no
+  longer held. A rising value means the 60s TTL is too short for the
+  network's latency, which is a tuning signal rather than a security one

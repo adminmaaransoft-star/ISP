@@ -60,6 +60,11 @@ type Subscriber struct {
 	FUPActive    bool
 	FUPThrottle  string
 	PlanID       int // resolves a policy-reference vendor's QoS profile name (FR-NAS-001, MDS §4.11)
+	// NTHash is MD4(UTF-16LE(password)), present only for subscribers
+	// enrolled for EAP-MSCHAPv2 (FR-AAA-006, migration 029). Nil means PAP
+	// against PasswordHash is the only method available to them, which is
+	// the default for everybody.
+	NTHash []byte
 }
 
 // radiusJob bundles the ResponseWriter and Request so both can pass through the worker queue.
@@ -78,6 +83,16 @@ type RadiusDaemon struct {
 	verifierCache *VerifierCache
 	packetQueue   chan radiusJob
 	nasResolver   *nas.Resolver
+	eapSessions   *EAPSessionStore
+}
+
+// SetEAPSessionStore enables EAP-MSCHAPv2 (FR-AAA-006, MDS §4.18).
+//
+// Optional: with no store set, an Access-Request carrying an EAP-Message is
+// rejected rather than silently falling through to the PAP path, and every
+// PAP authentication behaves exactly as before.
+func (d *RadiusDaemon) SetEAPSessionStore(s *EAPSessionStore) {
+	d.eapSessions = s
 }
 
 // SetNASResolver enables per-NAS secret verification and vendor-aware

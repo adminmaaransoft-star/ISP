@@ -42,6 +42,14 @@ func (d *RadiusDaemon) handleAuth(ctx context.Context, w radius.ResponseWriter, 
 	timer := prometheus.NewTimer(radiusAuthDuration)
 	defer timer.ObserveDuration()
 
+	// EAP first: an Access-Request carrying an EAP-Message is a
+	// challenge-response conversation with no User-Password to compare, so
+	// the PAP path below cannot answer it (FR-AAA-006, MDS §4.18).
+	// handleEAP reports whether it took ownership of the packet.
+	if d.handleEAP(ctx, w, r) {
+		return
+	}
+
 	username := rfc2865.UserName_GetString(r.Packet)
 	password := rfc2865.UserPassword_GetString(r.Packet)
 

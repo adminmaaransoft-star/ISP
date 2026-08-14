@@ -31,7 +31,7 @@ func (s *RadiusStore) GetSubscriberByUsername(ctx context.Context, username stri
 	const q = `
 		SELECT s.id, s.username, s.password_hash, s.status,
 		       p.rate_limit_string, COALESCE(p.fup_throttle_string, ''),
-		       COALESCE(s.fup_active, FALSE), s.plan_id
+		       COALESCE(s.fup_active, FALSE), s.plan_id, s.nt_hash
 		FROM subscribers s
 		JOIN plans p ON p.id = s.plan_id
 		WHERE s.username = $1`
@@ -39,7 +39,7 @@ func (s *RadiusStore) GetSubscriberByUsername(ctx context.Context, username stri
 	var sub radius.Subscriber
 	err := s.pool.QueryRow(ctx, q, username).Scan(
 		&sub.ID, &sub.Username, &sub.PasswordHash, &sub.Status,
-		&sub.RateLimitStr, &sub.FUPThrottle, &sub.FUPActive, &sub.PlanID,
+		&sub.RateLimitStr, &sub.FUPThrottle, &sub.FUPActive, &sub.PlanID, &sub.NTHash,
 	)
 	if isNoRows(err) {
 		// A missing subscriber is a normal reject, not a failure: handleAuth
@@ -58,9 +58,11 @@ func (s *RadiusStore) GetSubscriberByUsername(ctx context.Context, username stri
 type APIStore struct{ pool dbPool }
 
 var (
-	_ api.SubscriberQuerier = (*APIStore)(nil)
-	_ api.KYCQuerier        = (*APIStore)(nil)
-	_ api.LifecycleQuerier  = (*APIStore)(nil)
+	_ api.SubscriberQuerier   = (*APIStore)(nil)
+	_ api.KYCQuerier          = (*APIStore)(nil)
+	_ api.LifecycleQuerier    = (*APIStore)(nil)
+	_ api.EAPEnrolmentQuerier = (*APIStore)(nil)
+	_ api.CredentialQuerier   = (*APIStore)(nil)
 )
 
 const apiSubscriberColumns = `
@@ -268,6 +270,66 @@ func (s *APIStore) TerminateSubscriber(ctx context.Context, subscriberID int) (*
 		return nil, fmt.Errorf("db: terminate subscriber %d: %w", subscriberID, err)
 	}
 	return rec, nil
+}
+
+// GetPasswordHash returns a subscriber's stored bcrypt hash for credential
+// verification.
+//
+// Kept off api.SubscriberRecord deliberately: that struct is serialised
+// straight to API clients, and a password hash on it would be one forgotten
+// `omitempty` away from being published.
+func (s *APIStore) GetPasswordHash(ctx context.Context, username string) (string, error) {
+	const q = `SELECT password_hash FROM subscribers WHERE username = $1`
+
+	var hash string
+	err := s.pool.QueryRow(ctx, q, username).Scan(&hash)
+	if isNoRows(err) {
+		return "", fmt.Errorf("db: subscriber %q: %w", username, ErrNotFound)
+	}
+	if err != nil {
+		return "", fmt.Errorf("db: get password hash for %q: %w", username, err)
+	}
+	return hash, nil
+}
+
+// SetNTHash enrols (or un-enrols, with a nil hash) a subscriber for
+// EAP-MSCHAPv2.
+//
+// The NT hash can only be derived from the plaintext password, which exists
+// only at the moment somebody supplies it — there is no way to backfill this
+// from the stored bcrypt hash. Enrolment therefore always requires the
+// password to be presented again, which is why this is a deliberate action
+// rather than a migration (FR-AAA-006, MDS §4.18).
+func (s *APIStore) SetNTHash(ctx context.Context, subscriberID int, ntHash []byte) error {
+	const q = `UPDATE subscribers SET nt_hash = $2 WHERE id = $1`
+
+	tag, err := s.pool.Exec(ctx, q, subscriberID, ntHash)
+	if err != nil {
+		return fmt.Errorf("db: set nt_hash for subscriber %d: %w", subscriberID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("db: subscriber %d: %w", subscriberID, ErrNotFound)
+	}
+	return nil
+}
+
+// IsEAPEnrolled reports whether a subscriber has an NT hash stored.
+//
+// Returns the flag rather than the hash: nothing outside the RADIUS auth
+// path has a reason to read credential material, and an endpoint that
+// answered with the hash would be a credential-disclosure route.
+func (s *APIStore) IsEAPEnrolled(ctx context.Context, subscriberID int) (bool, error) {
+	const q = `SELECT nt_hash IS NOT NULL FROM subscribers WHERE id = $1`
+
+	var enrolled bool
+	err := s.pool.QueryRow(ctx, q, subscriberID).Scan(&enrolled)
+	if isNoRows(err) {
+		return false, fmt.Errorf("db: subscriber %d: %w", subscriberID, ErrNotFound)
+	}
+	if err != nil {
+		return false, fmt.Errorf("db: check EAP enrolment for subscriber %d: %w", subscriberID, err)
+	}
+	return enrolled, nil
 }
 
 // UpsertKYC stores the encrypted Aadhaar and PAN against a subscriber.
