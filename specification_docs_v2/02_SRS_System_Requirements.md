@@ -16,8 +16,8 @@
 | FR-AAA-002 | Authenticate users against Redis cache in ≤ 5 ms | — | MDS §4.1 |
 | FR-AAA-003 | Deduplicate Interim-Update packets via atomic Redis SetNX (session ID + octet count key) | — | DDS §5.2 |
 | FR-AAA-004 | Write subscriber session to Redis on first auth; TTL = plan validity period | — | MDS §4.1 |
-| FR-AAA-005 | Support CHAP in addition to PAP; requires a credential-storage strategy compatible with challenge-response verification (bcrypt-only storage cannot answer a CHAP challenge) | CRD-EXP-001 | MDS §4.1 |
-| FR-AAA-006 | Support EAP-MSCHAPv2 for wireless-controller/hotspot deployments that require it | CRD-EXP-001 | MDS §4.1 |
+| FR-AAA-005 | ~~Support CHAP~~ **Deferred by decision (2026-08-14):** plain CHAP requires the plaintext password to recompute `MD5(id ‖ pw ‖ challenge)`. The chosen storage strategy is an opt-in NT-hash (see FR-AAA-006), which cannot answer a CHAP challenge. Enabling CHAP would require storing reversibly-encrypted passwords, a blast radius deliberately not accepted | CRD-EXP-001 | MDS §4.1 — deferred |
+| FR-AAA-006 | Support EAP-MSCHAPv2 for wireless-controller/hotspot deployments. Verification uses a nullable `subscribers.nt_hash`, populated **only** for subscribers who opt into EAP; bcrypt remains the PAP path and the sole credential for everyone else | CRD-EXP-001 | MDS §4.1, §4.18 |
 | FR-AAA-007 | A plan change or top-up must invalidate the subscriber's Redis auth-cache entry and enqueue a CoA to any active session, so the new rate limit applies without waiting for reauthentication | CRD-EXP-001 | MDS §4.1, §4.2 |
 
 ### Billing & Finance
@@ -218,7 +218,7 @@
 
 | FR ID | Requirement | CRD Ref | Module |
 |---|---|---|---|
-| FR-CPE-001 | Run or integrate with a TR-069 Auto-Configuration Server (ACS) to auto-provision CPE (SSID, PPPoE credentials, firmware) on first connect | CRD-EXP-003 | new module |
+| FR-CPE-001 | Run a **minimal built-in** TR-069 ACS to auto-provision CPE (SSID, PPPoE credentials, firmware) on first connect. Decision (2026-08-14): implement the RPC subset this platform needs — Inform, GetParameterValues, SetParameterValues, Reboot, Download, Connection Request — rather than integrating GenieACS, which would add MongoDB and Node.js to a Go/Postgres/Redis stack. Not a general-purpose ACS | CRD-EXP-003 | MDS §4.18 |
 | FR-CPE-002 | CPE provisioning profiles must derive from the subscriber's plan, pushing a bandwidth profile to the CPE alongside the NAS-side RADIUS limit | CRD-EXP-003 | new module |
 | FR-CPE-003 | Support remote CPE reboot/firmware-update/diagnostics via TR-069 RPCs, surfaced to NOC/technician roles | CRD-EXP-003 | new module |
 
