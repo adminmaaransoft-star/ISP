@@ -1510,3 +1510,110 @@ creation paths, with a test that fails if it regresses.
   any UI that renders it.
 - **`reason` is set only where a caller supplies it.** Operator edits,
   dunning, signup and lead conversion are labelled; other paths leave it NULL.
+
+---
+
+## 4.21 Module 21: Reporting Views *(new — FR-RPT-001, FR-RPT-003, migration 032)*
+
+**Module ID:** MOD-RPT (extends §4.8) | **FR:** FR-RPT-001, FR-RPT-003 |
+**DBD:** §6.7 | **Migration:** 032 | **Reads:** §4.20's capture tables
+
+### Four objects, one materialised
+
+| Object | Kind | Serves | Why this kind |
+|---|---|---|---|
+| `v_plan_mix` | view | FR-RPT-001 | Current-state question; needs no history and no refresh |
+| `v_subscriber_growth_monthly` | view | FR-RPT-001 | Reads §4.20's capture; cheap to aggregate |
+| `mv_ticket_resolution` | **materialised** | FR-RPT-001 | Computes a percentile across every ticket ever filed — not a per-page-load query |
+| `v_franchise_collection` | view | FR-RPT-003 | Franchise is the reporting area (decision 2026-08-15) |
+
+Plain views are the default. They are always current, need no refresh story,
+and at this data volume cost nothing worth optimising. Materialising by habit
+would have bought staleness for no gain.
+
+### The judgement calls the SQL encodes
+
+These are the parts a reader should be able to disagree with explicitly, and
+each has a test that fails if it is quietly changed:
+
+- **Suspension is not churn.** A hard-suspended account is a collections
+  problem that usually reverses. Folding it into churn makes every dunning run
+  look like a customer exodus and leaves the two numbers impossible to act on
+  separately. `suspended` is reported beside `churned`, never inside it.
+- **MRR counts active subscribers only.** Revenue from a suspended account is
+  revenue the business is not currently collecting.
+- **Resolution time is the FIRST arrival at `resolved`, not the last.** A
+  ticket closed, reopened and closed again is a support failure; taking the
+  last timestamp reports it as one slow success and hides the reopen. Verified
+  by switching `min()` to `max()` and watching the median jump from ~2h to 10h.
+- **Median, not mean.** One ticket left open over a long weekend drags an
+  average far enough to hide an otherwise healthy month.
+- **`LEFT JOIN` to resolutions.** An inner join drops exactly the tickets a
+  resolution report exists to surface, and the numbers would improve the worse
+  things actually got. Verified: the inner-join variant returned zero rows for
+  three unresolved tickets.
+- **A NULL median beats a zero.** Reporting 0.0 hours for a month in which
+  nobody was helped claims the fastest possible support.
+- **A NULL collection rate beats a zero.** A franchise that raised no invoices
+  has no collection rate; 0% ranks a new territory bottom of a league table it
+  has not joined. Confirmed live: a freshly created franchise shows blank, not
+  0%.
+- **Billed and collected come from different tables.** `invoices` records what
+  was charged, `lco_ledger` what a franchise actually took in. Deriving one
+  from the other would make the collection rate definitionally 100%.
+- **Baseline rows are excluded.** §4.20's seeded snapshots are starting
+  positions, not events; counting one as a signup invents a growth curve for a
+  period with no capture.
+
+### Two defects live verification found and the tests did not
+
+**The unique index must be over plain columns.** `REFRESH MATERIALIZED VIEW
+CONCURRENTLY` requires a unique index that is neither partial nor over an
+expression. The natural formulation — `coalesce(franchise_id, -1)`, to cope
+with direct subscribers having no franchise — is exactly an expression index,
+and Postgres refuses the refresh outright. `NULLS NOT DISTINCT` (PostgreSQL
+15+) solves what the coalesce was reaching for while keeping the index over
+plain columns.
+
+**The application cannot refresh a view it does not own.** PostgreSQL has no
+REFRESH privilege; the command requires ownership. The app connects as
+`bss_app` (migration 019) while migrations run as the superuser, so the worker
+failed on the demo stack with `must be owner of materialized view` — while the
+integration suite passed, because it connects as the superuser and never
+exercised the real privilege boundary.
+
+Making `bss_app` the owner would have fixed it and also handed the role the
+right to drop the view. A `SECURITY DEFINER` function grants exactly the
+refresh and nothing else, with `search_path` pinned to `pg_catalog, public`
+because a SECURITY DEFINER function with a caller-controlled search_path is a
+privilege-escalation vector. Verified both directions live: `bss_app` can call
+`refresh_reporting_views()` and is still refused a direct `REFRESH`.
+
+### Refresh
+
+`reporting.RefreshScanner` (wired in `cmd/radiusd`, tracked by
+`check_wiring.sh`) refreshes every 15 minutes and once at startup. A
+materialised view with nothing refreshing it reports the numbers that were true
+the day it was created, forever, with no outward sign — which is why the
+interval is code rather than a cron entry somebody has to remember to add.
+
+Fifteen minutes is chosen against use: monthly medians and SLA attainment do
+not move minute to minute, and refreshing far more often would spend real CPU
+recomputing a percentile over the whole ticket table to change a second decimal
+place.
+
+`reporting_matview_last_refresh_timestamp` is the gauge an alert should watch.
+A refresh that stops happening leaves a dashboard showing confident, plausible,
+wrong numbers — the failure mode with no visible symptom, so staleness has to
+be measurable. It earned its keep immediately: the ownership defect above
+surfaced as `refresh_failures_total 1` within seconds of the container starting.
+
+### Known limitations
+
+- **No history before 2026-08-15.** Growth and resolution figures cover only
+  the period since §4.20's capture began, and any UI must label earlier periods
+  as partial history rather than reporting zero.
+- **Area is franchise, not geography.** No address, region or pincode column
+  exists; deferred to the Batch 4 address work (FR-RPT-003).
+- **No export or scheduling yet.** FR-RPT-002 is untouched — these views are
+  what an export would read.

@@ -51,6 +51,7 @@ COMPONENTS=(
     "NewSubscriberCache:RADIUS subscriber cache"
     "NewResolver:multi-vendor NAS attribute/secret resolver"
     "NewSLAScanner:SLA breach scanner (helpdesk deadlines)"
+    "NewRefreshScanner:reporting view refresh (keeps mv_ticket_resolution current)"
 )
 
 if [ "${1:-}" = "--list" ]; then

@@ -176,6 +176,10 @@ func (d *DB) Announcements() *AnnouncementStore { return &AnnouncementStore{pool
 // TR069 returns the store satisfying tr069.Store and api.CPEControlQuerier.
 func (d *DB) TR069() *TR069Store { return &TR069Store{pool: d.pool} }
 
+// Reporting returns the store satisfying reporting.Refresher and the
+// api reporting queriers.
+func (d *DB) Reporting() *ReportingStore { return &ReportingStore{pool: d.pool} }
+
 // ── Money helpers ───────────────────────────────────────────────────────────
 
 // parseDecimal converts a NUMERIC-as-text column into a decimal.

@@ -33,6 +33,7 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/nas"
 	"github.com/maaransoft/isp-bss-oss/internal/notifications"
 	"github.com/maaransoft/isp-bss-oss/internal/radius"
+	"github.com/maaransoft/isp-bss-oss/internal/reporting"
 	"github.com/maaransoft/isp-bss-oss/internal/revenue"
 	"github.com/maaransoft/isp-bss-oss/internal/tickets"
 	"github.com/maaransoft/isp-bss-oss/pkg/crypto"
@@ -231,6 +232,23 @@ func run() error {
 		log.Info().Msg("radiusd: SLA breach scanner started")
 		slaScanner.Run(ctx)
 		log.Info().Msg("radiusd: SLA breach scanner stopped")
+	}()
+
+	// ── Reporting view refresh ──────────────────────────────────────────────
+
+	// mv_ticket_resolution (migration 032) computes a percentile across every
+	// ticket ever filed, so it is materialised rather than recomputed per
+	// page load. A materialised view with nothing refreshing it reports the
+	// numbers that were true the day it was created, forever, with no outward
+	// sign — so the refresh runs here rather than being left to a cron entry
+	// somebody has to remember to add (FR-RPT-001).
+	reportingRefresher := reporting.NewRefreshScanner(database.Reporting(), 0)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Info().Msg("radiusd: reporting view refresh started")
+		reportingRefresher.Run(ctx)
+		log.Info().Msg("radiusd: reporting view refresh stopped")
 	}()
 
 	// ── Asynq workers ───────────────────────────────────────────────────────

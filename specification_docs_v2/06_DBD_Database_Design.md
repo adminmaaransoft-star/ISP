@@ -789,3 +789,54 @@ decision in `internal/db`, not a table design one. The one exception:
 `revenue_snapshots` and `collections_forecast` (§6.2) are already
 write-once/read-many nightly-batch tables, which makes them the safest
 first candidates to route to a replica once one exists.
+
+---
+
+## 6.7 Reporting Views *(new — FR-RPT-001, FR-RPT-003, migration 032)*
+
+**Module:** MOD-RPT | MDS §4.21
+
+The first views in the schema. Three are plain, one materialised; all read the
+capture tables §6.2 documents plus the existing current-state tables.
+
+| Object | Kind | Grain | Notes |
+|---|---|---|---|
+| `v_plan_mix` | view | plan × franchise | `mrr` counts active subscribers only — a suspended account produces no revenue |
+| `v_subscriber_growth_monthly` | view | month × franchise × plan | Excludes `is_baseline` rows. `suspended` is reported beside `churned`, never inside it |
+| `mv_ticket_resolution` | materialised | month × category × priority × franchise | Median (not mean) hours to the **first** resolution; `reopens` counted separately |
+| `v_franchise_collection` | view | franchise × month | `billed` from `invoices`, `collected` from `lco_ledger` — separate sources on purpose |
+
+### `idx_mv_ticket_resolution_key`
+
+```sql
+CREATE UNIQUE INDEX idx_mv_ticket_resolution_key
+    ON mv_ticket_resolution (month, category, priority, franchise_id) NULLS NOT DISTINCT;
+```
+
+Required by `REFRESH MATERIALIZED VIEW CONCURRENTLY`, which without it takes an
+ACCESS EXCLUSIVE lock and blocks every reader for the duration of the rebuild.
+
+The index must be over plain **columns**: Postgres rejects a concurrent refresh
+backed by a partial or expression index. The obvious formulation,
+`coalesce(franchise_id, -1)` to handle direct subscribers having no franchise,
+is exactly an expression index and was verified to fail. `NULLS NOT DISTINCT`
+(PostgreSQL 15+) achieves the same grouping while keeping the index eligible.
+
+### `refresh_reporting_views()`
+
+`SECURITY DEFINER`, `SET search_path = pg_catalog, public`, `EXECUTE` granted to
+`bss_app` only.
+
+PostgreSQL has no REFRESH privilege — the command requires *ownership* of the
+materialised view. The application connects as `bss_app` (migration 019) while
+migrations run as the superuser, so a direct `REFRESH` from the app fails with
+`must be owner of materialized view`. Making `bss_app` the owner would fix that
+and also grant it the right to drop the view; the function grants exactly the
+refresh and nothing else. `search_path` is pinned because a SECURITY DEFINER
+function with a caller-controlled search_path is a privilege-escalation vector.
+
+### Grants
+
+`SELECT` on all four objects is granted to `bss_app` explicitly, for the same
+reason `staff_users` needed it in migration 021: `ALTER DEFAULT PRIVILEGES`
+covers only objects created by the role that set it.
