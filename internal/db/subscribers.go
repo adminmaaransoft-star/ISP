@@ -101,13 +101,20 @@ func scanAPISubscriber(row interface {
 func (s *APIStore) CreateSubscriber(ctx context.Context, sub api.SubscriberRecord, passwordHash string) (*api.SubscriberRecord, error) {
 	// The shared column list is written against the alias "s", so the insert is
 	// wrapped in a CTE that both the write and the projection can reference.
+	// The ctx CTE attributes the new connection for migration 031's capture
+	// trigger; see actor.go.
 	const q = `
-		WITH ins AS (
+		WITH ctx AS (
+			SELECT set_config('app.actor', $14, true)              AS actor,
+			       set_config('app.change_reason', 'signup', true) AS reason
+		), ins AS (
 			INSERT INTO subscribers (
 				caf_number, username, password_hash, mobile_number, email,
 				plan_id, franchise_id, status, dunning_state, wallet_balance,
 				registered_state, kyc_status, plan_expiry
-			) VALUES ($1,$2,$3,$4,NULLIF($5,''),$6,$7,$8,$9,COALESCE(NULLIF($10,''),'0.00')::numeric,$11,$12,$13)
+			)
+			SELECT $1,$2,$3,$4,NULLIF($5,''),$6,$7,$8,$9,COALESCE(NULLIF($10,''),'0.00')::numeric,$11,$12,$13
+			  FROM ctx WHERE ctx.actor IS NOT NULL
 			RETURNING *
 		)
 		SELECT ` + apiSubscriberColumns + ` FROM ins s`
@@ -128,7 +135,7 @@ func (s *APIStore) CreateSubscriber(ctx context.Context, sub api.SubscriberRecor
 	row := s.pool.QueryRow(ctx, q,
 		sub.CAFNumber, sub.Username, passwordHash, sub.MobileNumber, sub.Email,
 		sub.PlanID, sub.FranchiseID, status, dunning, sub.WalletBalance,
-		sub.RegisteredState, kyc, sub.PlanExpiry,
+		sub.RegisteredState, kyc, sub.PlanExpiry, actorFromContext(ctx),
 	)
 	rec, err := scanAPISubscriber(row)
 	if err != nil {
@@ -167,18 +174,25 @@ func (s *APIStore) GetSubscriberByUsername(ctx context.Context, username string)
 }
 
 // UpdateSubscriber applies a partial update. A nil field is left untouched.
+//
+// The leading ctx CTE attributes any status change to the calling operator for
+// the migration-031 capture trigger (see actor.go).
 func (s *APIStore) UpdateSubscriber(ctx context.Context, id int, planID *int, status *string) (*api.SubscriberRecord, error) {
 	const q = `
-		WITH upd AS (
+		WITH ctx AS (
+			SELECT set_config('app.actor', $4, true)         AS actor,
+			       set_config('app.change_reason', 'operator', true) AS reason
+		), upd AS (
 			UPDATE subscribers
 			SET plan_id = COALESCE($2, plan_id),
 			    status  = COALESCE($3, status)
-			WHERE id = $1
-			RETURNING *
+			FROM ctx
+			WHERE subscribers.id = $1 AND ctx.actor IS NOT NULL
+			RETURNING subscribers.*
 		)
 		SELECT ` + apiSubscriberColumns + ` FROM upd s`
 
-	rec, err := scanAPISubscriber(s.pool.QueryRow(ctx, q, id, planID, status))
+	rec, err := scanAPISubscriber(s.pool.QueryRow(ctx, q, id, planID, status, actorFromContext(ctx)))
 	if isNoRows(err) {
 		return nil, nil
 	}
@@ -256,13 +270,18 @@ func (s *APIStore) SetSubscriberPlan(ctx context.Context, subscriberID, newPlanI
 // code path that ever writes a subscriber back out of this state.
 func (s *APIStore) TerminateSubscriber(ctx context.Context, subscriberID int) (*api.SubscriberRecord, error) {
 	const q = `
-		WITH upd AS (
-			UPDATE subscribers SET status = 'terminated' WHERE id = $1
-			RETURNING *
+		WITH ctx AS (
+			SELECT set_config('app.actor', $2, true)                   AS actor,
+			       set_config('app.change_reason', 'termination', true) AS reason
+		), upd AS (
+			UPDATE subscribers SET status = 'terminated'
+			FROM ctx
+			WHERE subscribers.id = $1 AND ctx.actor IS NOT NULL
+			RETURNING subscribers.*
 		)
 		SELECT ` + apiSubscriberColumns + ` FROM upd s`
 
-	rec, err := scanAPISubscriber(s.pool.QueryRow(ctx, q, subscriberID))
+	rec, err := scanAPISubscriber(s.pool.QueryRow(ctx, q, subscriberID, actorFromContext(ctx)))
 	if isNoRows(err) {
 		return nil, nil
 	}
@@ -541,24 +560,27 @@ func (s *PortalStore) CreateTicket(ctx context.Context, req portal.TicketCreateR
 		return nil, err
 	}
 
+	// Selects from a ctx CTE rather than VALUES so the capture trigger can
+	// attribute the ticket to the subscriber who raised it; see actor.go.
 	const q = `
+		WITH ctx AS (SELECT set_config('app.actor', $9, true) AS actor)
 		INSERT INTO tickets (
 			subscriber_id, category, description, status,
 			priority, sla_response_due_at, sla_resolution_due_at,
 			franchise_id, routed_role
 		)
-		VALUES (
+		SELECT
 			$1, $2, $3, 'open',
 			$4, NOW() + ($5 * INTERVAL '1 minute'), NOW() + ($6 * INTERVAL '1 minute'),
 			$7, $8
-		)
+		FROM ctx WHERE ctx.actor IS NOT NULL
 		RETURNING id, category, description, status, created_at`
 
 	var t portal.TicketEntry
 	err = s.pool.QueryRow(ctx, q,
 		req.SubscriberID, req.Category, req.Description,
 		sla.Priority, sla.ResponseMinutes, sla.ResolutionMinutes,
-		sla.FranchiseID, sla.RoutedRole).
+		sla.FranchiseID, sla.RoutedRole, actorFromContext(ctx)).
 		Scan(&t.ID, &t.Category, &t.Description, &t.Status, &t.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("db: create ticket for subscriber %d: %w", req.SubscriberID, err)

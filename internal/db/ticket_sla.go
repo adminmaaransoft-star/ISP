@@ -99,15 +99,22 @@ func resolveTicketSLA(ctx context.Context, pool dbPool, subscriberID int, catego
 // them in Go would introduce a small skew between created_at and the
 // deadlines derived from it, and would put the SLA window on the
 // application host's clock rather than the database's.
+//
+// The INSERT selects from a ctx CTE rather than using VALUES so migration
+// 031's capture trigger can attribute the opening of the ticket to whoever
+// opened it (see actor.go). Without it the first row of every ticket's
+// history reads "unknown", which is the one transition an agent looking at a
+// disputed ticket most wants attributed.
 const insertTicketSQL = `
+	WITH ctx AS (SELECT set_config('app.actor', $9, true) AS actor)
 	INSERT INTO tickets (
 		subscriber_id, category, description, status,
 		priority, sla_response_due_at, sla_resolution_due_at,
 		franchise_id, routed_role
 	)
-	VALUES (
+	SELECT
 		$1, $2, $3, 'open',
 		$4, NOW() + ($5 * INTERVAL '1 minute'), NOW() + ($6 * INTERVAL '1 minute'),
 		$7, $8
-	)
+	FROM ctx WHERE ctx.actor IS NOT NULL
 	RETURNING ` + ticketColumns

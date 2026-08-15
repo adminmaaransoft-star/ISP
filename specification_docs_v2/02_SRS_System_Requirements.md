@@ -204,9 +204,9 @@
 
 | FR ID | Requirement | CRD Ref | Module |
 |---|---|---|---|
-| FR-RPT-001 | Report subscriber growth/churn trends, plan-mix distribution, and ticket-resolution metrics, beyond revenue reconciliation | CRD-EXP-002 | MDS §4.8 (extended) |
+| FR-RPT-001 | Report subscriber growth/churn trends, plan-mix distribution, and ticket-resolution metrics, beyond revenue reconciliation. **Capture landed 2026-08-15 (migration 031); views pending.** Churn and resolution were not computable from the schema at all — `subscribers.status` and `tickets.status` are overwritten in place and `sla_events` records no `resolved` event — so lifecycle transitions are now captured append-only by trigger. Reports before 2026-08-15 show the seeded baseline only and must be labelled partial history | CRD-EXP-002 | MDS §4.20 (capture), §4.8 (views) |
 | FR-RPT-002 | Reports must be exportable (CSV/PDF) and schedulable for periodic email delivery to owner/franchise roles | CRD-EXP-002 | MDS §4.8 (extended) |
-| FR-RPT-003 | Report per-area collection performance for franchise/LCO partners | CRD-EXP-002 | MDS §4.8, §4.10 |
+| FR-RPT-003 | Report per-area collection performance for franchise/LCO partners. Decision (2026-08-15): **franchise territory is the reporting area** — no address, region or pincode column exists anywhere in the schema, and franchise is the only grouping that maps to real geography today. A true `service_area` is deferred to the Batch 4 address work | CRD-EXP-002 | MDS §4.8, §4.10 |
 
 ### Document Storage *(new — gap CRD-EXP-003, v3)*
 

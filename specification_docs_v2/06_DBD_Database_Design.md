@@ -29,6 +29,8 @@ nas_devices (1) ─────── (N) plan_nas_profiles  [v3 — FR-NAS-002]
 plans       (1) ─────── (N) plan_nas_profiles  [v3 — FR-NAS-001]
 encryption_keys (1) ─── (N) nas_devices        [v3 — FR-NAS-002, secret encrypted at rest]
 tickets     (1) ─────── (N) sla_events         [v3 — FR-SUP-002, append-only]
+subscribers (1) ─────── (N) subscriber_status_history [NEW — FR-RPT-001, append-only, trigger-written]
+tickets     (1) ─────── (N) ticket_status_history     [NEW — FR-RPT-001, append-only, trigger-written]
 franchises  (1) ─────── (N) ticket_routing_rules  [v3 — FR-SUP-003, franchise_id nullable]
 staff_users (1) ─────── (N) tickets            [v3 — FR-SUP-003, assigned_to — the FK migration 009 promised and never added]
 franchises  (1) ─────── (N) tickets            [v3 — FR-SUP-003, denormalized from subscribers.franchise_id]
@@ -529,6 +531,65 @@ operator action cannot be pushed and must wait for a session the device opens.
 | `invoice_ref` | `VARCHAR(100)` | NULLABLE | |
 | `purchased_by_username` | `VARCHAR(100)` | NOT NULL | |
 | `purchased_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT NOW() | |
+
+### Table: `subscriber_status_history` *(new — FR-RPT-001, migration 031)*
+**Module:** MOD-RPT | MDS §4.20
+
+Append-only record of every subscriber lifecycle transition. Exists because
+`subscribers.status` is overwritten in place and `updated_at` is bumped by
+unrelated edits, so nothing else in the schema can date a churn event.
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `BIGSERIAL` | PK | |
+| `subscriber_id` | `INTEGER` | NOT NULL, FK → subscribers.id ON DELETE CASCADE | |
+| `old_status` | `VARCHAR(20)` | NULLABLE | NULL means no predecessor: either a creation or the seeded baseline |
+| `new_status` | `VARCHAR(20)` | NOT NULL | |
+| `reason` | `VARCHAR(64)` | NULLABLE | `signup`, `operator`, `dunning`, `termination`, `lead_conversion`, `baseline` |
+| `changed_by` | `VARCHAR(100)` | NOT NULL DEFAULT `unknown` | JWT subject, or `system:dunning-scanner` for workers. `unknown` when a write path supplied no context — the event is still captured |
+| `plan_id` | `INTEGER` | FK → plans.id NULLABLE | Denormalised at the moment of the change: churn asks which plan was *left*, and the subscriber's current plan is a different question |
+| `franchise_id` | `INTEGER` | FK → franchises.id NULLABLE | Same reasoning; also the grouping FR-RPT-003 reports on |
+| `is_baseline` | `BOOLEAN` | NOT NULL DEFAULT FALSE | TRUE only for the one-off snapshot seeded for pre-migration accounts. A snapshot is a starting position, not an event, and reporting views exclude these from growth and churn |
+| `occurred_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT NOW() | |
+| `CONSTRAINT chk_ssh_status_changed` | | `old_status IS DISTINCT FROM new_status` | A save that changes nothing is not a transition; without this an operator re-saving an unchanged form inflates every count |
+| `CONSTRAINT chk_ssh_baseline_has_no_predecessor` | | `NOT is_baseline OR old_status IS NULL` | A baseline carrying a predecessor is a transition claiming to be a snapshot |
+
+Indexes: `idx_ssh_occurred (occurred_at DESC)` for period reports;
+`idx_ssh_subscriber (subscriber_id, occurred_at DESC)` for one account's timeline.
+
+### Table: `ticket_status_history` *(new — FR-RPT-001, migration 031)*
+**Module:** MOD-RPT | MDS §4.20
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `BIGSERIAL` | PK | |
+| `ticket_id` | `INTEGER` | NOT NULL, FK → tickets.id ON DELETE CASCADE | |
+| `old_status` | `VARCHAR(20)` | NULLABLE | |
+| `new_status` | `VARCHAR(20)` | NOT NULL | |
+| `changed_by` | `VARCHAR(100)` | NOT NULL DEFAULT `unknown` | |
+| `is_baseline` | `BOOLEAN` | NOT NULL DEFAULT FALSE | |
+| `occurred_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT NOW() | |
+| `CONSTRAINT chk_tsh_status_changed` | | `old_status IS DISTINCT FROM new_status` | |
+| `CONSTRAINT chk_tsh_baseline_has_no_predecessor` | | `NOT is_baseline OR old_status IS NULL` | |
+
+Index `idx_tsh_ticket (ticket_id, occurred_at)` serves the query every
+resolution metric starts with: the **first** transition into `resolved`. First,
+not last — a ticket closed, reopened and closed again is a support failure, and
+taking the last timestamp would report it as one slow success while hiding the
+reopen entirely.
+
+### Capture triggers *(migration 031)*
+
+`capture_subscriber_status()` and `capture_ticket_status()` fire `AFTER INSERT`
+and `AFTER UPDATE OF status ... WHEN (OLD.status IS DISTINCT FROM NEW.status)`.
+The `WHEN` clause means the function is never called for the far more frequent
+`wallet_balance`, `plan_expiry` and `fup_active` writes, so hot paths are
+unaffected.
+
+Attribution reaches the trigger through the transaction-local settings
+`app.actor` and `app.change_reason`, set by the same statement that performs
+the write (MDS §4.20). Triggers guarantee the *event* is never lost; the
+application supplies *who* and *why* when it can.
 
 ### Table: `revenue_snapshots` *(new — FR-REV-001)*
 **Module:** MOD-REV

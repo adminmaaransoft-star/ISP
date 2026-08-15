@@ -35,6 +35,12 @@ var truncateOrder = []string{
 	// them and every ticket-creation path reads them, so truncating them
 	// would break ticket creation everywhere rather than isolate a test.
 	"sla_events",
+	// Migration 031. Both cascade from their parents, but they are listed
+	// before them so the order this slice documents stays true — and so a
+	// reader can see that capture history is reset between tests rather than
+	// accumulating across them.
+	"ticket_status_history",
+	"subscriber_status_history",
 	"tickets",
 	"notification_log",
 	"notification_templates",

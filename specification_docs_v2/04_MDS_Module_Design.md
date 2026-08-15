@@ -1404,3 +1404,109 @@ serial is flagged rather than silently trusted.
   rather than on demand — bounded by the device's periodic interval.
 - **No parameter-history ledger.** `GetParameterValues` results are recorded
   against the task; there is no time series of what a device reported.
+
+---
+
+## 4.20 Module 20: Lifecycle State Capture *(new — FR-RPT-001 precondition, migration 031)*
+
+**Module ID:** MOD-RPT (extends §4.8) | **FR:** FR-RPT-001 | **DBD:** §6.2
+(`subscriber_status_history`, `ticket_status_history`) | **Migration:** 031
+
+### Why this exists before any reporting view
+
+`subscribers.status` and `tickets.status` are both overwritten in place.
+`updated_at` is bumped by every unrelated edit — a wallet top-up, an FUP flag —
+so it cannot date a status change. `sla_events` records only the four warning
+and breach types; there is no `resolved` event.
+
+The consequence is that **churn trends and ticket-resolution metrics are not
+computable from the current schema at any level of SQL skill.** A view can
+aggregate history but cannot invent it. Plan-mix and collection performance
+*are* answerable from current-state columns, which is what splits FR-RPT-001
+into a part that needed a migration and a part that did not.
+
+This is why capture ships as its own migration, ahead of the views that read
+it: every day without these tables is churn and resolution data destroyed as
+it is produced, and unlike most gaps it cannot be backfilled later.
+
+### Capture is by trigger, attribution is by the application
+
+There are only four status-writing paths today, so application-level writes
+would have worked. Triggers were chosen for the fifth path somebody adds next
+year, and for the DBA fixing a row by hand at 2am — the cases where a missing
+audit row is least likely to be noticed and most likely to matter.
+
+What a trigger cannot see is *who* and *why*, which live in the request
+context. The bridge is a transaction-local GUC:
+
+```
+WITH ctx AS (
+    SELECT set_config('app.actor', $n, true)         AS actor,
+           set_config('app.change_reason', $m, true) AS reason
+), upd AS (
+    UPDATE subscribers SET status = ...
+    FROM ctx WHERE subscribers.id = $1 AND ctx.actor IS NOT NULL
+    RETURNING subscribers.*
+) SELECT ... FROM upd
+```
+
+Three properties of that shape are load-bearing:
+
+- **`is_local = true`.** pgx hands the same physical connection to unrelated
+  requests; a session-level setting would misattribute the next one.
+- **One statement, not an explicit `BEGIN`.** The CTE keeps the config and the
+  update in the same implicit transaction with no block to leak on an early
+  return.
+- **The CTE must be referenced.** `AND ctx.actor IS NOT NULL` is always true
+  and exists only to force evaluation. This is not defensive
+  over-engineering — removing the reference was verified to silently drop
+  attribution to `unknown` while the update itself still succeeded.
+
+**Forgetting to set the actor is not a failure.** The transition is still
+captured, with `changed_by = 'unknown'`. Losing who made a change is
+recoverable from other logs; losing the fact that it happened is not. That
+asymmetry is the whole argument for the trigger.
+
+Background workers annotate their own context — `middleware.WithSubject(ctx,
+"system:dunning-scanner")` — so an automatic suspension stays distinguishable
+from one a person decided on. Without it, a churn report cannot separate "our
+collections process is working" from "staff are suspending customers".
+
+### A baseline is not an event
+
+Accounts that predate the migration get one seeded row recording where they
+stand now, dated from `created_at` and flagged `is_baseline`. The reporting
+views exclude those rows from every growth and churn count, and
+`chk_ssh_baseline_has_no_predecessor` stops one ever being written with an
+`old_status` — a baseline carrying a predecessor is a transition claiming to
+be a snapshot.
+
+Terminated subscribers and resolved/closed tickets are skipped entirely. Their
+transition moment is unrecoverable, and a baseline row for one would let a
+churn we cannot date masquerade as a signup we cannot date.
+
+### Cost
+
+`AFTER UPDATE OF status ... WHEN (OLD.status IS DISTINCT FROM NEW.status)`
+means the trigger function is not called at all for the far more frequent
+`wallet_balance`, `plan_expiry` and `fup_active` writes. The hot paths pay
+nothing. The `WHEN` clause also makes a no-op re-save a non-event: without it,
+an operator re-saving an unchanged form inflates every count — verified by
+removing it and watching the test fail.
+
+### Verification
+
+Six integration tests, three negative controls, and a live run against the
+demo stack. The live run is what found the real gap: capture had been wired
+into the status *update* paths but not the *create* ones, so the first row of
+every subscriber's and every ticket's history read `unknown` — the one entry
+an audit of "who opened this account" most needs. Fixed across all four
+creation paths, with a test that fails if it regresses.
+
+### Known limitations
+
+- **No history before 2026-08-15.** Reports covering earlier periods show the
+  baseline only. This is deliberate and must be labelled as partial history in
+  any UI that renders it.
+- **`reason` is set only where a caller supplies it.** Operator edits,
+  dunning, signup and lead conversion are labelled; other paths leave it NULL.

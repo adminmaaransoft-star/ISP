@@ -208,9 +208,20 @@ func (s *BillingStore) ListDunningCandidates(ctx context.Context) ([]billing.Dun
 // hard_suspended with a status still 'active' would keep a non-paying
 // subscriber online.
 func (s *BillingStore) SetSubscriberDunningState(ctx context.Context, subscriberID int, state billing.DunningState, status string) error {
-	const q = `UPDATE subscribers SET dunning_state = $2, status = $3 WHERE id = $1`
+	// The ctx CTE attributes the status change for migration 031's capture
+	// trigger. This path runs from the dunning scanner, which has no JWT, so
+	// the caller annotates its context with middleware.WithSubject — that is
+	// what keeps an automatic suspension distinguishable from an operator's.
+	const q = `
+		WITH ctx AS (
+			SELECT set_config('app.actor', $4, true)              AS actor,
+			       set_config('app.change_reason', 'dunning', true) AS reason
+		)
+		UPDATE subscribers SET dunning_state = $2, status = $3
+		FROM ctx
+		WHERE subscribers.id = $1 AND ctx.actor IS NOT NULL`
 
-	tag, err := s.pool.Exec(ctx, q, subscriberID, string(state), status)
+	tag, err := s.pool.Exec(ctx, q, subscriberID, string(state), status, actorFromContext(ctx))
 	if err != nil {
 		return fmt.Errorf("db: set dunning state for subscriber %d: %w", subscriberID, err)
 	}

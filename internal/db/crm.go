@@ -150,13 +150,22 @@ func (s *CRMStore) ConvertLead(ctx context.Context, leadID int, sub api.Subscrib
 
 	const readLead = `SELECT ` + leadColumns + ` FROM leads WHERE id = $1`
 
+	// The ctx CTE attributes the new connection to the converting operator for
+	// migration 031's capture trigger, and marks it as originating from a lead
+	// conversion rather than a direct signup — the two are different enough
+	// for a growth report to want them apart.
 	const insertSubscriber = `
-		WITH ins AS (
+		WITH ctx AS (
+			SELECT set_config('app.actor', $9, true)                     AS actor,
+			       set_config('app.change_reason', 'lead_conversion', true) AS reason
+		), ins AS (
 			INSERT INTO subscribers (
 				caf_number, username, password_hash, mobile_number, email,
 				plan_id, franchise_id, status, dunning_state, wallet_balance,
 				registered_state, kyc_status, plan_expiry
-			) VALUES ($1,$2,$3,$4,NULLIF($5,''),$6,$7,'active','active',0.00,$8,'pending',NULL)
+			)
+			SELECT $1,$2,$3,$4,NULLIF($5,''),$6,$7,'active','active',0.00,$8,'pending',NULL
+			  FROM ctx WHERE ctx.actor IS NOT NULL
 			RETURNING *
 		)
 		SELECT ` + apiSubscriberColumns + ` FROM ins s`
@@ -174,7 +183,7 @@ func (s *CRMStore) ConvertLead(ctx context.Context, leadID int, sub api.Subscrib
 		// transaction rolls back and this insert never happened.
 		rec, err := scanAPISubscriber(tx.QueryRow(ctx, insertSubscriber,
 			sub.CAFNumber, sub.Username, passwordHash, sub.MobileNumber, sub.Email,
-			sub.PlanID, sub.FranchiseID, sub.RegisteredState))
+			sub.PlanID, sub.FranchiseID, sub.RegisteredState, actorFromContext(ctx)))
 		if err != nil {
 			// Surfaced verbatim so api.isUniqueViolation can classify a
 			// duplicate caf_number or username as 409 rather than 500.

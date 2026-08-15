@@ -104,6 +104,19 @@ func SubjectFromContext(ctx context.Context) string {
 	return sub
 }
 
+// WithSubject attaches an acting principal to a context that did not come
+// from an HTTP request.
+//
+// Background workers — the dunning scanner, the renewal scanner — change
+// subscriber status with no JWT anywhere in sight, and the status-capture
+// triggers (migration 031) would otherwise attribute their work to "unknown".
+// Naming them explicitly, as "system:dunning-scanner", is what lets an
+// operator reading the history tell an automatic suspension apart from one a
+// person decided on.
+func WithSubject(ctx context.Context, subject string) context.Context {
+	return context.WithValue(ctx, ctxKeySubject, subject)
+}
+
 // SubscriberIDFromContext extracts the subscriber_id claim.
 func SubscriberIDFromContext(ctx context.Context) int {
 	id, _ := ctx.Value(ctxKeySubID).(int)

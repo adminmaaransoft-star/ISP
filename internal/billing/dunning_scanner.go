@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hibiken/asynq"
+	"github.com/maaransoft/isp-bss-oss/internal/middleware"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog/log"
@@ -186,6 +187,12 @@ func (s *DunningScanner) Run(ctx context.Context) {
 // Scan performs one pass. Exported so a test can drive a single pass without
 // waiting on the ticker.
 func (s *DunningScanner) Scan(ctx context.Context) error {
+	// Name the scanner as the actor for migration 031's status-capture
+	// trigger. Without this every automatic suspension is recorded as
+	// "unknown", and a churn report cannot separate accounts the system
+	// suspended for non-payment from ones a person acted on.
+	ctx = middleware.WithSubject(ctx, "system:dunning-scanner")
+
 	candidates, err := s.db.ListDunningCandidates(ctx)
 	if err != nil {
 		return fmt.Errorf("dunning scan: list candidates: %w", err)

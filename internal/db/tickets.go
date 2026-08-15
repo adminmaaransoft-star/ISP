@@ -49,7 +49,7 @@ func (s *TicketStore) CreateTicketAdmin(ctx context.Context, subscriberID int, c
 	t, err := scanTicket(s.pool.QueryRow(ctx, insertTicketSQL,
 		subscriberID, category, description,
 		sla.Priority, sla.ResponseMinutes, sla.ResolutionMinutes,
-		sla.FranchiseID, sla.RoutedRole))
+		sla.FranchiseID, sla.RoutedRole, actorFromContext(ctx)))
 	if err != nil {
 		return nil, fmt.Errorf("db: create ticket for subscriber %d: %w", subscriberID, err)
 	}
@@ -72,7 +72,13 @@ func (s *TicketStore) UpdateTicketAdmin(ctx context.Context, ticketID int, statu
 	// pol.category has to be matched against the CTE's copy of the category,
 	// not against tickets directly.
 	const q = `
-		WITH resolved AS (
+		WITH ctx AS (
+			-- Attribution for migration 031's ticket capture trigger; see
+			-- actor.go. Referenced in the WHERE clause below so Postgres is
+			-- obliged to evaluate it.
+			SELECT set_config('app.actor', $5, true) AS actor
+		),
+		resolved AS (
 			SELECT t.id,
 			       t.created_at,
 			       t.category,
@@ -110,11 +116,11 @@ func (s *TicketStore) UpdateTicketAdmin(ctx context.Context, ticketID int, statu
 		        WHEN $4::text IS NULL THEN t.sla_resolution_due_at
 		        ELSE p.anchor_created_at + (p.resolution_minutes * INTERVAL '1 minute')
 		    END
-		FROM policy p
-		WHERE t.id = p.ticket_id
+		FROM policy p, ctx
+		WHERE t.id = p.ticket_id AND ctx.actor IS NOT NULL
 		RETURNING ` + ticketColumns
 
-	t, err := scanTicket(s.pool.QueryRow(ctx, q, ticketID, status, assignedTo, priority))
+	t, err := scanTicket(s.pool.QueryRow(ctx, q, ticketID, status, assignedTo, priority, actorFromContext(ctx)))
 	if isNoRows(err) {
 		return nil, nil
 	}
