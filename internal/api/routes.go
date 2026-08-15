@@ -102,6 +102,8 @@ type Handler struct {
 	secretEncryptor SecretEncryptor
 	partnerAuth     middleware.APIKeyAuthenticator
 	events          EventEmitter
+	hotspot         HotspotQuerier
+	nas             NASQuerier
 	// subscriberLister backs revenue.ListSubscribersHandler, which is a
 	// plain http.HandlerFunc rather than a method on Handler — so the
 	// dependency is held here and passed to it at route-registration time.
@@ -155,6 +157,8 @@ type HandlerDeps struct {
 	SecretEncryptor  SecretEncryptor
 	PartnerAuth      middleware.APIKeyAuthenticator
 	Events           EventEmitter
+	Hotspot          HotspotQuerier
+	NAS              NASQuerier
 
 	// Health serves GET /api/v1/subscribers/{id}/health (FR-OBS-004). The
 	// implementation lives in internal/health, which cannot be imported here
@@ -205,6 +209,8 @@ func NewHandler(deps HandlerDeps) *Handler {
 		secretEncryptor:  deps.SecretEncryptor,
 		partnerAuth:      deps.PartnerAuth,
 		events:           deps.Events,
+		hotspot:          deps.Hotspot,
+		nas:              deps.NAS,
 		health:           deps.Health,
 
 		razorpayWebhookSecret: deps.RazorpayWebhookSecret,
@@ -379,6 +385,48 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, jwtSecret string) {
 	mux.Handle("POST /api/v1/partner-keys", ownerOnly(http.HandlerFunc(h.CreateAPIKey)))
 	mux.Handle("GET /api/v1/partner-keys", ownerOnly(http.HandlerFunc(h.ListAPIKeys)))
 	mux.Handle("DELETE /api/v1/partner-keys/{id}", ownerOnly(http.HandlerFunc(h.RevokeAPIKey)))
+
+	// NAS inventory (FR-NAS-001..004, FR-HSP-002 | MDS §4.11).
+	//
+	// NOC tier: this is network infrastructure, and every field on it —
+	// the shared secret, the CoA port, allow_mab — changes how the RADIUS
+	// daemons treat a device. Deliberately not `staffRead` even for the
+	// listing: which NAS exist, on which addresses, with MAB on or off, is a
+	// map of the network's soft spots rather than routine support data.
+	//
+	// Path is /api/v1/nas rather than an /admin/ prefix, matching every other
+	// resource in this file — the tier is expressed by the middleware, not by
+	// the URL.
+	mux.Handle("GET /api/v1/nas",
+		nocOnly(http.HandlerFunc(h.ListNASDevices)))
+	mux.Handle("POST /api/v1/nas",
+		nocOnly(http.HandlerFunc(h.CreateNASDevice)))
+	mux.Handle("PATCH /api/v1/nas/{id}",
+		nocOnly(http.HandlerFunc(h.UpdateNASDevice)))
+
+	// Hotspot administration (FR-HSP-001..002 | MDS §4.23).
+	//
+	// Two tiers, split by what the action actually grants. Issuing and voiding
+	// vouchers is billing_admin/isp_owner: a batch of vouchers is prepaid
+	// service, and generating one is the same kind of act as crediting a
+	// wallet. Registering a subscriber's phone for MAC Auth Bypass is routine
+	// support work, so it sits with csr/technician alongside CPE handling.
+	//
+	// The captive portal that redeems these lives in internal/hotspot and is
+	// mounted separately, with no authentication at all — it has to be, since
+	// its audience has no account yet. Keeping issuance here rather than there
+	// is what stops the public-facing surface from being able to mint what it
+	// accepts.
+	mux.Handle("POST /api/v1/hotspot/vouchers",
+		admin(http.HandlerFunc(h.CreateVoucherBatch)))
+	mux.Handle("GET /api/v1/hotspot/vouchers",
+		staffRead(http.HandlerFunc(h.ListVouchers)))
+	mux.Handle("DELETE /api/v1/hotspot/vouchers/{id}",
+		admin(http.HandlerFunc(h.VoidVoucher)))
+	mux.Handle("POST /api/v1/hotspot/devices",
+		csrOrTech(http.HandlerFunc(h.RegisterHotspotDevice)))
+	mux.Handle("DELETE /api/v1/hotspot/devices/{mac}",
+		csrOrTech(http.HandlerFunc(h.DeactivateHotspotDevice)))
 
 	// Announcements (FR-ANN-001..002 | MDS §4.17). Composing a broadcast to
 	// the whole subscriber base is an owner/billing-tier action; the portal

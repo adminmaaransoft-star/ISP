@@ -1,6 +1,8 @@
 package nas
 
 import (
+	"sort"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -34,6 +36,29 @@ var builders = map[Vendor]AttributeBuilder{
 	VendorCiscoWLC: ciscoWLCBuilder{},
 	VendorAruba:    arubaBuilder{},
 	VendorRuckus:   ruckusBuilder{},
+}
+
+// KnownVendor reports whether vendor has a builder in this package.
+//
+// The set here and the CHECK constraint on nas_devices.vendor (migration 022)
+// must agree. Validating at the API edge turns a vendor typo into a readable
+// 422 instead of either a constraint violation surfacing as a 500, or — worse —
+// a row that stores fine and then silently authenticates on the MikroTik
+// fallback that BuilderFor applies to anything it does not recognise.
+func KnownVendor(vendor Vendor) bool {
+	_, ok := builders[vendor]
+	return ok
+}
+
+// Vendors returns the supported vendor values, sorted, for error messages and
+// operator-facing listings.
+func Vendors() []string {
+	out := make([]string, 0, len(builders))
+	for v := range builders {
+		out = append(out, string(v))
+	}
+	sort.Strings(out)
+	return out
 }
 
 // BuilderFor returns the AttributeBuilder for vendor. An unrecognized

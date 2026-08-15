@@ -9,9 +9,13 @@ package db_test
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/maaransoft/isp-bss-oss/internal/hotspot"
 )
 
 func seedNAS(ctx context.Context, t *testing.T, pool *pgxpool.Pool, id int, ip string, allowMAB bool) {
@@ -133,7 +137,10 @@ func TestFR_HSP_001_VoucherIsSingleUseUnderConcurrency(t *testing.T) {
 	seedNAS(ctx, t, pool, 1, "203.0.113.10", true)
 
 	store := database.Hotspot()
-	if _, err := store.CreateVoucher(ctx, "hash-abc", "HS-ABCD", 1, nil, 60, 0, "batch-1", "owner"); err != nil {
+	if _, err := store.CreateVoucher(ctx, hotspot.NewVoucher{
+		CodeHash: "hash-abc", CodePrefix: "HS-ABCD", PlanID: 1,
+		DurationMinutes: 60, BatchRef: "batch-1", CreatedBy: "owner",
+	}); err != nil {
 		t.Fatalf("CreateVoucher: %v", err)
 	}
 
@@ -177,6 +184,137 @@ func TestFR_HSP_001_VoucherIsSingleUseUnderConcurrency(t *testing.T) {
 	if again != 0 {
 		t.Error("a spent voucher must not be redeemable again")
 	}
+}
+
+// TestFR_HSP_001_UnredeemedVoucherGoesStale covers expires_at, which is the
+// shelf life of the printed code itself — not the session it buys. A batch
+// printed for a festival must stop working after the festival, or a stack
+// found in a drawer two years later is still free service.
+func TestFR_HSP_001_UnredeemedVoucherGoesStale(t *testing.T) {
+	database, pool := newTestDB(t)
+	ctx := context.Background()
+
+	seedPlan(ctx, t, pool, 1, "P", "5M/5M", 0, "", "20.00")
+	store := database.Hotspot()
+
+	past := time.Now().Add(-time.Hour)
+	future := time.Now().Add(24 * time.Hour)
+	if _, err := store.CreateVoucher(ctx, hotspot.NewVoucher{
+		CodeHash: "hash-stale", CodePrefix: "HS-STAL", PlanID: 1,
+		DurationMinutes: 60, ExpiresAt: &past, CreatedBy: "owner",
+	}); err != nil {
+		t.Fatalf("CreateVoucher(stale): %v", err)
+	}
+	if _, err := store.CreateVoucher(ctx, hotspot.NewVoucher{
+		CodeHash: "hash-fresh", CodePrefix: "HS-FRSH", PlanID: 1,
+		DurationMinutes: 60, ExpiresAt: &future, CreatedBy: "owner",
+	}); err != nil {
+		t.Fatalf("CreateVoucher(fresh): %v", err)
+	}
+
+	stale, err := store.RedeemVoucher(ctx, "hash-stale", "AA:BB:CC:DD:EE:10", nil)
+	if err != nil {
+		t.Fatalf("RedeemVoucher(stale): %v", err)
+	}
+	if stale != 0 {
+		t.Error("a voucher past its expires_at must not redeem — an unexpiring printed code " +
+			"is free service for as long as the paper survives")
+	}
+
+	fresh, err := store.RedeemVoucher(ctx, "hash-fresh", "AA:BB:CC:DD:EE:11", nil)
+	if err != nil || fresh == 0 {
+		t.Fatalf("a voucher inside its shelf life must redeem: id=%d err=%v", fresh, err)
+	}
+}
+
+// TestFR_HSP_001_VoucherListingNeverExposesTheCode is the property that makes
+// hashing the codes worth anything: a staff listing must not hand back what it
+// takes to redeem them.
+func TestFR_HSP_001_VoucherListingNeverExposesTheCode(t *testing.T) {
+	database, pool := newTestDB(t)
+	ctx := context.Background()
+
+	seedPlan(ctx, t, pool, 1, "P", "5M/5M", 0, "", "20.00")
+	store := database.Hotspot()
+
+	generated, err := hotspot.GenerateCode()
+	if err != nil {
+		t.Fatalf("GenerateCode: %v", err)
+	}
+	id, err := store.CreateVoucher(ctx, hotspot.NewVoucher{
+		CodeHash: generated.Hash, CodePrefix: generated.Prefix, PlanID: 1,
+		DurationMinutes: 30, BatchRef: "festival", CreatedBy: "owner",
+	})
+	if err != nil {
+		t.Fatalf("CreateVoucher: %v", err)
+	}
+
+	listed, err := store.ListVouchers(ctx, hotspot.VoucherFilter{BatchRef: "festival"})
+	if err != nil {
+		t.Fatalf("ListVouchers: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("want 1 voucher in the batch, got %d", len(listed))
+	}
+	if listed[0].CodePrefix != generated.Prefix {
+		t.Errorf("code_prefix: want %q, got %q", generated.Prefix, listed[0].CodePrefix)
+	}
+	// The listing is a struct, so the code cannot appear in it by construction —
+	// which is the point. Serialising it is how a reviewer sees that stays true
+	// if a field is ever added.
+	blob := mustJSON(t, listed)
+	if contains(blob, generated.Plaintext) || contains(blob, generated.Hash) {
+		t.Error("a voucher listing must expose neither the code nor its hash — either one " +
+			"turns read access to the admin API into free service")
+	}
+
+	// A batch that has not been handed out yet can be pulled from circulation.
+	voided, err := store.VoidVoucher(ctx, id)
+	if err != nil || !voided {
+		t.Fatalf("VoidVoucher: ok=%v err=%v", voided, err)
+	}
+	spent, err := store.RedeemVoucher(ctx, generated.Hash, "AA:BB:CC:DD:EE:12", nil)
+	if err != nil {
+		t.Fatalf("RedeemVoucher(voided): %v", err)
+	}
+	if spent != 0 {
+		t.Error("a voided voucher must not redeem")
+	}
+
+	// And voiding is not a way to un-redeem: a claimed voucher stays claimed.
+	if _, err := store.CreateVoucher(ctx, hotspot.NewVoucher{
+		CodeHash: "hash-claimed", CodePrefix: "HS-CLMD", PlanID: 1,
+		DurationMinutes: 30, CreatedBy: "owner",
+	}); err != nil {
+		t.Fatalf("CreateVoucher(claimed): %v", err)
+	}
+	claimedList, err := store.ListVouchers(ctx, hotspot.VoucherFilter{Status: "unused"})
+	if err != nil {
+		t.Fatalf("ListVouchers(unused): %v", err)
+	}
+	if len(claimedList) != 1 {
+		t.Fatalf("want 1 unused voucher after voiding the other, got %d", len(claimedList))
+	}
+	if _, err := store.RedeemVoucher(ctx, "hash-claimed", "AA:BB:CC:DD:EE:13", nil); err != nil {
+		t.Fatalf("RedeemVoucher: %v", err)
+	}
+	if voidedAfter, err := store.VoidVoucher(ctx, claimedList[0].ID); err != nil || voidedAfter {
+		t.Errorf("a redeemed voucher must not be voidable: ok=%v err=%v — voiding it would "+
+			"strand a live grant behind a voucher claiming it was never used", voidedAfter, err)
+	}
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return string(b)
+}
+
+func contains(haystack, needle string) bool {
+	return strings.Contains(haystack, needle)
 }
 
 func macForRacer(n int) (string, bool) {

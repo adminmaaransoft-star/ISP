@@ -3,7 +3,6 @@ package radius
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -167,30 +166,6 @@ func (d *RadiusDaemon) applyRateLimit(resp *radius.Packet, sub *Subscriber, r *r
 	for _, a := range attrs {
 		resp.Add(a.Type, a.Value)
 	}
-}
-
-// handleAccounting processes RADIUS Accounting-Request with deduplication.
-//
-// FR: FR-AAA-003 | DDS Ã‚Â§5.2
-func (d *RadiusDaemon) handleAccounting(ctx context.Context, w radius.ResponseWriter, r *radius.Request) {
-	acctSessionID := rfc2865.NASIdentifier_GetString(r.Packet) // reuse as session key
-	inputOctets := uint64(0)
-	// Extract Acct-Input-Octets if present
-	if v := r.Get(radius.Type(42)); v != nil {
-		if len(v) == 4 {
-			inputOctets = uint64(v[0])<<24 | uint64(v[1])<<16 | uint64(v[2])<<8 | uint64(v[3])
-		}
-	}
-
-	dedupKey := "acct_dedup:" + acctSessionID + ":" + strconv.FormatUint(inputOctets, 10)
-	isNew, err := d.redisClient.SetNX(ctx, dedupKey, "1", 30*time.Second).Result()
-	if err != nil || !isNew {
-		w.Write(r.Response(radius.CodeAccountingResponse)) //nolint:errcheck,gosec
-		radiusDedupSkipped.Inc()
-		return
-	}
-
-	w.Write(r.Response(radius.CodeAccountingResponse)) //nolint:errcheck,gosec
 }
 
 // recordAuthFailure increments the brute-force counter for a rejected credential.

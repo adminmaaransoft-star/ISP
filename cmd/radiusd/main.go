@@ -25,6 +25,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"github.com/maaransoft/isp-bss-oss/internal/archive"
 	"github.com/maaransoft/isp-bss-oss/internal/billing"
 	"github.com/maaransoft/isp-bss-oss/internal/cache"
 	"github.com/maaransoft/isp-bss-oss/internal/config"
@@ -157,10 +158,17 @@ func run() error {
 	// FALSE, so it stays unreachable until an operator turns it on for a
 	// specific NAS.
 	daemon.SetMABQuerier(database.Hotspot())
+	// Session accounting (FR-AAA-003, DDS §5.2). This is what populates
+	// subscriber_session_history, which the FUP scanner, the CoA sender, LEA
+	// lookups and the portal's usage history all read — without it they each
+	// query an empty table and quietly do nothing.
+	daemon.SetAccountingStore(database.FUP())
+	daemon.SetAcctAddr(cfg.RadiusAcctAddr)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		log.Info().Str("addr", cfg.RadiusAddr).Msg("radiusd: RADIUS listening")
+		log.Info().Str("addr", cfg.RadiusAddr).Str("acct_addr", cfg.RadiusAcctAddr).
+			Msg("radiusd: RADIUS listening")
 		// Blocks until the listener fails or ctx is cancelled, at which point it
 		// stops accepting and drains queued packets before returning.
 		if err := daemon.StartContext(ctx); err != nil {
@@ -264,6 +272,30 @@ func run() error {
 		reportingRefresher.Run(ctx)
 		log.Info().Msg("radiusd: reporting view refresh stopped")
 	}()
+
+	// ── Document retention purge (FR-DOC-001 | MDS §4.24) ───────────────────
+	//
+	// Only runs when a backend is configured. Archival with no purge would be
+	// worse than no archival: retain_until would record the date each document
+	// should have been deleted while nothing deleted it, which under the DPDP
+	// Act's storage-limitation principle is a violation the system has
+	// documented against itself.
+	if cfg.ArchiveDir != "" {
+		archiveStore, err := archive.NewLocalStore(cfg.ArchiveDir)
+		if err != nil {
+			return fmt.Errorf("document archive storage: %w", err)
+		}
+		purgeScanner := archive.NewPurgeScanner(archiveStore, database.Archive(), 0)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			log.Info().Str("dir", cfg.ArchiveDir).Msg("radiusd: document retention purge started")
+			purgeScanner.Run(ctx)
+			log.Info().Msg("radiusd: document retention purge stopped")
+		}()
+	} else {
+		log.Warn().Msg("radiusd: ARCHIVE_DIR unset — document archival and retention purge are disabled")
+	}
 
 	// ── Asynq workers ───────────────────────────────────────────────────────
 

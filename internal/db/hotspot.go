@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/maaransoft/isp-bss-oss/internal/hotspot"
 	"github.com/maaransoft/isp-bss-oss/internal/radius"
 )
 
@@ -13,7 +14,10 @@ import (
 // hotspot_grants.
 type HotspotStore struct{ pool dbPool }
 
-var _ radius.MABQuerier = (*HotspotStore)(nil)
+var (
+	_ radius.MABQuerier  = (*HotspotStore)(nil)
+	_ hotspot.GrantStore = (*HotspotStore)(nil)
+)
 
 // AuthorizeMAC resolves a MAC to the subscriber it may authenticate as.
 //
@@ -134,24 +138,83 @@ func (s *HotspotStore) DeactivateDevice(ctx context.Context, mac string) (bool, 
 
 // CreateVoucher stores one voucher. The plaintext code never reaches this
 // layer — it is shown once at generation, like an API key.
-func (s *HotspotStore) CreateVoucher(ctx context.Context, codeHash, codePrefix string,
-	planID int, franchiseID *int, durationMinutes int, dataCapBytes int64,
-	batchRef, createdBy string,
-) (int, error) {
+func (s *HotspotStore) CreateVoucher(ctx context.Context, v hotspot.NewVoucher) (int, error) {
 	const q = `
 		INSERT INTO hotspot_vouchers (
 			code_hash, code_prefix, plan_id, franchise_id,
-			duration_minutes, data_cap_bytes, batch_ref, created_by)
-		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7,''), $8)
+			duration_minutes, data_cap_bytes, expires_at, batch_ref, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8,''), $9)
 		RETURNING id`
 
 	var id int
-	err := s.pool.QueryRow(ctx, q, codeHash, codePrefix, planID, franchiseID,
-		durationMinutes, dataCapBytes, batchRef, createdBy).Scan(&id)
+	err := s.pool.QueryRow(ctx, q, v.CodeHash, v.CodePrefix, v.PlanID, v.FranchiseID,
+		v.DurationMinutes, v.DataCapBytes, v.ExpiresAt, v.BatchRef, v.CreatedBy).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("db: create voucher: %w", err)
 	}
 	return id, nil
+}
+
+// ListVouchers returns stored vouchers, newest first, optionally narrowed to
+// one printed batch or one status.
+//
+// code_hash is never selected. An operator listing vouchers to reconcile a
+// printed batch has no use for it, and a listing endpoint that returned it
+// would hand anyone who reaches the admin API the ability to redeem every
+// unused code — the exact outcome hashing them was meant to prevent.
+func (s *HotspotStore) ListVouchers(ctx context.Context, f hotspot.VoucherFilter) ([]hotspot.Voucher, error) {
+	const q = `
+		SELECT id, code_prefix, plan_id, franchise_id, duration_minutes, data_cap_bytes,
+		       status, COALESCE(redeemed_by_mac, ''), redeemed_at, expires_at, valid_until,
+		       COALESCE(batch_ref, ''), created_by, created_at
+		  FROM hotspot_vouchers
+		 WHERE ($1 = '' OR batch_ref = $1)
+		   AND ($2 = '' OR status = $2)
+		 ORDER BY created_at DESC, id DESC
+		 LIMIT $3`
+
+	limit := f.Limit
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	rows, err := s.pool.Query(ctx, q, f.BatchRef, f.Status, limit)
+	if err != nil {
+		return nil, fmt.Errorf("db: list vouchers: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]hotspot.Voucher, 0, limit)
+	for rows.Next() {
+		var v hotspot.Voucher
+		if err := rows.Scan(&v.ID, &v.CodePrefix, &v.PlanID, &v.FranchiseID,
+			&v.DurationMinutes, &v.DataCapBytes, &v.Status, &v.RedeemedByMAC,
+			&v.RedeemedAt, &v.ExpiresAt, &v.ValidUntil, &v.BatchRef,
+			&v.CreatedBy, &v.CreatedAt); err != nil {
+			return nil, fmt.Errorf("db: scan voucher row: %w", err)
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterate vouchers: %w", err)
+	}
+	return out, nil
+}
+
+// VoidVoucher takes an unredeemed voucher out of circulation — a printed sheet
+// that was lost or mis-issued.
+//
+// Only 'unused' vouchers can be voided: voiding one that is already redeemed
+// would strand a live grant behind a voucher whose status claims it was never
+// used, and the schema's chk_voucher_redemption_complete constraint would
+// reject the row anyway.
+func (s *HotspotStore) VoidVoucher(ctx context.Context, voucherID int) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE hotspot_vouchers SET status = 'void' WHERE id = $1 AND status = 'unused'`, voucherID)
+	if err != nil {
+		return false, fmt.Errorf("db: void voucher %d: %w", voucherID, err)
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // RedeemVoucher claims a voucher for a MAC and opens a grant, atomically.

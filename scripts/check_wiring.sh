@@ -52,6 +52,29 @@ COMPONENTS=(
     "NewResolver:multi-vendor NAS attribute/secret resolver"
     "NewSLAScanner:SLA breach scanner (helpdesk deadlines)"
     "NewRefreshScanner:reporting view refresh (keeps mv_ticket_resolution current)"
+    # Tracks the mount, not the constructor. Constructing the handler proves
+    # nothing on its own — an unmounted captive portal is built, tested, and
+    # serves no route, which is this script's whole subject. Matching the
+    # method call covers both, since it can only be called on a handler that
+    # was constructed. It does depend on the variable's name in cmd/api, which
+    # is the right direction to be brittle in: a rename fails loudly here
+    # rather than passing silently while nothing is served.
+    "hotspotHandler.RegisterRoutes:captive portal (walled-garden voucher and login pages)"
+    # Not merely a dependency of the above: with no limiter constructed, every
+    # redemption answers 503 by design, so an unwired limiter is a silently
+    # dead captive portal rather than an unmetered one.
+    "hotspot.NewRedisLimiter:captive-portal attempt limiter (bounds voucher guessing)"
+    # The canonical instance of what this script is for. StartSession,
+    # UpdateSessionOctets and StopSession were written, tested and correct, and
+    # nothing called them — so subscriber_session_history stayed empty and FUP
+    # enforcement, CoA targeting, LEA lookups and portal usage all read no rows
+    # while their own tests passed.
+    "daemon.SetAccountingStore:RADIUS accounting persistence (writes subscriber_session_history)"
+    # Retention that nothing enforces is worse than none: retain_until would
+    # record the date each document should have been deleted while it sat there,
+    # which under the DPDP Act is a violation the system documented against
+    # itself.
+    "archive.NewPurgeScanner:document retention purge (deletes archives past retain_until)"
 )
 
 if [ "${1:-}" = "--list" ]; then

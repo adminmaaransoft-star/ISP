@@ -237,16 +237,24 @@ func TestFR_AAA_003_FUPStore_SessionLifecycle(t *testing.T) {
 		t.Fatalf("want 1 open session, got %d", n)
 	}
 
-	if err := store.UpdateSessionOctets(ctx, "live-1", 1_000_000, 2_000_000); err != nil {
+	matched, err := store.UpdateSessionOctets(ctx, "live-1", 1_000_000, 2_000_000)
+	if err != nil {
 		t.Fatalf("UpdateSessionOctets: %v", err)
+	}
+	if !matched {
+		t.Error("an interim update for an open session must report that it matched one")
 	}
 	used := countRows(ctx, t, pool, `SELECT input_octets + output_octets FROM subscriber_session_history WHERE session_id = 'live-1'`)
 	if used != 3_000_000 {
 		t.Errorf("usage: want 3000000, got %d", used)
 	}
 
-	if err := store.StopSession(ctx, "live-1", 5_000_000, 6_000_000, "User-Request"); err != nil {
+	stopped, err := store.StopSession(ctx, "live-1", 5_000_000, 6_000_000, "User-Request")
+	if err != nil {
 		t.Fatalf("StopSession: %v", err)
+	}
+	if !stopped {
+		t.Error("stopping an open session must report that it matched one")
 	}
 	if n := countRows(ctx, t, pool, `SELECT COUNT(*) FROM subscriber_session_history WHERE stop_time IS NULL`); n != 0 {
 		t.Errorf("session must be closed, %d still open", n)

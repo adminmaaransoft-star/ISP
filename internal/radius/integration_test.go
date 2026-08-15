@@ -11,6 +11,7 @@ package radius
 
 import (
 	"context"
+	"net"
 	"sort"
 	"sync"
 	"testing"
@@ -23,6 +24,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"layeh.com/radius"
 	"layeh.com/radius/rfc2865"
+	"layeh.com/radius/rfc2866"
 )
 
 var itSecret = []byte("testing123")
@@ -96,18 +98,29 @@ func itAccessRequest(t *testing.T, username, password string) *radius.Request {
 	return &radius.Request{Packet: pkt}
 }
 
+// itAccountingRequest builds an Interim-Update.
+//
+// It previously set NAS-Identifier as the session key, matching a handler that
+// read the session id from that attribute — a per-device string, not a
+// per-session one. Both were wrong together, so this test passed while
+// exercising the defect. It now builds the attributes RFC 2866 actually
+// specifies.
 func itAccountingRequest(t *testing.T, sessionID string, inputOctets uint32) *radius.Request {
 	t.Helper()
 	pkt := radius.New(radius.CodeAccountingRequest, itSecret)
-	if err := rfc2865.NASIdentifier_SetString(pkt, sessionID); err != nil {
-		t.Fatalf("set NAS-Identifier: %v", err)
+	if err := rfc2866.AcctStatusType_Set(pkt, rfc2866.AcctStatusType_Value_InterimUpdate); err != nil {
+		t.Fatalf("set Acct-Status-Type: %v", err)
 	}
-	octets := []byte{
-		byte(inputOctets >> 24), byte(inputOctets >> 16),
-		byte(inputOctets >> 8), byte(inputOctets),
+	if err := rfc2866.AcctSessionID_SetString(pkt, sessionID); err != nil {
+		t.Fatalf("set Acct-Session-Id: %v", err)
 	}
-	pkt.Add(radius.Type(42), radius.Attribute(octets)) // Acct-Input-Octets
-	return &radius.Request{Packet: pkt}
+	if err := rfc2866.AcctInputOctets_Set(pkt, rfc2866.AcctInputOctets(inputOctets)); err != nil {
+		t.Fatalf("set Acct-Input-Octets: %v", err)
+	}
+	return &radius.Request{
+		Packet:     pkt,
+		RemoteAddr: &net.UDPAddr{IP: net.IPv4(203, 0, 113, 9), Port: 41000},
+	}
 }
 
 // itCounterValue reads the current value of a counter for delta assertions.
@@ -389,7 +402,9 @@ func TestFR_AAA_003_Dedup_DuplicateInterimSkipped(t *testing.T) {
 	if len(keys) != 1 {
 		t.Fatalf("want exactly 1 dedup key, got %d: %v", len(keys), keys)
 	}
-	wantKey := "acct_dedup:" + sessionID + ":1234567890"
+	// Session, record type, and both counters: everything that distinguishes a
+	// genuine record from a retransmission of the same one.
+	wantKey := "acct_dedup:" + sessionID + ":interim:1234567890:0"
 	if keys[0] != wantKey {
 		t.Errorf("dedup key: want %q, got %q", wantKey, keys[0])
 	}

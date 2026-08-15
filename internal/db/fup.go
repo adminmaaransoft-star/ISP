@@ -7,6 +7,7 @@ import (
 
 	"github.com/maaransoft/isp-bss-oss/internal/api"
 	"github.com/maaransoft/isp-bss-oss/internal/fup"
+	"github.com/maaransoft/isp-bss-oss/internal/radius"
 )
 
 // FUPStore serves the FUP scanner, the CoA/PoD senders, admin session control
@@ -18,11 +19,12 @@ import (
 type FUPStore struct{ pool dbPool }
 
 var (
-	_ fup.FUPQuerier        = (*FUPStore)(nil)
-	_ fup.CoAQuerier        = (*FUPStore)(nil)
-	_ api.SessionController = (*FUPStore)(nil)
-	_ api.LEAQuerier        = (*FUPStore)(nil)
-	_ api.LEAAuditRecorder  = (*FUPStore)(nil)
+	_ fup.FUPQuerier         = (*FUPStore)(nil)
+	_ fup.CoAQuerier         = (*FUPStore)(nil)
+	_ api.SessionController  = (*FUPStore)(nil)
+	_ api.LEAQuerier         = (*FUPStore)(nil)
+	_ api.LEAAuditRecorder   = (*FUPStore)(nil)
+	_ radius.AccountingStore = (*FUPStore)(nil)
 )
 
 // liveSessionUsage aggregates octets across every open session a subscriber has,
@@ -153,11 +155,31 @@ func (s *FUPStore) GetSubscriberNASSession(ctx context.Context, subscriberID int
 }
 
 // StartSession records a new RADIUS session at Accounting-Start.
+//
+// Idempotent on session_id: a NAS retransmits an Accounting-Start it never saw
+// acknowledged, and a second open row for one session would be counted twice by
+// the FUP scanner, which sums octets across every open session a subscriber
+// has. That would throttle a subscriber at half their real quota.
+//
+// Enforced with WHERE NOT EXISTS rather than a unique index because the table is
+// partitioned by start_time (migration 010), and PostgreSQL requires the
+// partition key in any unique constraint — session_id alone cannot carry one.
+// Two Starts racing at the same instant could still both insert; the daemon's
+// Redis dedup covers the retransmit window where that is actually possible.
 func (s *FUPStore) StartSession(ctx context.Context, subscriberID int, sessionID, nasIP, assignedIP string) error {
 	const q = `
 		INSERT INTO subscriber_session_history (
 			subscriber_id, session_id, nas_ip_address, assigned_ipv4, start_time
-		) VALUES ($1, $2, $3::inet, NULLIF($4,'')::inet, NOW())`
+		)
+		-- $2 is cast explicitly because it appears both in the SELECT list, where
+		-- nothing constrains its type, and in the comparison below against a
+		-- VARCHAR column. Without the cast PostgreSQL deduces two different types
+		-- for one parameter and rejects the statement (SQLSTATE 42P08).
+		SELECT $1, $2::varchar, $3::inet, NULLIF($4,'')::inet, NOW()
+		WHERE NOT EXISTS (
+			SELECT 1 FROM subscriber_session_history
+			 WHERE session_id = $2::varchar AND stop_time IS NULL
+		)`
 
 	if _, err := s.pool.Exec(ctx, q, subscriberID, sessionID, nasIP, assignedIP); err != nil {
 		return fmt.Errorf("db: start session for subscriber %d: %w", subscriberID, err)
@@ -165,30 +187,41 @@ func (s *FUPStore) StartSession(ctx context.Context, subscriberID int, sessionID
 	return nil
 }
 
-// UpdateSessionOctets applies an Interim-Update counter to the open session.
-func (s *FUPStore) UpdateSessionOctets(ctx context.Context, sessionID string, inputOctets, outputOctets int64) error {
+// UpdateSessionOctets applies an Interim-Update counter to the open session,
+// reporting whether one was found.
+//
+// A miss is not an error: the daemon may have been down when the session
+// started, or the NAS may be accounting for a session this system never
+// authorised. The caller counts those rather than failing the NAS, but it has
+// to be able to tell — silently affecting zero rows is how usage goes missing
+// without anyone noticing.
+func (s *FUPStore) UpdateSessionOctets(ctx context.Context, sessionID string, inputOctets, outputOctets int64) (bool, error) {
 	const q = `
 		UPDATE subscriber_session_history
 		SET input_octets = $2, output_octets = $3
 		WHERE session_id = $1 AND stop_time IS NULL`
 
-	if _, err := s.pool.Exec(ctx, q, sessionID, inputOctets, outputOctets); err != nil {
-		return fmt.Errorf("db: update session %s octets: %w", sessionID, err)
+	tag, err := s.pool.Exec(ctx, q, sessionID, inputOctets, outputOctets)
+	if err != nil {
+		return false, fmt.Errorf("db: update session %s octets: %w", sessionID, err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
-// StopSession closes a session at Accounting-Stop.
-func (s *FUPStore) StopSession(ctx context.Context, sessionID string, inputOctets, outputOctets int64, cause string) error {
+// StopSession closes a session at Accounting-Stop, reporting whether an open
+// session was found. See UpdateSessionOctets for why a miss is reported rather
+// than raised.
+func (s *FUPStore) StopSession(ctx context.Context, sessionID string, inputOctets, outputOctets int64, cause string) (bool, error) {
 	const q = `
 		UPDATE subscriber_session_history
 		SET stop_time = NOW(), input_octets = $2, output_octets = $3, terminate_cause = NULLIF($4,'')
 		WHERE session_id = $1 AND stop_time IS NULL`
 
-	if _, err := s.pool.Exec(ctx, q, sessionID, inputOctets, outputOctets, cause); err != nil {
-		return fmt.Errorf("db: stop session %s: %w", sessionID, err)
+	tag, err := s.pool.Exec(ctx, q, sessionID, inputOctets, outputOctets, cause)
+	if err != nil {
+		return false, fmt.Errorf("db: stop session %s: %w", sessionID, err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
 // ── Admin session control (API-004) ─────────────────────────────────────────

@@ -31,6 +31,16 @@ type Config struct {
 	APIAddr     string
 	MetricsAddr string
 	RadiusAddr  string
+	// RadiusAcctAddr is the accounting listener. Separate from RadiusAddr
+	// because RFC 2866 puts accounting on its own port and every NAS sends it
+	// there; sharing one port would drop every accounting record on the wire.
+	RadiusAcctAddr string
+
+	// ArchiveDir roots the local document-archival backend (FR-DOC-001).
+	// Empty disables archival entirely rather than defaulting to a path: a
+	// deployment that has not chosen where its invoices and KYC scans live
+	// should not have that decided for it by a constant.
+	ArchiveDir string
 
 	// PostgreSQL
 	DBDSN         string
@@ -107,12 +117,14 @@ const (
 // daemon would block startup for no reason.
 func Load(service string) (*Config, error) {
 	cfg := &Config{
-		Environment: env("ENVIRONMENT", "development"),
-		LogFormat:   env("LOG_FORMAT", "console"),
-		LogLevel:    env("LOG_LEVEL", "info"),
-		APIAddr:     env("API_ADDR", ":8080"),
-		MetricsAddr: env("METRICS_ADDR", ":9101"),
-		RadiusAddr:  env("RADIUS_ADDR", ":1812"),
+		Environment:    env("ENVIRONMENT", "development"),
+		LogFormat:      env("LOG_FORMAT", "console"),
+		LogLevel:       env("LOG_LEVEL", "info"),
+		APIAddr:        env("API_ADDR", ":8080"),
+		MetricsAddr:    env("METRICS_ADDR", ":9101"),
+		RadiusAddr:     env("RADIUS_ADDR", ":1812"),
+		RadiusAcctAddr: env("RADIUS_ACCT_ADDR", ":1813"),
+		ArchiveDir:     env("ARCHIVE_DIR", ""),
 
 		DBDSN:         env("DB_DSN", ""),
 		DBMaxConns:    int32(envInt("DB_MAX_CONNS", 25)), //nolint:gosec // bounded by envInt
@@ -240,6 +252,8 @@ func (c *Config) Redact() map[string]string {
 		"api_addr":               c.APIAddr,
 		"metrics_addr":           c.MetricsAddr,
 		"radius_addr":            c.RadiusAddr,
+		"radius_acct_addr":       c.RadiusAcctAddr,
+		"archive_dir":            c.ArchiveDir,
 		"db_dsn":                 redactDSN(c.DBDSN),
 		"db_max_conns":           strconv.Itoa(int(c.DBMaxConns)),
 		"redis_mode":             redisMode(c),

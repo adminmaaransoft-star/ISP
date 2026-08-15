@@ -251,3 +251,7 @@ func (d *DB) Partner() *PartnerStore { return &PartnerStore{pool: d.pool} }
 // Hotspot returns the store satisfying radius.MABQuerier and the hotspot
 // captive-portal queriers.
 func (d *DB) Hotspot() *HotspotStore { return &HotspotStore{pool: d.pool} }
+
+// Archive returns the store backing document archival and the retention purge
+// sweep (FR-DOC-001).
+func (d *DB) Archive() *ArchiveStore { return &ArchiveStore{pool: d.pool} }

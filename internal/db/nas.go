@@ -46,6 +46,100 @@ func (s *NASStore) ListNASDevices(ctx context.Context) ([]nas.DeviceRow, error) 
 	return out, nil
 }
 
+// ── Management (FR-NAS-001 | MDS §4.11) ─────────────────────────────────────
+//
+// Registering a NAS and turning MAB on for it were direct SQL until now, which
+// made the one prerequisite a hotspot deployment cannot skip
+// (nas_devices.allow_mab) reachable only by someone with a psql prompt.
+
+// CreateNASDevice registers a NAS and returns the operator-facing summary.
+func (s *NASStore) CreateNASDevice(ctx context.Context, d nas.NewNASDevice) (*nas.DeviceSummary, error) {
+	const q = `
+		INSERT INTO nas_devices (
+			ip, vendor, description, radius_secret_encrypted, key_version_id,
+			coa_port, pod_port, allow_mab)
+		VALUES ($1::inet, $2, NULLIF($3,''), $4, $5, $6, $7, $8)
+		RETURNING id, host(ip), vendor, COALESCE(description,''), coa_port, pod_port,
+		          allow_mab, created_at, updated_at`
+
+	var out nas.DeviceSummary
+	err := s.pool.QueryRow(ctx, q, d.IP, d.Vendor, d.Description, d.SecretEncrypted,
+		d.KeyVersion, d.CoAPort, d.PoDPort, d.AllowMAB).
+		Scan(&out.ID, &out.IP, &out.Vendor, &out.Description, &out.CoAPort, &out.PoDPort,
+			&out.AllowMAB, &out.CreatedAt, &out.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("db: create nas device %s: %w", d.IP, err)
+	}
+	return &out, nil
+}
+
+// UpdateNASDevice applies a partial update, returning nil when no such device.
+//
+// The secret and its key version move together or not at all: storing
+// ciphertext against the wrong key version makes it undecryptable, which would
+// take the NAS offline at the next resolver refresh rather than at the moment
+// of the mistake.
+func (s *NASStore) UpdateNASDevice(ctx context.Context, id int, u nas.NASDeviceUpdate) (*nas.DeviceSummary, error) {
+	const q = `
+		UPDATE nas_devices SET
+			vendor                  = COALESCE($2, vendor),
+			description             = COALESCE($3, description),
+			coa_port                = COALESCE($4, coa_port),
+			pod_port                = COALESCE($5, pod_port),
+			allow_mab               = COALESCE($6, allow_mab),
+			radius_secret_encrypted = COALESCE($7, radius_secret_encrypted),
+			key_version_id          = COALESCE($8, key_version_id),
+			updated_at              = NOW()
+		WHERE id = $1
+		RETURNING id, host(ip), vendor, COALESCE(description,''), coa_port, pod_port,
+		          allow_mab, created_at, updated_at`
+
+	var out nas.DeviceSummary
+	err := s.pool.QueryRow(ctx, q, id, u.Vendor, u.Description, u.CoAPort, u.PoDPort,
+		u.AllowMAB, u.SecretEncrypted, u.KeyVersion).
+		Scan(&out.ID, &out.IP, &out.Vendor, &out.Description, &out.CoAPort, &out.PoDPort,
+			&out.AllowMAB, &out.CreatedAt, &out.UpdatedAt)
+	if isNoRows(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db: update nas device %d: %w", id, err)
+	}
+	return &out, nil
+}
+
+// ListNASDeviceSummaries returns the registered NAS inventory without secrets.
+//
+// A separate query from ListNASDevices rather than a filter over it: the
+// ciphertext is never selected, so it cannot reach a response by accident.
+func (s *NASStore) ListNASDeviceSummaries(ctx context.Context) ([]nas.DeviceSummary, error) {
+	const q = `
+		SELECT id, host(ip), vendor, COALESCE(description,''), coa_port, pod_port,
+		       allow_mab, created_at, updated_at
+		  FROM nas_devices
+		 ORDER BY id`
+
+	rows, err := s.pool.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("db: list nas device summaries: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]nas.DeviceSummary, 0, 16)
+	for rows.Next() {
+		var d nas.DeviceSummary
+		if err := rows.Scan(&d.ID, &d.IP, &d.Vendor, &d.Description, &d.CoAPort,
+			&d.PoDPort, &d.AllowMAB, &d.CreatedAt, &d.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("db: scan nas device summary: %w", err)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterate nas device summaries: %w", err)
+	}
+	return out, nil
+}
+
 // ListPlanNASProfiles returns every plan-to-vendor-profile mapping, for
 // nas.Resolver's cache (the same small-dataset, refresh-on-interval
 // reasoning as ListNASDevices — a handful of plans times a handful of

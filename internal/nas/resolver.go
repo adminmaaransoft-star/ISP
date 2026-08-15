@@ -23,6 +23,57 @@ type DeviceRow struct {
 	AllowMAB              bool
 }
 
+// DeviceSummary is a NAS as an operator sees it.
+//
+// Deliberately not DeviceRow: that type carries RadiusSecretEncrypted because
+// the resolver needs it, and a management API must never return the secret in
+// any form. Two types rather than one with an omitted field, so the API cannot
+// start serving the ciphertext by someone adding a JSON tag.
+type DeviceSummary struct {
+	ID          int       `json:"id"`
+	IP          string    `json:"ip"`
+	Vendor      string    `json:"vendor"`
+	Description string    `json:"description,omitempty"`
+	CoAPort     int       `json:"coa_port"`
+	PoDPort     int       `json:"pod_port"`
+	AllowMAB    bool      `json:"allow_mab"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// NewNASDevice is a NAS to register.
+//
+// The secret arrives already encrypted. Neither this package nor the store
+// below it ever handles a plaintext RADIUS secret: encryption happens once, at
+// the API edge that received it, so there is no layer where a plaintext secret
+// could be logged or persisted by mistake.
+//
+// Declared here rather than in internal/db because internal/api needs it too,
+// and internal/db already imports internal/api — the reverse import would be a
+// cycle.
+type NewNASDevice struct {
+	IP              string
+	Vendor          string
+	Description     string
+	SecretEncrypted string
+	KeyVersion      string
+	CoAPort         int
+	PoDPort         int
+	AllowMAB        bool
+}
+
+// NASDeviceUpdate carries the fields a partial update may change. Nil means
+// "leave alone", so toggling AllowMAB does not require resubmitting the secret.
+type NASDeviceUpdate struct {
+	Vendor          *string
+	Description     *string
+	CoAPort         *int
+	PoDPort         *int
+	AllowMAB        *bool
+	SecretEncrypted *string
+	KeyVersion      *string
+}
+
 // PlanProfileRow is one row from the plan_nas_profiles table.
 type PlanProfileRow struct {
 	PlanID      int

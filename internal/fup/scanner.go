@@ -91,6 +91,13 @@ func (s *Scanner) Run(ctx context.Context) {
 	}
 }
 
+// ScanOnce performs a single scan pass — the same work one tick of Run does.
+//
+// Exported so a caller that drives its own schedule, or an integration test
+// standing up a real database, can exercise the scanner without waiting out a
+// 10-second ticker or reaching into the package's internals.
+func (s *Scanner) ScanOnce(ctx context.Context) error { return s.scan(ctx) }
+
 func (s *Scanner) scan(ctx context.Context) error {
 	if err := s.scanBreaches(ctx); err != nil {
 		return err

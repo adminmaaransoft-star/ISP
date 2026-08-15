@@ -1,0 +1,244 @@
+package archive
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"path"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+// Document kinds match the doc_kind CHECK constraint in migration 034.
+const (
+	KindInvoice = "invoice"
+	KindKYC     = "kyc_document"
+	KindReport  = "report"
+)
+
+var (
+	archivedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "document_archived_total",
+		Help: "Documents archived, by kind and outcome",
+	}, []string{"kind", "outcome"})
+	archivedBytes = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "document_archived_bytes_total",
+		Help: "Bytes written to archival storage, by kind",
+	}, []string{"kind"})
+)
+
+// Record is a stored archive row.
+type Record struct {
+	ID             int64      `json:"id"`
+	DocKind        string     `json:"doc_kind"`
+	EntityID       int        `json:"entity_id"`
+	StorageBackend string     `json:"storage_backend"`
+	StorageURL     string     `json:"storage_url"`
+	ChecksumSHA256 string     `json:"checksum_sha256"`
+	SizeBytes      int64      `json:"size_bytes"`
+	ArchivedAt     time.Time  `json:"archived_at"`
+	RetainUntil    *time.Time `json:"retain_until,omitempty"`
+	PurgedAt       *time.Time `json:"purged_at,omitempty"`
+}
+
+// Recorder persists and retrieves archive rows. Satisfied by *db.ArchiveStore.
+type Recorder interface {
+	RecordArchive(ctx context.Context, r Record) (int64, error)
+	ListDueForPurge(ctx context.Context, limit int) ([]Record, error)
+	MarkPurged(ctx context.Context, id int64) (bool, error)
+}
+
+// Document is one thing to archive.
+type Document struct {
+	Kind     string
+	EntityID int
+	// Filename is used only to build a readable storage key; it never reaches
+	// the filesystem unsanitised (see storageKey).
+	Filename string
+	Body     io.Reader
+}
+
+// Retention is a calendar-relative keep-for period.
+//
+// Calendar units rather than a time.Duration, because retention obligations are
+// written in years and a fixed 365-day year drifts: eight of them fall two days
+// short of eight calendar years, so a fixed-duration policy would delete GST
+// records two days before the statute allows. Nobody would notice, and that is
+// precisely the problem with getting it wrong.
+type Retention struct {
+	Years  int
+	Months int
+	Days   int
+}
+
+// IsZero reports whether the period is empty — which the policy treats as
+// "keep indefinitely" rather than "purge immediately".
+func (r Retention) IsZero() bool { return r.Years == 0 && r.Months == 0 && r.Days == 0 }
+
+// RetentionPolicy decides how long each kind of document is kept.
+//
+// Per-kind rather than one global interval because the statutory minimums
+// genuinely differ, and a single sweep would either delete invoices before the
+// tax authority is done with them or hoard KYC scans long past the point the
+// DPDP Act's storage-limitation principle allows.
+//
+// These defaults are a starting point an operator must confirm against their
+// own licence conditions and counsel — they are encoded here so retention is
+// explicit and reviewable, not because this package can know the answer for a
+// given deployment.
+type RetentionPolicy map[string]Retention
+
+// DefaultRetention is the shipped policy.
+//
+//   - invoice: 8 years. India's GST rules require books and records to be kept
+//     72 months from the due date of the annual return, and the extra margin
+//     covers the gap between an invoice's date and that due date.
+//   - kyc_document: 5 years. DoT licence conditions require subscriber
+//     verification records well past disconnection; the counterpoint is the
+//     DPDP Act, which is why this is finite rather than forever.
+//   - report: 1 year. Regenerable from the underlying data, so keeping it is a
+//     convenience rather than an obligation.
+var DefaultRetention = RetentionPolicy{
+	KindInvoice: {Years: 8},
+	KindKYC:     {Years: 5},
+	KindReport:  {Years: 1},
+}
+
+// RetainUntil returns the purge date for a kind archived at now, or nil when
+// the policy names no period.
+//
+// A nil result means "keep indefinitely", and the purge scanner skips those
+// rows. That is the safe direction for an unrecognised kind: keeping a document
+// too long is a compliance conversation, deleting one too early can be
+// unrecoverable.
+func (p RetentionPolicy) RetainUntil(kind string, now time.Time) *time.Time {
+	r, ok := p[kind]
+	if !ok || r.IsZero() {
+		return nil
+	}
+	t := now.AddDate(r.Years, r.Months, r.Days)
+	return &t
+}
+
+// Archiver streams documents into a Store and records where they went.
+type Archiver struct {
+	store     Store
+	db        Recorder
+	retention RetentionPolicy
+	now       func() time.Time
+}
+
+// NewArchiver constructs an Archiver with the default retention policy.
+func NewArchiver(store Store, recorder Recorder) *Archiver {
+	return &Archiver{store: store, db: recorder, retention: DefaultRetention, now: time.Now}
+}
+
+// SetRetention overrides the retention policy.
+func (a *Archiver) SetRetention(p RetentionPolicy) { a.retention = p }
+
+// Archive writes doc to storage and records it.
+//
+// Order matters and is deliberate: the bytes land first, the row second. The
+// reverse would produce a row promising a document that does not exist, which
+// is worse than an orphaned object — a restore would report success and hand
+// back nothing. An orphan, by contrast, is wasted space that a later archival
+// of the same document simply overwrites.
+func (a *Archiver) Archive(ctx context.Context, doc Document) (*Record, error) {
+	if !ValidKind(doc.Kind) {
+		return nil, fmt.Errorf("archive: unknown document kind %q", doc.Kind)
+	}
+	if doc.EntityID <= 0 {
+		return nil, fmt.Errorf("archive: %s has no entity id", doc.Kind)
+	}
+	if doc.Body == nil {
+		return nil, fmt.Errorf("archive: %s %d has no content", doc.Kind, doc.EntityID)
+	}
+
+	now := a.now()
+	put, err := a.store.Put(ctx, storageKey(doc, now), doc.Body)
+	if err != nil {
+		archivedTotal.WithLabelValues(doc.Kind, "store_error").Inc()
+		return nil, err
+	}
+
+	rec := Record{
+		DocKind:        doc.Kind,
+		EntityID:       doc.EntityID,
+		StorageBackend: a.store.Backend(),
+		StorageURL:     put.URL,
+		ChecksumSHA256: put.ChecksumSHA256,
+		SizeBytes:      put.SizeBytes,
+		ArchivedAt:     now,
+		RetainUntil:    a.retention.RetainUntil(doc.Kind, now),
+	}
+	id, err := a.db.RecordArchive(ctx, rec)
+	if err != nil {
+		archivedTotal.WithLabelValues(doc.Kind, "record_error").Inc()
+		return nil, err
+	}
+	rec.ID = id
+
+	archivedTotal.WithLabelValues(doc.Kind, "archived").Inc()
+	archivedBytes.WithLabelValues(doc.Kind).Add(float64(put.SizeBytes))
+	return &rec, nil
+}
+
+// ValidKind reports whether kind is one the schema accepts.
+func ValidKind(kind string) bool {
+	switch kind {
+	case KindInvoice, KindKYC, KindReport:
+		return true
+	default:
+		return false
+	}
+}
+
+// storageKey lays documents out as kind/YYYY/MM/entity-filename.
+//
+// Dated directories keep any single directory to a month's worth of documents,
+// which matters for the local backend where a flat directory of hundreds of
+// thousands of invoices becomes slow to even list. The entity id leads the
+// filename so the object is identifiable without consulting the database.
+func storageKey(doc Document, now time.Time) string {
+	name := sanitiseFilename(doc.Filename)
+	if name == "" {
+		name = doc.Kind
+	}
+	return path.Join(
+		doc.Kind,
+		now.UTC().Format("2006"),
+		now.UTC().Format("01"),
+		strconv.Itoa(doc.EntityID)+"-"+name,
+	)
+}
+
+// sanitiseFilename reduces a caller-supplied name to something safe to place
+// in a path: no separators, no traversal, no leading dots, bounded length.
+//
+// The Store re-checks containment, so this is the first of two independent
+// defences rather than the only one — but it is the one that keeps the
+// resulting key readable instead of merely safe.
+func sanitiseFilename(name string) string {
+	name = strings.TrimSpace(name)
+	name = name[strings.LastIndexAny(name, `/\`)+1:]
+
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	cleaned := strings.TrimLeft(b.String(), ".")
+	if len(cleaned) > 100 {
+		cleaned = cleaned[:100]
+	}
+	return cleaned
+}

@@ -1,0 +1,123 @@
+{{define "head"}}
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wi-Fi Sign In</title>
+<style>
+  /* Inlined, not linked. A device on the walled garden has no route off the
+     network yet, so a stylesheet on a CDN would not load and a font from
+     Google would hang the page for its full DNS timeout before rendering.
+     Everything this page needs has to arrive in this response. */
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem; background: #f4f5f7; color: #1c1f23;
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .card {
+    width: 100%; max-width: 26rem; background: #fff; border-radius: 12px; padding: 1.75rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,.12), 0 8px 24px rgba(0,0,0,.08);
+  }
+  h1 { margin: 0 0 .25rem; font-size: 1.4rem; }
+  p.sub { margin: 0 0 1.5rem; color: #5b6470; font-size: .92rem; }
+  label { display: block; margin: 0 0 .35rem; font-weight: 600; font-size: .85rem; }
+  input[type=text], input[type=password] {
+    width: 100%; padding: .7rem .8rem; margin-bottom: 1rem; font-size: 1rem;
+    border: 1px solid #c8ced6; border-radius: 8px; background: #fff; color: inherit;
+  }
+  input.code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .12em; text-transform: uppercase; }
+  button {
+    width: 100%; padding: .75rem; font-size: 1rem; font-weight: 600; color: #fff;
+    background: #1a6dcc; border: 0; border-radius: 8px; cursor: pointer;
+  }
+  button:hover { background: #155ba9; }
+  .notice {
+    padding: .7rem .8rem; margin-bottom: 1.25rem; border-radius: 8px; font-size: .9rem;
+    background: #fdf0ef; border: 1px solid #f2c3bf; color: #8a2c22;
+  }
+  .ok { background: #eef8f0; border-color: #bfe3c8; color: #1f6b33; }
+  .divider { display: flex; align-items: center; gap: .75rem; margin: 1.5rem 0; color: #8b939d; font-size: .8rem; }
+  .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: #e2e6ea; }
+  .meta { margin-top: 1.5rem; font-size: .78rem; color: #8b939d; word-break: break-all; }
+  a { color: #1a6dcc; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #14171a; color: #e8eaed; }
+    .card { background: #1d2126; box-shadow: none; border: 1px solid #2c3238; }
+    p.sub, .meta, .divider { color: #9aa3ad; }
+    input[type=text], input[type=password] { background: #14171a; border-color: #39414a; color: #e8eaed; }
+    .notice { background: #33201e; border-color: #6b3a34; color: #f3b8b0; }
+    .ok { background: #16301d; border-color: #2f5c3c; color: #9fdcb0; }
+    .divider::before, .divider::after { background: #2c3238; }
+  }
+</style>
+{{end}}
+
+{{/* Hidden fields carry the NAS's own redirect parameters back through the
+     POST. They are echoed, never trusted: the MAC is re-normalised and the
+     redirect re-validated on the way in. */}}
+{{define "session-fields"}}
+<input type="hidden" name="mac" value="{{.MAC}}">
+{{if .NASID}}<input type="hidden" name="nasid" value="{{.NASID}}">{{end}}
+{{if .Redirect}}<input type="hidden" name="link-orig" value="{{.Redirect}}">{{end}}
+{{end}}
+
+{{define "landing"}}<!doctype html>
+<html lang="en">
+<head>{{template "head"}}</head>
+<body>
+<div class="card">
+  <h1>Wi-Fi Sign In</h1>
+  <p class="sub">Enter your voucher code, or sign in with your account.</p>
+
+  {{if .Notice}}<div class="notice">{{.Notice}}</div>{{end}}
+
+  {{if .Ready}}
+  <form method="post" action="/hotspot/voucher" autocomplete="off">
+    {{template "session-fields" .Session}}
+    <label for="code">Voucher code</label>
+    <input class="code" id="code" name="code" type="text" placeholder="HS-XXXX-XXXX-XXXX"
+           autocapitalize="characters" autocorrect="off" spellcheck="false" required>
+    <button type="submit">Get online</button>
+  </form>
+
+  <div class="divider">or</div>
+
+  <form method="post" action="/hotspot/login" autocomplete="on">
+    {{template "session-fields" .Session}}
+    <label for="username">Account username</label>
+    <input id="username" name="username" type="text" autocapitalize="none"
+           autocorrect="off" spellcheck="false" required>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" required>
+    <button type="submit">Sign in</button>
+  </form>
+
+  <p class="meta">Device: {{.Session.MAC}}</p>
+  {{end}}
+</div>
+</body>
+</html>
+{{end}}
+
+{{define "granted"}}<!doctype html>
+<html lang="en">
+<head>{{template "head"}}</head>
+<body>
+<div class="card">
+  <h1>You're connected</h1>
+  <p class="sub">Your device has been authorised for this network.</p>
+
+  <div class="notice ok">
+    If pages do not load yet, turn Wi-Fi off and on again — your device needs to
+    reconnect before the network lets it through.
+  </div>
+
+  {{if .Session.Redirect}}
+  <p><a href="{{.Session.Redirect}}">Continue to where you were going</a></p>
+  {{end}}
+
+  <p class="meta">Device: {{.Session.MAC}}</p>
+</div>
+</body>
+</html>
+{{end}}

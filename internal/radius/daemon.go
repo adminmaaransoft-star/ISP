@@ -13,6 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog/log"
 	"layeh.com/radius"
 
 	"github.com/maaransoft/isp-bss-oss/internal/nas"
@@ -76,6 +77,7 @@ type radiusJob struct {
 // RadiusDaemon is the fixed-worker-pool RADIUS server.
 type RadiusDaemon struct {
 	addr          string
+	acctAddr      string
 	secret        []byte
 	db            DBQuerier
 	redisClient   redis.UniversalClient
@@ -85,6 +87,23 @@ type RadiusDaemon struct {
 	nasResolver   *nas.Resolver
 	mabDB         MABQuerier
 	eapSessions   *EAPSessionStore
+	acctDB        AccountingStore
+}
+
+// DefaultAcctAddr is the RFC 2866 accounting port. Authentication and
+// accounting are separate ports by protocol, and every NAS sends them
+// separately: binding only :1812 means accounting packets arrive at a closed
+// port and the NAS's records are silently discarded on the wire.
+const DefaultAcctAddr = ":1813"
+
+// SetAcctAddr overrides the accounting listener address.
+func (d *RadiusDaemon) SetAcctAddr(addr string) { d.acctAddr = addr }
+
+func (d *RadiusDaemon) effectiveAcctAddr() string {
+	if d.acctAddr == "" {
+		return DefaultAcctAddr
+	}
+	return d.acctAddr
 }
 
 // SetEAPSessionStore enables EAP-MSCHAPv2 (FR-AAA-006, MDS §4.18).
@@ -150,6 +169,32 @@ func (d *RadiusDaemon) StartContext(ctx context.Context) error {
 		return fmt.Errorf("radius: listen UDP %s: %w", d.addr, err)
 	}
 
+	// Accounting is bound before the worker pool starts, so a port already in
+	// use fails startup rather than leaving the daemon authenticating happily
+	// while silently recording nothing — the exact failure this listener was
+	// added to end.
+	acctAddr, err := net.ResolveUDPAddr("udp", d.effectiveAcctAddr())
+	if err != nil {
+		conn.Close() //nolint:errcheck,gosec
+		return fmt.Errorf("radius: resolve accounting addr %s: %w", d.effectiveAcctAddr(), err)
+	}
+	acctConn, err := net.ListenUDP("udp", acctAddr)
+	if err != nil {
+		conn.Close() //nolint:errcheck,gosec
+		return fmt.Errorf("radius: listen UDP %s (accounting): %w", d.effectiveAcctAddr(), err)
+	}
+
+	// Said out loud because the alternative is the failure this listener was
+	// added to end: a daemon that authenticates perfectly, acknowledges every
+	// accounting record, and writes none of them — leaving FUP enforcement, CoA
+	// targeting, LEA lookups and portal usage all reading an empty table with
+	// nothing anywhere reporting a problem.
+	if d.acctDB == nil {
+		log.Warn().Str("acct_addr", d.effectiveAcctAddr()).
+			Msg("radius: no accounting store configured — sessions will not be recorded, " +
+				"and quota enforcement, LEA lookups and portal usage will have no data")
+	}
+
 	var workers sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
 		workers.Add(1)
@@ -164,35 +209,55 @@ func (d *RadiusDaemon) StartContext(ctx context.Context) error {
 		packetSecretSource = d.nasResolver
 	}
 
+	// Both listeners feed the one worker pool. Accounting is far lighter than
+	// authentication and shares the same backends, so a second pool would only
+	// add tuning surface; what matters is that neither port can starve the
+	// other, which the shared bounded queue already ensures.
+	enqueue := radius.HandlerFunc(func(w radius.ResponseWriter, r *radius.Request) {
+		select {
+		case d.packetQueue <- radiusJob{w: w, r: r}:
+		case <-ctx.Done():
+		}
+	})
+
 	server := &radius.PacketServer{
 		Addr:         d.addr,
 		SecretSource: packetSecretSource,
-		Handler: radius.HandlerFunc(func(w radius.ResponseWriter, r *radius.Request) {
-			select {
-			case d.packetQueue <- radiusJob{w: w, r: r}:
-			case <-ctx.Done():
-			}
-		}),
+		Handler:      enqueue,
+	}
+	acctServer := &radius.PacketServer{
+		Addr:         d.effectiveAcctAddr(),
+		SecretSource: packetSecretSource,
+		Handler:      enqueue,
 	}
 
-	serveErr := make(chan error, 1)
+	// Buffered for both, so whichever listener does not fail first can still
+	// deliver its result without leaking a blocked goroutine.
+	serveErr := make(chan error, 2)
 	go func() { serveErr <- server.Serve(conn) }()
+	go func() { serveErr <- acctServer.Serve(acctConn) }()
+
+	// Deliberately not derived from ctx: on cancellation we are here *because*
+	// ctx was cancelled, and a Shutdown given a dead context returns
+	// immediately without draining, defeating the graceful stop.
+	shutdown := func() { //nolint:contextcheck // a fresh deadline is required to drain
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)     //nolint:errcheck
+		_ = acctServer.Shutdown(shutdownCtx) //nolint:errcheck
+		close(d.packetQueue)
+		workers.Wait()
+	}
 
 	select {
 	case err := <-serveErr:
-		close(d.packetQueue)
-		workers.Wait()
+		// One listener died. Stop the other too rather than running on in a
+		// half-serving state where authentication works and accounting does
+		// not, or the reverse.
+		shutdown()
 		return err
 	case <-ctx.Done():
-		// Deliberately not derived from ctx: we are here *because* ctx was
-		// cancelled, and a Shutdown given a dead context returns immediately
-		// without draining, defeating the point of a graceful stop.
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-		defer cancel()
-		//nolint:errcheck,contextcheck // already shutting down; fresh deadline is required to drain
-		_ = server.Shutdown(shutdownCtx)
-		close(d.packetQueue)
-		workers.Wait()
+		shutdown()
 		return nil
 	}
 }

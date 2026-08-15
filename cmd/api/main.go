@@ -29,6 +29,7 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/config"
 	"github.com/maaransoft/isp-bss-oss/internal/db"
 	"github.com/maaransoft/isp-bss-oss/internal/health"
+	"github.com/maaransoft/isp-bss-oss/internal/hotspot"
 	"github.com/maaransoft/isp-bss-oss/internal/notifications"
 	"github.com/maaransoft/isp-bss-oss/internal/partner"
 	"github.com/maaransoft/isp-bss-oss/internal/portal"
@@ -187,6 +188,15 @@ func run() error {
 		// never fails the operation that triggered it — a third party's
 		// configuration must not be able to break subscriber creation.
 		Events: partner.NewEmitter(database.Partner(), asynqClient),
+		// Hotspot voucher issuance and MAB device registration (FR-HSP-001..002).
+		// The same store backs the captive portal below; the split is in the
+		// interfaces, not the data — staff can mint what the public portal can
+		// only redeem.
+		Hotspot: database.Hotspot(),
+		// NAS inventory management (FR-NAS-001..004). Removes the direct-SQL
+		// prerequisite for registering a NAS and for turning on allow_mab, which
+		// a hotspot deployment cannot do without.
+		NAS:    database.NAS(),
 		Health: http.HandlerFunc(healthHandler.GetSubscriberHealth),
 
 		RazorpayWebhookSecret: cfg.RazorpayWebhookSecret,
@@ -234,6 +244,16 @@ func run() error {
 		JWTSecret:   cfg.JWTSecret,
 	})
 
+	// Captive portal (FR-HSP-001 | MDS §4.23). Unauthenticated by necessity —
+	// its visitors have no account and no network yet — so the attempt limiter
+	// is not optional: without Redis the portal returns 503 rather than
+	// accepting unmetered guesses at the voucher space.
+	hotspotHandler := hotspot.NewHandler(hotspot.Deps{
+		Grants:      database.Hotspot(),
+		Subscribers: database.Portal(),
+		Limiter:     hotspot.NewRedisLimiter(redisClient),
+	})
+
 	notificationWebhook := notifications.NewWebhookHandler(
 		database.Notifications(), cfg.WhatsAppAppSecret, cfg.WhatsAppWebhookVerifyToken)
 
@@ -242,6 +262,7 @@ func run() error {
 	portalHandler.RegisterRoutes(mux)
 	portalUIHandler.RegisterRoutes(mux)
 	staffUIHandler.RegisterRoutes(mux)
+	hotspotHandler.RegisterRoutes(mux)
 
 	// Meta delivery callbacks: GET is the subscription handshake, POST carries
 	// delivery statuses. Both are HMAC- or token-verified, never JWT.
