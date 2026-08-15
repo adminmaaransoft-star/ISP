@@ -34,6 +34,11 @@ var truncateOrder = []string{
 	// ticket_routing_rules) are deliberately absent: migration 023 seeds
 	// them and every ticket-creation path reads them, so truncating them
 	// would break ticket creation everywhere rather than isolate a test.
+	// Migration 033. webhook_deliveries before its parents; api_keys last of
+	// the three since both others reference it.
+	"webhook_deliveries",
+	"webhook_endpoints",
+	"api_keys",
 	"sla_events",
 	// Migration 031. Both cascade from their parents, but they are listed
 	// before them so the order this slice documents stays true — and so a

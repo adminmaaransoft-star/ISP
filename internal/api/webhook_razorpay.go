@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/maaransoft/isp-bss-oss/internal/billing"
+	"github.com/maaransoft/isp-bss-oss/internal/partner"
 	"github.com/rs/zerolog/log"
 	"github.com/shopspring/decimal"
 )
@@ -102,6 +103,10 @@ func (h *Handler) RazorpayWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "recharge failed", http.StatusInternalServerError)
 		return
 	}
+
+	// Emitted only after the wallet credit committed. Publishing before it
+	// would tell a partner money arrived that a rollback then unwound.
+	h.emit(r.Context(), partner.EventPaymentReceived, subscriberID)
 
 	w.WriteHeader(http.StatusOK)
 }

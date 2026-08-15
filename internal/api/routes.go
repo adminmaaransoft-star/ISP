@@ -16,6 +16,7 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/maaransoft/isp-bss-oss/internal/billing"
 	"github.com/maaransoft/isp-bss-oss/internal/middleware"
+	"github.com/maaransoft/isp-bss-oss/internal/partner"
 	"github.com/maaransoft/isp-bss-oss/internal/revenue"
 	"github.com/maaransoft/isp-bss-oss/pkg/crypto"
 	"github.com/maaransoft/isp-bss-oss/pkg/validate"
@@ -75,28 +76,32 @@ type Handler struct {
 	walletSvc *billing.WalletService
 	keyStore  crypto.KeyStore
 
-	ledger        LedgerQuerier
-	sessions      SessionReader
-	sessionCtl    SessionController
-	tasks         TaskEnqueuer
-	invoices      InvoiceQuerier
-	pdfGen        PDFGenerator
-	tickets       TicketAdminQuerier
-	lea           LEAQuerier
-	leaAudit      LEAAuditRecorder
-	franchises    FranchiseQuerier
-	lifecycle     LifecycleQuerier
-	refunds       RefundQuerier
-	subCache      SubscriberCacheInvalidator
-	approvals     ApprovalQuerier
-	fieldTasks    FieldTaskQuerier
-	leads         LeadQuerier
-	inventory     InventoryQuerier
-	announcements AnnouncementQuerier
-	pushTokens    PushTokenQuerier
-	eapEnrolment  EAPEnrolmentQuerier
-	credentials   CredentialQuerier
-	cpeControl    CPEControlQuerier
+	ledger          LedgerQuerier
+	sessions        SessionReader
+	sessionCtl      SessionController
+	tasks           TaskEnqueuer
+	invoices        InvoiceQuerier
+	pdfGen          PDFGenerator
+	tickets         TicketAdminQuerier
+	lea             LEAQuerier
+	leaAudit        LEAAuditRecorder
+	franchises      FranchiseQuerier
+	lifecycle       LifecycleQuerier
+	refunds         RefundQuerier
+	subCache        SubscriberCacheInvalidator
+	approvals       ApprovalQuerier
+	fieldTasks      FieldTaskQuerier
+	leads           LeadQuerier
+	inventory       InventoryQuerier
+	announcements   AnnouncementQuerier
+	pushTokens      PushTokenQuerier
+	eapEnrolment    EAPEnrolmentQuerier
+	credentials     CredentialQuerier
+	cpeControl      CPEControlQuerier
+	partners        PartnerQuerier
+	secretEncryptor SecretEncryptor
+	partnerAuth     middleware.APIKeyAuthenticator
+	events          EventEmitter
 	// subscriberLister backs revenue.ListSubscribersHandler, which is a
 	// plain http.HandlerFunc rather than a method on Handler — so the
 	// dependency is held here and passed to it at route-registration time.
@@ -146,6 +151,10 @@ type HandlerDeps struct {
 	EAPEnrolment     EAPEnrolmentQuerier
 	Credentials      CredentialQuerier
 	CPEControl       CPEControlQuerier
+	Partners         PartnerQuerier
+	SecretEncryptor  SecretEncryptor
+	PartnerAuth      middleware.APIKeyAuthenticator
+	Events           EventEmitter
 
 	// Health serves GET /api/v1/subscribers/{id}/health (FR-OBS-004). The
 	// implementation lives in internal/health, which cannot be imported here
@@ -192,6 +201,10 @@ func NewHandler(deps HandlerDeps) *Handler {
 		eapEnrolment:     deps.EAPEnrolment,
 		credentials:      deps.Credentials,
 		cpeControl:       deps.CPEControl,
+		partners:         deps.Partners,
+		secretEncryptor:  deps.SecretEncryptor,
+		partnerAuth:      deps.PartnerAuth,
+		events:           deps.Events,
 		health:           deps.Health,
 
 		razorpayWebhookSecret: deps.RazorpayWebhookSecret,
@@ -356,6 +369,17 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, jwtSecret string) {
 	mux.Handle("POST /api/v1/cpe/devices/{serial}/reprovision",
 		nocOrTech(http.HandlerFunc(h.ReprovisionCPE)))
 
+	// Partner API keys (FR-API-001 | MDS §4.22). Issuing a credential that can
+	// read subscriber data is an owner-level act, so key management is
+	// isp_owner only — deliberately narrower than `admin`, which billing_admin
+	// also reaches.
+	ownerOnly := func(next http.Handler) http.Handler {
+		return auth(middleware.RequireRole("isp_owner")(next))
+	}
+	mux.Handle("POST /api/v1/partner-keys", ownerOnly(http.HandlerFunc(h.CreateAPIKey)))
+	mux.Handle("GET /api/v1/partner-keys", ownerOnly(http.HandlerFunc(h.ListAPIKeys)))
+	mux.Handle("DELETE /api/v1/partner-keys/{id}", ownerOnly(http.HandlerFunc(h.RevokeAPIKey)))
+
 	// Announcements (FR-ANN-001..002 | MDS §4.17). Composing a broadcast to
 	// the whole subscriber base is an owner/billing-tier action; the portal
 	// banner feed is subscriber-authenticated and handled separately below.
@@ -444,6 +468,33 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, jwtSecret string) {
 				revenue.ListSubscribersHandler(h.subscriberLister))))
 	}
 
+	// Partner-facing surface (FR-API-001..003 | MDS §4.22).
+	//
+	// Authenticated by API key, never by JWT. The two middlewares are separate
+	// on purpose: APIKeyMiddleware sets no role in the context, so a partner
+	// key cannot satisfy any RequireRole check even if a route were wired
+	// wrongly — the separation FR-API-001 asks for is structural rather than a
+	// convention to be remembered.
+	if h.partnerAuth != nil {
+		apiKey := middleware.APIKeyMiddleware(h.partnerAuth)
+		manageWebhooks := func(next http.Handler) http.Handler {
+			return apiKey(middleware.RequireScope(partner.ScopeManageWebhooks)(next))
+		}
+		mux.Handle("POST /api/v1/partner/webhooks",
+			manageWebhooks(http.HandlerFunc(h.CreateWebhookEndpoint)))
+		mux.Handle("GET /api/v1/partner/webhooks",
+			manageWebhooks(http.HandlerFunc(h.ListWebhookEndpoints)))
+		mux.Handle("DELETE /api/v1/partner/webhooks/{id}",
+			manageWebhooks(http.HandlerFunc(h.DeleteWebhookEndpoint)))
+		mux.Handle("GET /api/v1/partner/webhooks/{id}/deliveries",
+			manageWebhooks(http.HandlerFunc(h.ListWebhookDeliveries)))
+
+		// Read-only data access for integrations, each behind its own scope.
+		mux.Handle("GET /api/v1/partner/subscribers/{id}",
+			apiKey(middleware.RequireScope(partner.ScopeReadSubscribers)(
+				http.HandlerFunc(h.GetSubscriber))))
+	}
+
 	// Webhooks (no JWT — uses HMAC)
 	mux.HandleFunc("POST /webhooks/razorpay",
 		h.RazorpayWebhook)
@@ -483,6 +534,7 @@ func (h *Handler) CreateSubscriber(w http.ResponseWriter, r *http.Request) {
 	h.persistKYC(r.Context(), created.ID, req.Aadhaar, req.PAN)
 
 	middleware.Audit(r.Context(), "subscriber.create", strconv.Itoa(created.ID), nil)
+	h.emit(r.Context(), partner.EventSubscriberCreated, created.ID)
 	writeJSON(w, http.StatusCreated, created)
 }
 
@@ -587,6 +639,12 @@ func (h *Handler) UpdateSubscriber(w http.ResponseWriter, r *http.Request) {
 	middleware.Audit(r.Context(), "subscriber.update", strconv.Itoa(id), map[string]any{
 		"plan_id": body.PlanID, "status": body.Status,
 	})
+	// Only on an actual status change. A plan-only edit is not a lifecycle
+	// event, and emitting one would have partners reacting to a suspension
+	// that never happened.
+	if body.Status != nil {
+		h.emit(r.Context(), partner.EventSubscriberStatusChanged, id)
+	}
 	writeJSON(w, http.StatusOK, updated)
 }
 

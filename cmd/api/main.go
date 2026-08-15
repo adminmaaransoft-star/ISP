@@ -30,6 +30,7 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/db"
 	"github.com/maaransoft/isp-bss-oss/internal/health"
 	"github.com/maaransoft/isp-bss-oss/internal/notifications"
+	"github.com/maaransoft/isp-bss-oss/internal/partner"
 	"github.com/maaransoft/isp-bss-oss/internal/portal"
 	"github.com/maaransoft/isp-bss-oss/internal/portalui"
 	"github.com/maaransoft/isp-bss-oss/internal/staffui"
@@ -87,6 +88,14 @@ func run() error {
 		return fmt.Errorf("load AES key store: %w", err)
 	}
 	log.Info().Str("active_version", keyStore.ActiveVersion()).Msg("api: key store loaded")
+
+	// Encrypts webhook signing secrets at rest (FR-API-002). Built once at
+	// startup so a broken key store fails here rather than on the first
+	// partner registration.
+	encryptor, err := crypto.NewAESEncryptor(keyStore)
+	if err != nil {
+		return fmt.Errorf("build AES encryptor: %w", err)
+	}
 
 	sessions := cache.NewSessionStore(redisClient)
 
@@ -167,7 +176,18 @@ func run() error {
 		Credentials:  database.API(),
 		// TR-069 remote control (FR-CPE-003).
 		CPEControl: database.TR069(),
-		Health:     http.HandlerFunc(healthHandler.GetSubscriberHealth),
+		// Partner API and webhooks (FR-API-001..003 | MDS §4.22). Partners and
+		// PartnerAuth are the same store behind two interfaces: one for
+		// management, one for the authentication middleware, kept separate so a
+		// handler cannot reach the authenticator by accident.
+		Partners:        database.Partner(),
+		PartnerAuth:     database.Partner(),
+		SecretEncryptor: encryptor,
+		// Fans lifecycle events out to subscribed partner endpoints. Emission
+		// never fails the operation that triggered it — a third party's
+		// configuration must not be able to break subscriber creation.
+		Events: partner.NewEmitter(database.Partner(), asynqClient),
+		Health: http.HandlerFunc(healthHandler.GetSubscriberHealth),
 
 		RazorpayWebhookSecret: cfg.RazorpayWebhookSecret,
 	})

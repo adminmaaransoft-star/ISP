@@ -32,6 +32,7 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/fup"
 	"github.com/maaransoft/isp-bss-oss/internal/nas"
 	"github.com/maaransoft/isp-bss-oss/internal/notifications"
+	"github.com/maaransoft/isp-bss-oss/internal/partner"
 	"github.com/maaransoft/isp-bss-oss/internal/radius"
 	"github.com/maaransoft/isp-bss-oss/internal/reporting"
 	"github.com/maaransoft/isp-bss-oss/internal/revenue"
@@ -105,6 +106,10 @@ func run() error {
 	// (fixed alongside this). Found by restarting the container, not by
 	// reading the code: every test passed throughout, because none of them
 	// runs main().
+	// Shared by the NAS resolver and the webhook sender: both need to decrypt
+	// secrets this keystore protects. Left nil when AES_KEY_STORE_URL is unset,
+	// which disables both features rather than failing startup.
+	var partnerKeyStore crypto.KeyStore
 	var nasResolver *nas.Resolver
 	switch cfg.AESKeyStoreURL {
 	case "":
@@ -116,6 +121,7 @@ func run() error {
 				Msg("radiusd: AES key store unreadable — multi-vendor NAS support disabled, every NAS gets the MikroTik VSA and the global RADIUS secret")
 			break
 		}
+		partnerKeyStore = nasKeyStore
 		nasResolver = nas.NewResolver(database.NAS(), nasKeyStore, []byte(cfg.RadiusSecret), fup.DefaultCoAPort)
 		if err := nasResolver.Refresh(ctx); err != nil {
 			log.Warn().Err(err).Msg("radiusd: initial NAS device cache load failed, starting on the fallback default")
@@ -193,6 +199,9 @@ func run() error {
 	// (MDS §4.14, FR-BIL-009).
 	autoRenewalScanner := billing.NewRecurringBillingScanner(
 		database.Billing(), billing.NewWalletService(database.Billing()))
+	// Publishes invoice.generated to subscribed partners (FR-API-002). Renewal
+	// itself never depends on this succeeding.
+	autoRenewalScanner.SetEventEmitter(partner.NewEmitter(database.Partner(), asynqClient))
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -278,7 +287,11 @@ func run() error {
 			"network_commands": 6,
 			"notifications":    3,
 			"announcements":    1,
-			"default":          1,
+			// Webhooks sit below transactional notifications on purpose: a
+			// partner retrying against a dead host must never delay a payment
+			// receipt or a suspension notice (FR-API-003).
+			"webhooks": 2,
+			"default":  1,
 		},
 		ErrorHandler: asynq.ErrorHandlerFunc(func(_ context.Context, task *asynq.Task, err error) {
 			log.Error().Err(err).Str("task_type", task.Type()).Msg("radiusd: task failed")
@@ -293,6 +306,21 @@ func run() error {
 	workerMux.Handle(billing.TaskTypePaymentReceipt, paymentReceiptHandler)
 	workerMux.Handle(tickets.TaskTypeTicketUpdate, ticketUpdateHandler)
 	workerMux.Handle(notifications.TaskTypeAnnouncement, announcementHandler)
+
+	// Outbound partner webhooks (FR-API-002..003 | MDS §4.22). The sender
+	// decrypts each endpoint's signing secret through the same AES keystore
+	// that protects NAS secrets, and posts over an SSRF-guarded HTTP client.
+	//
+	// Registered only when a keystore is available: without one no signing
+	// secret can be decrypted, and a worker that dequeued every webhook only to
+	// abandon it would silently discard events a partner is waiting for.
+	if partnerKeyStore != nil {
+		webhookSender := partner.NewSender(database.Partner(), crypto.StoreDecryptor{Store: partnerKeyStore})
+		workerMux.Handle(partner.TaskTypeWebhook, webhookSender)
+		log.Info().Msg("radiusd: partner webhook sender registered")
+	} else {
+		log.Warn().Msg("radiusd: AES key store unavailable — partner webhooks will not be delivered")
+	}
 
 	if err := workerServer.Start(workerMux); err != nil {
 		return fmt.Errorf("start Asynq workers: %w", err)

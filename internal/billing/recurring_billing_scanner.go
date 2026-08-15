@@ -85,7 +85,21 @@ type RecurringBillingScanner struct {
 	db     RenewalScanQuerier
 	wallet *WalletService
 	now    func() time.Time // injectable for tests
+	events EventEmitter
 }
+
+// EventEmitter publishes a lifecycle event to subscribed partners.
+// Satisfied by *partner.Emitter; nil in deployments with no integrations.
+type EventEmitter interface {
+	Emit(ctx context.Context, eventType string, entityID int)
+}
+
+// SetEventEmitter attaches partner webhook emission (FR-API-002).
+//
+// Optional, following SetNASResolver: a deployment with no key store cannot
+// decrypt signing secrets, and the scanner must keep renewing subscribers
+// regardless — billing is not allowed to depend on a partner integration.
+func (s *RecurringBillingScanner) SetEventEmitter(e EventEmitter) { s.events = e }
 
 // NewRecurringBillingScanner constructs a RecurringBillingScanner.
 func NewRecurringBillingScanner(db RenewalScanQuerier, wallet *WalletService) *RecurringBillingScanner {
@@ -208,8 +222,14 @@ func (s *RecurringBillingScanner) invoice(ctx context.Context, c RenewalCandidat
 	inv.SubscriberID = c.SubscriberID
 	inv.GbIncluded = c.PlanVolumeGB
 	inv.GbUsed = decimal.Zero
-	if _, err := s.db.CreateInvoice(ctx, inv); err != nil {
+	invoiceID, err := s.db.CreateInvoice(ctx, inv)
+	if err != nil {
 		return fmt.Errorf("create invoice: %w", err)
+	}
+	// After the row exists, never before: a partner told an invoice was
+	// generated must be able to fetch it.
+	if s.events != nil {
+		s.events.Emit(ctx, "invoice.generated", invoiceID)
 	}
 	return nil
 }

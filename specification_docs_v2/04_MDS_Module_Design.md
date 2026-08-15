@@ -1617,3 +1617,181 @@ surfaced as `refresh_failures_total 1` within seconds of the container starting.
   exists; deferred to the Batch 4 address work (FR-RPT-003).
 - **No export or scheduling yet.** FR-RPT-002 is untouched — these views are
   what an export would read.
+
+---
+
+## 4.22 Module 22: Partner API & Outbound Webhooks *(new — FR-API-001..003, migration 033)*
+
+**Module ID:** MOD-API | **FR:** FR-API-001..003 | **DBD:** §6.8 |
+**Migration:** 033
+
+### Partner credentials are structurally separate from staff tokens
+
+FR-API-001 asks for API-key authentication "distinct from internal staff
+JWTs". The way that is made true rather than aspirational is that
+`APIKeyMiddleware` **never sets a role in the context**. Every `RequireRole`
+check downstream therefore fails closed for a partner key, whatever route it
+reaches and however that route was wired. A convention would have to be
+remembered; this cannot be forgotten.
+
+Scopes (`read:subscribers`, `write:tickets`, `manage:webhooks`, …) are a closed
+set validated at key creation. A key requesting an unknown scope is refused
+rather than stored, because a scope no route checks reads as working right up
+until somebody depends on it.
+
+### SHA-256, not bcrypt — and why that is not an inconsistency
+
+Subscriber passwords are bcrypt. API keys are SHA-256. The two cases are not
+alike:
+
+| | Subscriber password | API key |
+|---|---|---|
+| Entropy | human-chosen, low | 192 bits of CSPRNG output |
+| Threat on a stolen hash | offline dictionary attack | none feasible |
+| Cost of a slow hash | paid once per login | paid on **every** partner request |
+
+A work factor exists to make a dictionary search expensive. There is no
+dictionary for a 192-bit random token, so bcrypt would add ~100ms to every API
+call and buy nothing. Salting is pointless for the same reason: there are no
+duplicate keys to correlate.
+
+The key format is `pk_{env}_{prefix}_{secret}`. The prefix is a **lookup
+handle, not a secret**: keys are stored hashed, so the server cannot search by
+the key itself. It parses the prefix, fetches that one row and compares — one
+hash per request rather than one per stored key. A key sharing only the prefix
+must not verify, which is asserted directly, because a prefix leaks easily
+(logs, console screenshots) in a way the secret does not.
+
+Authentication returns the same "invalid API key" for every failure — unknown
+prefix, wrong secret, revoked, expired. Telling an attacker which part of a
+credential was wrong tells them what to fix.
+
+### Thin payloads
+
+```json
+{"event_id": "...", "event_type": "ticket.created", "entity_id": 42, "occurred_at": "..."}
+```
+
+Decision 2026-08-15. Identifiers and a timestamp, never the subscriber record.
+Two reasons, and the second is load-bearing:
+
+1. A fat payload puts PII in `webhook_deliveries`, which is otherwise a pure
+   audit log with no retention obligation. Thin keeps DPDP out of it entirely.
+2. A payload captured at enqueue time is **stale** by the time it is delivered.
+   A partner that re-reads through the API with its own key always sees current
+   truth, and cannot act on a plan change that was superseded while the
+   delivery was retrying.
+
+`event_id` is the partner's idempotency key, echoed in every retry of the same
+event, so a timeout that actually succeeded is recognisable rather than
+double-processed.
+
+### Signing
+
+`X-ISP-Signature: t=<unix>,v1=<hmac-sha256 hex>`
+
+The timestamp is **inside** the signed material (`ts . body`), not merely
+alongside it. Signing the body alone would let an attacker who captured one
+delivery replay it forever with a fresh timestamp header; binding the two means
+a replay must reuse the original timestamp, which the freshness check rejects.
+Verified by rewriting the timestamp in a valid header and asserting it no
+longer verifies.
+
+The `v1=` prefix leaves room to revise the scheme without breaking partners who
+parse it — a `v2` can appear beside `v1` during a migration rather than in one
+cutover.
+
+`VerifySignature` is exported deliberately: it is the reference implementation
+handed to partners in the integration docs, and the server testing itself
+against the same function is what stops documentation and behaviour drifting
+apart.
+
+### SSRF: the check that matters runs at dial time
+
+A webhook URL is supplied by a third party and fetched by our server from
+inside the private network. Unconstrained, that is a server-side request
+forgery primitive — `https://169.254.169.254/latest/meta-data/` asks us to read
+cloud instance credentials and POST them somewhere.
+
+The guard runs **twice**, and only the second is a security boundary:
+
+- **At registration** — a friendly, immediate error, so an operator does not
+  get an endpoint that registers cleanly and fails silently forever.
+- **At dial time**, in the `net.Dialer.Control` hook — after DNS resolution and
+  immediately before the connection. This is the only place a **DNS rebinding**
+  attack cannot slip between the check and the use: a hostname that resolves
+  publicly at registration can resolve to link-local by delivery time.
+
+Redirects are refused (`ErrUseLastResponse`) for the same reason: a 302 to
+`169.254.169.254` would otherwise walk straight past both checks.
+
+A blocked target is **abandoned, not retried**. No amount of retrying makes a
+private address public, and retrying for a day would occupy the queue with a
+permanent misconfiguration.
+
+Two things the tests corrected here:
+
+- `::ffff:0:0/96` was in the blocklist to close the IPv4-mapped bypass. Go
+  represents *every* parsed IPv4 address in 16-byte mapped form, so that CIDR
+  matched all of them — the guard blocked `8.8.8.8` and every legitimate
+  partner endpoint. Caught by the test asserting public addresses stay allowed.
+- The explicit `To4()` normalisation written to replace it turned out to be
+  dead code: `net.IPNet.Contains` already calls `To4` on its argument.
+  Confirmed by removing it and observing no test change, then removed and the
+  comment corrected rather than left crediting it with a protection the
+  standard library provides.
+
+### Retry and the delivery log
+
+Asynq does the retrying; `webhook_deliveries` does the remembering. They are
+different jobs — the queue knows about the next attempt, the table is what a
+partner's support ticket gets answered from three weeks later, long after the
+queue entry is gone.
+
+- Fan-out is **one task per endpoint**, not per event, so a partner whose
+  server is down cannot delay delivery to every other partner.
+- The `webhooks` queue is separate from transactional notifications: a partner
+  retrying against a dead host must never sit in front of a payment receipt.
+- **4xx retries too.** A partner returning 401 because their own auth broke is
+  transient from our side, and giving up immediately would lose the event.
+- `abandoned` is distinct from `failed`: failed is one bad attempt, abandoned
+  means retries are exhausted and nobody will try again. Collapsing them hides
+  the state that needs a human.
+- A unique index on `(endpoint_id, event_id)` makes a retry **update** the
+  attempt trail rather than fork it. Without it a retry after a mid-write crash
+  would double-log and the attempt count — the number used to spot a flapping
+  partner — would be meaningless.
+
+### Emission never breaks the core product
+
+`Emit` logs its errors and returns nothing. Emission hangs off business
+operations — creating a subscriber, resolving a ticket, generating an invoice —
+and failing one of those because a third party's webhook could not be queued
+would let a partner's configuration break the platform.
+
+Six events are emitted: `subscriber.created`, `subscriber.status_changed`,
+`payment.received`, `invoice.generated`, `ticket.created`, `ticket.resolved`.
+Each is emitted **after** its write committed — a partner told a payment
+arrived must not be reacting to one a rollback then unwound.
+
+`subscriber.status_changed` fires only on an actual status change, not a
+plan-only edit; `ticket.resolved` only on resolution, not on every intermediate
+step. A webhook per intermediate state is noise a partner has to filter.
+
+### Revocation is complete
+
+`SubscribersFor` joins `api_keys` and requires the key to be active and
+unexpired. Deactivating a key silences its webhooks too — otherwise revocation
+would be only half a revocation, leaving a terminated partner still receiving
+subscriber events.
+
+### Known limitations
+
+- **No partner-facing rate limiting.** A partner can call the read endpoints as
+  fast as they like; nothing throttles them yet.
+- **No webhook replay endpoint.** A partner who missed events during an outage
+  can read `webhook_deliveries` but cannot ask for redelivery.
+- **Secret rotation requires re-registration.** There is no endpoint to roll an
+  endpoint's signing secret in place.
+- **The read surface is one route** (`GET /partner/subscribers/{id}`). The
+  scope vocabulary anticipates more; the routes do not exist yet.

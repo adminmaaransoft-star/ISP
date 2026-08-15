@@ -243,3 +243,7 @@ func inTx(ctx context.Context, pool dbPool, fn func(tx pgx.Tx) error) error {
 	committed = true
 	return nil
 }
+
+// Partner returns the store satisfying api.PartnerQuerier,
+// middleware.APIKeyAuthenticator and partner.DeliveryStore.
+func (d *DB) Partner() *PartnerStore { return &PartnerStore{pool: d.pool} }

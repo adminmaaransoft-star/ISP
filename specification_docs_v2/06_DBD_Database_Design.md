@@ -31,6 +31,8 @@ encryption_keys (1) ─── (N) nas_devices        [v3 — FR-NAS-002, secret 
 tickets     (1) ─────── (N) sla_events         [v3 — FR-SUP-002, append-only]
 subscribers (1) ─────── (N) subscriber_status_history [NEW — FR-RPT-001, append-only, trigger-written]
 tickets     (1) ─────── (N) ticket_status_history     [NEW — FR-RPT-001, append-only, trigger-written]
+api_keys    (1) ─────── (N) webhook_endpoints         [NEW — FR-API-001..002]
+webhook_endpoints (1) ─ (N) webhook_deliveries        [NEW — FR-API-003, audit trail]
 franchises  (1) ─────── (N) ticket_routing_rules  [v3 — FR-SUP-003, franchise_id nullable]
 staff_users (1) ─────── (N) tickets            [v3 — FR-SUP-003, assigned_to — the FK migration 009 promised and never added]
 franchises  (1) ─────── (N) tickets            [v3 — FR-SUP-003, denormalized from subscribers.franchise_id]
@@ -840,3 +842,71 @@ function with a caller-controlled search_path is a privilege-escalation vector.
 `SELECT` on all four objects is granted to `bss_app` explicitly, for the same
 reason `staff_users` needed it in migration 021: `ALTER DEFAULT PRIVILEGES`
 covers only objects created by the role that set it.
+
+---
+
+## 6.8 Partner API & Webhooks *(new — FR-API-001..003, migration 033)*
+
+**Module:** MOD-API | MDS §4.22
+
+### Table: `api_keys`
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `partner_name` | `VARCHAR(100)` | NOT NULL | |
+| `key_prefix` | `VARCHAR(24)` | NOT NULL UNIQUE | `pk_live_7f3a2b1c`. A lookup handle, not a secret — the server cannot search by a hashed key, so it parses this and fetches one row |
+| `key_hash` | `TEXT` | NOT NULL | SHA-256. Not bcrypt: an API key is 192 bits of CSPRNG output, so there is no dictionary to slow down and bcrypt would cost ~100ms on every partner request (MDS §4.22) |
+| `scopes` | `TEXT[]` | NOT NULL | Closed vocabulary, validated at creation |
+| `active` | `BOOLEAN` | NOT NULL DEFAULT TRUE | |
+| `last_used_at` | `TIMESTAMPTZ` | NULLABLE | Best-effort; never worth failing a request to write |
+| `expires_at` | `TIMESTAMPTZ` | NULLABLE | NULL = no expiry |
+| `created_by` | `VARCHAR(100)` | NOT NULL | Issuing operator |
+| `created_at` / `revoked_at` | `TIMESTAMPTZ` | | `revoked_at` is written once by an atomic conditional claim, so a second revoke cannot overwrite when the key actually stopped working |
+| `CONSTRAINT chk_api_key_scoped` | | `cardinality(scopes) >= 1` | `cardinality()` not `array_length()`: the latter returns NULL for an empty array and a CHECK passes on NULL — the same trap that let an earlier constraint in this schema admit the row it was written to reject |
+
+Index `idx_api_keys_active (key_prefix) WHERE active` — the authentication
+path is the only latency-sensitive query, and revoked keys are never looked up.
+
+### Table: `webhook_endpoints`
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `SERIAL` | PK | |
+| `api_key_id` | `INTEGER` | NOT NULL, FK → api_keys.id ON DELETE CASCADE | Binds an endpoint to its owner; deactivation is scoped by it so one partner cannot disable another's |
+| `url` | `TEXT` | NOT NULL | |
+| `secret_encrypted` | `TEXT` | NOT NULL | `{key_version}:{base64(nonce+ct)}` via the AES keystore, same as `nas_devices.radius_secret_encrypted`. **Encrypted, not hashed** — HMAC needs the secret back, so SHA-256 is right for `api_keys` and wrong here |
+| `key_version_id` | `VARCHAR(10)` | NOT NULL, FK → encryption_keys.version_id | Travels with the data so rotation stays possible |
+| `events` | `TEXT[]` | NOT NULL | Closed vocabulary |
+| `active` | `BOOLEAN` | NOT NULL DEFAULT TRUE | |
+| `CONSTRAINT chk_webhook_https` | | `url LIKE 'https://%'` | Catches the trivial case. The SSRF range check cannot live in SQL — it must run in Go at registration *and* at dial time, because DNS can be re-pointed between them (MDS §4.22) |
+| `CONSTRAINT chk_webhook_events` | | `cardinality(events) >= 1` | |
+
+### Table: `webhook_deliveries`
+
+The audit trail FR-API-003 requires. Asynq handles retrying; this table is what
+a partner's support ticket is answered from weeks later.
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `BIGSERIAL` | PK | |
+| `endpoint_id` | `INTEGER` | NOT NULL, FK → webhook_endpoints.id ON DELETE CASCADE | |
+| `event_id` | `UUID` | NOT NULL | The partner's idempotency key, echoed in every retry |
+| `event_type` | `VARCHAR(64)` | NOT NULL | |
+| `payload` | `JSONB` | NOT NULL | Stored as sent. Thin by policy — identifiers only, so no PII lands here and DPDP retention does not apply to the log |
+| `status` | `VARCHAR(16)` | NOT NULL CHECK IN (`pending`,`delivered`,`failed`,`abandoned`) | `abandoned` ≠ `failed`: failed is one bad attempt, abandoned means nobody will try again |
+| `attempts` | `INTEGER` | NOT NULL DEFAULT 0 | |
+| `response_status` / `response_excerpt` | `INTEGER` / `TEXT` | NULLABLE | Excerpt truncated by the writer — a partner's 500 page is not our audit log |
+| `last_error`, `next_attempt_at`, `created_at`, `delivered_at` | | | |
+
+`UNIQUE (endpoint_id, event_id)` is what makes a retry **update** the trail
+rather than fork it. Without it, an Asynq retry after a mid-write crash logs
+the same delivery twice and the attempt count — the number used to spot a
+flapping partner — becomes meaningless.
+
+### Grants
+
+`SELECT, INSERT, UPDATE` to `bss_app` on all three, plus their sequences. **No
+DELETE anywhere**: keys are revoked, endpoints deactivated, and the delivery
+log is an audit trail — a partner dispute is settled from rows nobody could
+quietly remove.

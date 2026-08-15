@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/maaransoft/isp-bss-oss/internal/middleware"
+	"github.com/maaransoft/isp-bss-oss/internal/partner"
 	tickettask "github.com/maaransoft/isp-bss-oss/internal/tickets"
 )
 
@@ -97,6 +98,7 @@ func (h *Handler) CreateTicket(w http.ResponseWriter, r *http.Request) {
 	middleware.Audit(r.Context(), "ticket.create", strconv.Itoa(ticket.ID), map[string]any{
 		"subscriber_id": req.SubscriberID, "category": req.Category,
 	})
+	h.emit(r.Context(), partner.EventTicketCreated, ticket.ID)
 	writeJSON(w, http.StatusCreated, ticket)
 }
 
@@ -150,6 +152,12 @@ func (h *Handler) UpdateTicket(w http.ResponseWriter, r *http.Request) {
 	middleware.Audit(r.Context(), "ticket.update", strconv.Itoa(ticketID), map[string]any{
 		"status": req.Status, "assigned_to": req.AssignedTo,
 	})
+	// Only resolution is published. Partners integrating on support outcomes
+	// care that a ticket closed, not that it moved to in_progress — and a
+	// webhook per intermediate step would be noise they have to filter.
+	if req.Status != nil && *req.Status == "resolved" {
+		h.emit(r.Context(), partner.EventTicketResolved, ticketID)
+	}
 	writeJSON(w, http.StatusOK, ticket)
 }
 

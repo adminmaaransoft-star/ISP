@@ -82,3 +82,19 @@ func NewAESEncryptor(store KeyStore) (*AESEncryptor, error) {
 	}
 	return &AESEncryptor{key: key, keyVersion: ver}, nil
 }
+
+// ActiveVersion reports the key version this encryptor writes with.
+//
+// Callers persist it beside the ciphertext so a later rotation can still
+// decrypt: the version travels with the data rather than being inferred from
+// whichever key happens to be active at read time.
+func (e *AESEncryptor) ActiveVersion() string { return e.keyVersion }
+
+// StoreDecryptor adapts a KeyStore to the single-argument Decrypt shape that
+// consumers depend on, so they need no knowledge of the key store itself.
+type StoreDecryptor struct{ Store KeyStore }
+
+// Decrypt decrypts a versioned ciphertext using the wrapped store.
+func (d StoreDecryptor) Decrypt(versionedCiphertext string) (string, error) {
+	return Decrypt(versionedCiphertext, d.Store)
+}

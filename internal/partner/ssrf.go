@@ -1,0 +1,184 @@
+package partner
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"syscall"
+	"time"
+)
+
+// SSRF protection for outbound webhooks — FR-API-002 | SecD §9.x | MDS §4.22.
+//
+// A webhook URL is supplied by a third party and fetched by our server from
+// inside the private network. That is a server-side request forgery primitive
+// unless it is constrained: a partner who registers
+// http://169.254.169.254/latest/meta-data/ is asking us to read cloud instance
+// credentials and POST them somewhere, and one who registers
+// https://bss_postgres_primary:5432/ is probing the internal service mesh.
+//
+// The check runs twice, and the second time is the one that matters.
+// Validating only at registration is defeated by DNS rebinding: a hostname
+// that resolves publicly when the endpoint is created can resolve to
+// 169.254.169.254 by the time a delivery fires. So the dialler re-checks every
+// address at connect time, after resolution, where the decision cannot be
+// undone by a later DNS answer.
+
+// blockedNets are ranges no legitimate partner endpoint lives in.
+var blockedNets = func() []*net.IPNet {
+	cidrs := []string{
+		"0.0.0.0/8",      // "this network"
+		"10.0.0.0/8",     // RFC1918
+		"100.64.0.0/10",  // CGNAT — our own subscriber space
+		"127.0.0.0/8",    // loopback
+		"169.254.0.0/16", // link-local, incl. cloud metadata at .169.254
+		"172.16.0.0/12",  // RFC1918
+		"192.0.0.0/24",   // IETF protocol assignments
+		"192.168.0.0/16", // RFC1918
+		"198.18.0.0/15",  // benchmarking
+		"224.0.0.0/4",    // multicast
+		"240.0.0.0/4",    // reserved
+		"::1/128",        // IPv6 loopback
+		"fc00::/7",       // IPv6 unique local
+		"fe80::/10",      // IPv6 link-local
+		"2001:db8::/32",  // documentation
+		// Deliberately NOT ::ffff:0:0/96. Go represents every parsed IPv4
+		// address in 16-byte IPv4-mapped form, so that CIDR matches all of
+		// them — listing it blocked 8.8.8.8 and every legitimate partner
+		// endpoint. The mapped-address bypass is closed by normalising to
+		// 4-byte form in IsBlockedIP instead, which then applies the IPv4
+		// rules above to ::ffff:127.0.0.1 exactly as it would to 127.0.0.1.
+	}
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}()
+
+// ErrBlockedAddress is returned when a webhook target resolves somewhere it
+// must not reach.
+type ErrBlockedAddress struct{ Addr string }
+
+func (e *ErrBlockedAddress) Error() string {
+	return fmt.Sprintf("partner: webhook target %s is in a private or reserved range", e.Addr)
+}
+
+// IsBlockedIP reports whether an address is off limits.
+func IsBlockedIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	// Unspecified and loopback are covered by the CIDRs below, but checking
+	// the helpers too means a future edit to the list cannot quietly reopen
+	// the most obvious targets.
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+
+	// IPv4-mapped IPv6 (::ffff:10.0.0.1) needs no normalisation here:
+	// net.IPNet.Contains calls To4 on its argument, so a mapped address is
+	// already matched against the IPv4 CIDRs above. Verified rather than
+	// assumed — an explicit To4 block was written here first, and removing it
+	// changed no test outcome because it never did anything.
+	for _, n := range blockedNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateWebhookURL checks a URL at registration time.
+//
+// This is the friendly check — it gives an operator an immediate, readable
+// error instead of a webhook that registers cleanly and then fails silently on
+// every delivery. It is not the security boundary; the dialler is.
+func ValidateWebhookURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("partner: webhook url is not a valid URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("partner: webhook url must be https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("partner: webhook url has no host")
+	}
+
+	host := u.Hostname()
+	// A literal IP can be judged immediately. A hostname cannot be judged
+	// safely here at all — see the DNS rebinding note above — so resolution
+	// failures are not fatal at registration.
+	if ip := net.ParseIP(host); ip != nil {
+		if IsBlockedIP(ip) {
+			return &ErrBlockedAddress{Addr: host}
+		}
+		return nil
+	}
+
+	addrs, err := net.LookupIP(host)
+	if err != nil {
+		// Deliberately not an error: a partner may register an endpoint whose
+		// DNS is not live yet, and refusing would be a worse failure than
+		// letting the dialler reject it later.
+		return nil
+	}
+	for _, ip := range addrs {
+		if IsBlockedIP(ip) {
+			return &ErrBlockedAddress{Addr: ip.String()}
+		}
+	}
+	return nil
+}
+
+// NewSafeHTTPClient builds the client webhook deliveries go out on.
+//
+// Control determines the address AFTER resolution and immediately before the
+// connection is made, which is the only place a rebinding attack cannot slip
+// between the check and the use. Redirects are refused for the same reason: a
+// 302 to 169.254.169.254 would otherwise walk straight past the checks above.
+func NewSafeHTTPClient(timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control: func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return fmt.Errorf("partner: cannot parse dial address %q: %w", address, err)
+			}
+			ip := net.ParseIP(host)
+			if IsBlockedIP(ip) {
+				return &ErrBlockedAddress{Addr: host}
+			}
+			return nil
+		},
+	}
+
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext:           dialer.DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 15 * time.Second,
+			MaxIdleConnsPerHost:   2,
+		},
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// DialIsBlocked reports whether a dial to this address would be refused.
+// Exported for tests that assert the boundary without opening a socket.
+func DialIsBlocked(_ context.Context, address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	return IsBlockedIP(net.ParseIP(host))
+}
