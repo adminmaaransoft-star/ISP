@@ -39,6 +39,11 @@ var truncateOrder = []string{
 	"webhook_deliveries",
 	"webhook_endpoints",
 	"api_keys",
+	// Migration 034. grants and vouchers before nas_devices/subscribers.
+	"hotspot_grants",
+	"hotspot_vouchers",
+	"hotspot_devices",
+	"document_archives",
 	"sla_events",
 	// Migration 031. Both cascade from their parents, but they are listed
 	// before them so the order this slice documents stays true — and so a
@@ -73,6 +78,10 @@ var truncateOrder = []string{
 	"kyc_verifications",
 	"subscribers",
 	"plans",
+	// Migration 034 seeds nas_devices with explicit ids, so it must be reset
+	// between tests or the second test to seed id=1 collides. plan_nas_profiles
+	// references it and is taken by CASCADE.
+	"nas_devices",
 	// After tickets: tickets.assigned_to references it (migration 023).
 	"staff_users",
 	"franchises",

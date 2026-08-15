@@ -23,7 +23,7 @@ var _ nas.DeviceStore = (*NASStore)(nil)
 // RADIUS shared secret, which is exactly as sensitive).
 func (s *NASStore) ListNASDevices(ctx context.Context) ([]nas.DeviceRow, error) {
 	const q = `
-		SELECT host(ip), vendor, radius_secret_encrypted, coa_port, pod_port
+		SELECT id, host(ip), vendor, radius_secret_encrypted, coa_port, pod_port, allow_mab
 		FROM nas_devices`
 
 	rows, err := s.pool.Query(ctx, q)
@@ -35,7 +35,7 @@ func (s *NASStore) ListNASDevices(ctx context.Context) ([]nas.DeviceRow, error) 
 	var out []nas.DeviceRow
 	for rows.Next() {
 		var row nas.DeviceRow
-		if err := rows.Scan(&row.IP, &row.Vendor, &row.RadiusSecretEncrypted, &row.CoAPort, &row.PoDPort); err != nil {
+		if err := rows.Scan(&row.ID, &row.IP, &row.Vendor, &row.RadiusSecretEncrypted, &row.CoAPort, &row.PoDPort, &row.AllowMAB); err != nil {
 			return nil, fmt.Errorf("db: scan nas_devices row: %w", err)
 		}
 		out = append(out, row)

@@ -63,9 +63,15 @@ type AttributeBuilder interface {
 // Device is a resolved, ready-to-use NAS: secret already decrypted, vendor
 // already known.
 type Device struct {
+	ID      int
 	IP      string
 	Vendor  Vendor
 	Secret  []byte
 	CoAPort int
 	PoDPort int
+	// AllowMAB permits MAC-address-only authentication from this NAS
+	// (FR-HSP-002). False is the safe zero value and is what an unregistered
+	// NAS resolves to, so MAB can never be reached by a device the operator
+	// has not deliberately enabled it for.
+	AllowMAB bool
 }

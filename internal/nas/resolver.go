@@ -14,11 +14,13 @@ import (
 
 // DeviceRow is one row from the nas_devices table, as read from Postgres.
 type DeviceRow struct {
+	ID                    int
 	IP                    string
 	Vendor                string
 	RadiusSecretEncrypted string
 	CoAPort               int
 	PoDPort               int
+	AllowMAB              bool
 }
 
 // PlanProfileRow is one row from the plan_nas_profiles table.
@@ -129,11 +131,16 @@ func (r *Resolver) Refresh(ctx context.Context) error {
 		}
 
 		next[row.IP] = Device{
+			ID:      row.ID,
 			IP:      row.IP,
 			Vendor:  Vendor(row.Vendor),
 			Secret:  []byte(secret),
 			CoAPort: coaPort,
 			PoDPort: podPort,
+			// Only a registered NAS can carry this. The fallback Device below
+			// leaves it at its false zero value, so an unregistered NAS never
+			// gets MAB (FR-HSP-002).
+			AllowMAB: row.AllowMAB,
 		}
 	}
 

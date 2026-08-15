@@ -152,6 +152,11 @@ func run() error {
 	// authentication can land on different radiusd instances — which is
 	// exactly what a NAS load-balancing across servers will do.
 	daemon.SetEAPSessionStore(radius.NewEAPSessionStore(redisClient))
+	// MAC Auth Bypass for hotspot NAS devices (FR-HSP-002, MDS §4.23). Wiring
+	// the querier does not enable MAB anywhere: nas_devices.allow_mab defaults
+	// FALSE, so it stays unreachable until an operator turns it on for a
+	// specific NAS.
+	daemon.SetMABQuerier(database.Hotspot())
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

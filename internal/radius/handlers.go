@@ -50,6 +50,14 @@ func (d *RadiusDaemon) handleAuth(ctx context.Context, w radius.ResponseWriter, 
 		return
 	}
 
+	// MAC Auth Bypass (FR-HSP-002, MDS §4.23). Like EAP, it reports whether it
+	// took ownership. Checked before the PAP path because a MAB request has no
+	// password to compare and would otherwise be rejected for a missing
+	// subscriber rather than handled.
+	if d.handleMAB(ctx, w, r) {
+		return
+	}
+
 	username := rfc2865.UserName_GetString(r.Packet)
 	password := rfc2865.UserPassword_GetString(r.Packet)
 
@@ -119,6 +127,21 @@ func (d *RadiusDaemon) handleAuth(ctx context.Context, w radius.ResponseWriter, 
 	// resolver is wired, falling back to the MikroTik VSA unconditionally
 	// (today's exact, unchanged behavior) when it is not.
 	resp := r.Response(radius.CodeAccessAccept)
+	d.applyRateLimit(resp, sub, r)
+
+	w.Write(resp) //nolint:errcheck,gosec
+	radiusAuthAccept.Inc()
+}
+
+// applyRateLimit attaches the vendor-appropriate bandwidth attributes for a
+// subscriber's plan (FR-NAS-001..004, MDS §4.11).
+//
+// Extracted so every authentication method — PAP, EAP-MSCHAPv2 and MAB —
+// shapes a session through the same code rather than three copies that can
+// drift. That shared path is what makes FR-HSP-003 true: a hotspot session is
+// rate-limited and later throttled by the identical machinery as PPPoE,
+// because it is literally the same Access-Accept construction.
+func (d *RadiusDaemon) applyRateLimit(resp *radius.Packet, sub *Subscriber, r *radius.Request) {
 	rateLimit := sub.RateLimitStr
 	if sub.FUPActive && sub.FUPThrottle != "" {
 		rateLimit = sub.FUPThrottle
@@ -138,15 +161,12 @@ func (d *RadiusDaemon) handleAuth(ctx context.Context, w radius.ResponseWriter, 
 		// online. They connect without a bandwidth attribute — the same
 		// silent-no-enforcement outcome an unclassified NAS already has
 		// today — logged and metered so it is found, not just tolerated.
-		log.Warn().Err(err).Str("username", username).Str("vendor", string(vendor)).
+		log.Warn().Err(err).Str("username", sub.Username).Str("vendor", string(vendor)).
 			Msg("radius: vendor attribute build failed, Accept sent without a bandwidth attribute")
 	}
 	for _, a := range attrs {
 		resp.Add(a.Type, a.Value)
 	}
-
-	w.Write(resp) //nolint:errcheck,gosec
-	radiusAuthAccept.Inc()
 }
 
 // handleAccounting processes RADIUS Accounting-Request with deduplication.

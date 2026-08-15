@@ -83,6 +83,7 @@ type RadiusDaemon struct {
 	verifierCache *VerifierCache
 	packetQueue   chan radiusJob
 	nasResolver   *nas.Resolver
+	mabDB         MABQuerier
 	eapSessions   *EAPSessionStore
 }
 
