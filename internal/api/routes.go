@@ -104,6 +104,8 @@ type Handler struct {
 	events          EventEmitter
 	hotspot         HotspotQuerier
 	nas             NASQuerier
+	reports         ReportQuerier
+	archives        ArchiveLookup
 	// subscriberLister backs revenue.ListSubscribersHandler, which is a
 	// plain http.HandlerFunc rather than a method on Handler — so the
 	// dependency is held here and passed to it at route-registration time.
@@ -159,6 +161,8 @@ type HandlerDeps struct {
 	Events           EventEmitter
 	Hotspot          HotspotQuerier
 	NAS              NASQuerier
+	Reports          ReportQuerier
+	Archives         ArchiveLookup
 
 	// Health serves GET /api/v1/subscribers/{id}/health (FR-OBS-004). The
 	// implementation lives in internal/health, which cannot be imported here
@@ -211,6 +215,8 @@ func NewHandler(deps HandlerDeps) *Handler {
 		events:           deps.Events,
 		hotspot:          deps.Hotspot,
 		nas:              deps.NAS,
+		reports:          deps.Reports,
+		archives:         deps.Archives,
 		health:           deps.Health,
 
 		razorpayWebhookSecret: deps.RazorpayWebhookSecret,
@@ -504,6 +510,24 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, jwtSecret string) {
 		admin(http.HandlerFunc(h.GetConsolidatedPnL)))
 	mux.Handle("GET /api/v1/franchises/{franchise_id}/pnl",
 		franchiseRead(http.HandlerFunc(h.GetFranchisePnL)))
+
+	// Report export and scheduling (FR-RPT-002 | MDS §4.8).
+	//
+	// franchiseRead, so an LCO can pull their own numbers. The handlers scope
+	// every query from the caller's own token, and a franchise-bound caller
+	// cannot name a different franchise in the query string. The same tier
+	// already reads the P&L above, which is strictly more sensitive than these
+	// aggregates.
+	//
+	// The literal "exports" path is registered before the {report} pattern for
+	// readability; Go 1.22's mux prefers the more specific literal regardless,
+	// so "exports" is never parsed as a report name.
+	mux.Handle("GET /api/v1/reports/exports/{id}",
+		franchiseRead(http.HandlerFunc(h.GetReportExport)))
+	mux.Handle("GET /api/v1/reports/{report}",
+		franchiseRead(http.HandlerFunc(h.GetReport)))
+	mux.Handle("POST /api/v1/reports/{report}/export",
+		franchiseRead(http.HandlerFunc(h.RequestReportExport)))
 
 	// Franchise-scoped subscriber listing. revenue.ListSubscribersHandler and
 	// revenue.FranchiseMiddleware have existed since v2.0 with no route

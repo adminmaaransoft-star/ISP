@@ -196,8 +196,14 @@ func run() error {
 		// NAS inventory management (FR-NAS-001..004). Removes the direct-SQL
 		// prerequisite for registering a NAS and for turning on allow_mab, which
 		// a hotspot deployment cannot do without.
-		NAS:    database.NAS(),
-		Health: http.HandlerFunc(healthHandler.GetSubscriberHealth),
+		NAS: database.NAS(),
+		// Report export and scheduling (FR-RPT-002). The views existed since
+		// migration 032 with no HTTP surface serving them; Archives backs the
+		// status lookup for a queued export, which is delivered into the same
+		// archival storage FR-DOC-001 built.
+		Reports:  database.Reporting(),
+		Archives: database.Archive(),
+		Health:   http.HandlerFunc(healthHandler.GetSubscriberHealth),
 
 		RazorpayWebhookSecret: cfg.RazorpayWebhookSecret,
 	})

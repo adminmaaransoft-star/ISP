@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -185,6 +186,25 @@ func (a *Archiver) Archive(ctx context.Context, doc Document) (*Record, error) {
 	archivedTotal.WithLabelValues(doc.Kind, "archived").Inc()
 	archivedBytes.WithLabelValues(doc.Kind).Add(float64(put.SizeBytes))
 	return &rec, nil
+}
+
+// ArchiveReport stores a generated report and returns where it landed.
+//
+// A named convenience over Archive because report delivery (FR-RPT-002) is the
+// one caller that already holds the whole document in memory, and threading a
+// bytes.Reader through the general path at every call site reads worse than
+// saying what is happening.
+func (a *Archiver) ArchiveReport(ctx context.Context, entityID int, filename string, body []byte) (string, error) {
+	rec, err := a.Archive(ctx, Document{
+		Kind:     KindReport,
+		EntityID: entityID,
+		Filename: filename,
+		Body:     bytes.NewReader(body),
+	})
+	if err != nil {
+		return "", err
+	}
+	return rec.StorageURL, nil
 }
 
 // ValidKind reports whether kind is one the schema accepts.

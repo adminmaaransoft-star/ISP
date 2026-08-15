@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -38,13 +39,32 @@ type Claims struct {
 	LeaAccess bool `json:"lea_access,omitempty"`
 }
 
+// writeAuthError answers with the same {code, message} envelope every handler
+// in this codebase uses.
+//
+// Previously http.Error, which sends text/plain. That made the most common
+// error a client ever sees — an expired token — the one response its JSON
+// parser could not read, while every handler-level error was well-formed JSON
+// (FR-MOB-002). A mobile app cannot write one error path against that.
+//
+// The envelope is duplicated here rather than shared with internal/api's
+// writeError because api imports this package; the shape is pinned by the
+// portal contract tests on both sides, which is what keeps the two in step.
+func writeAuthError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck // client hung up; nothing to recover
+		"code": code, "message": message,
+	})
+}
+
 // JWTMiddleware validates the Bearer token and injects the parsed claims into ctx.
 func JWTMiddleware(jwtSecret string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			authHeader := r.Header.Get("Authorization")
 			if !strings.HasPrefix(authHeader, "Bearer ") {
-				http.Error(w, "missing or malformed Authorization header", http.StatusUnauthorized)
+				writeAuthError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "missing or malformed Authorization header")
 				return
 			}
 			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
@@ -57,7 +77,7 @@ func JWTMiddleware(jwtSecret string) func(http.Handler) http.Handler {
 				return []byte(jwtSecret), nil
 			})
 			if err != nil || !token.Valid {
-				http.Error(w, "invalid token", http.StatusUnauthorized)
+				writeAuthError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "invalid or expired token")
 				return
 			}
 
@@ -83,7 +103,7 @@ func RequireRole(roles ...string) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			role, _ := r.Context().Value(ctxKeyRole).(string)
 			if !allowed[role] {
-				http.Error(w, "forbidden", http.StatusForbidden)
+				writeAuthError(w, http.StatusForbidden, "ERR_FORBIDDEN", "your role does not permit this action")
 				return
 			}
 			auditLog(r, role)
@@ -144,7 +164,7 @@ func LeaAccessFromContext(ctx context.Context) bool {
 func RequireLeaAccess(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !LeaAccessFromContext(r.Context()) {
-			http.Error(w, "forbidden: lea_access claim required", http.StatusForbidden)
+			writeAuthError(w, http.StatusForbidden, "ERR_FORBIDDEN", "lea_access claim required")
 			return
 		}
 		next.ServeHTTP(w, r)

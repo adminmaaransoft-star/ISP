@@ -280,11 +280,16 @@ func run() error {
 	// should have been deleted while nothing deleted it, which under the DPDP
 	// Act's storage-limitation principle is a violation the system has
 	// documented against itself.
+	// reportArchiver is nil when archival is off, which is what disables the
+	// scheduled-export worker below: an export with nowhere to deliver would
+	// run the query, produce the CSV and drop it.
+	var reportArchiver *archive.Archiver
 	if cfg.ArchiveDir != "" {
 		archiveStore, err := archive.NewLocalStore(cfg.ArchiveDir)
 		if err != nil {
 			return fmt.Errorf("document archive storage: %w", err)
 		}
+		reportArchiver = archive.NewArchiver(archiveStore, database.Archive())
 		purgeScanner := archive.NewPurgeScanner(archiveStore, database.Archive(), 0)
 		wg.Add(1)
 		go func() {
@@ -328,7 +333,12 @@ func run() error {
 			// partner retrying against a dead host must never delay a payment
 			// receipt or a suspension notice (FR-API-003).
 			"webhooks": 2,
-			"default":  1,
+			// Reports sit at the bottom with announcements: a ten-year
+			// aggregate query is the slowest thing this pool runs, and a CoA
+			// waiting behind one leaves a subscriber unthrottled for its
+			// duration (FR-RPT-002).
+			"reports": 1,
+			"default": 1,
 		},
 		ErrorHandler: asynq.ErrorHandlerFunc(func(_ context.Context, task *asynq.Task, err error) {
 			log.Error().Err(err).Str("task_type", task.Type()).Msg("radiusd: task failed")
@@ -343,6 +353,15 @@ func run() error {
 	workerMux.Handle(billing.TaskTypePaymentReceipt, paymentReceiptHandler)
 	workerMux.Handle(tickets.TaskTypeTicketUpdate, ticketUpdateHandler)
 	workerMux.Handle(notifications.TaskTypeAnnouncement, announcementHandler)
+	// Scheduled report exports (FR-RPT-002). Registered only with somewhere to
+	// deliver to — a worker that generates a CSV and discards it would report
+	// success for an export nobody can collect.
+	if reportArchiver != nil {
+		workerMux.Handle(reporting.TaskTypeReportExport,
+			reporting.NewExportHandler(database.Reporting(), reportArchiver))
+	} else {
+		log.Warn().Msg("radiusd: ARCHIVE_DIR unset — scheduled report exports will not be processed")
+	}
 
 	// Outbound partner webhooks (FR-API-002..003 | MDS §4.22). The sender
 	// decrypts each endpoint's signing secret through the same AES keystore
