@@ -1,52 +1,73 @@
 # Handoff — state of play
 
-Rewritten 2026-08-12. The previous version described a moment that has since
-passed and had gone stale in ways that would mislead a fresh session (it
-still listed the already-shipped FR-NOTIF-007 as the next task, and quoted
-package/wiring counts that no longer matched). Re-derive the numbers below
-rather than trusting them if this file is more than a few sessions old —
-`go test ./...`, `check_wiring.sh` and `git log` are the truth, this file is
-a convenience.
+Rewritten 2026-08-16, after the Phase 4A/4B close-out. The previous version
+was written on 2026-08-12 and every number in it had drifted — it claimed 22
+migrations against an actual 34, 13/13 wiring against 20/20, and "2 known
+lint findings" against 116. Re-derive rather than trust if this file is more
+than a few sessions old: `go test ./...`, `check_wiring.sh`, `golangci-lint`
+and `git log` are the truth, this file is a convenience.
 
 ---
 
 ## Where the project is
 
-`v1.0.0` was cut, then ten commits landed on top of it. The work since falls
-into two groups:
+The Jaze-parity roadmap (CRD §1.11, adopted as BO-007) is functionally
+complete at **97 of 99 FRs**. FR-AAA-005 (plain CHAP) is formally deferred —
+it requires storing recoverable plaintext passwords. See the count caveat
+below.
 
-**Shipped and verified** (all pushed to `origin/main`):
+Phases 1–4 are shipped and pushed. The last two commits closed it out:
 
-| Feature | FR | Verification |
-|---|---|---|
-| Dunning scanner, nightly revenue reconciliation, operations console | FR-BIL-004, FR-REV-*, FR-SEC-005 | 45 Playwright tests across 5 staff personas |
-| Ticket status-change notifications | FR-NOTIF-007 | Live: console click → `notification_log` row in 1s |
-| Multi-vendor NAS attribute engine | FR-NAS-001..004 | 20 unit tests, byte-exact VSA encoding per vendor |
-| PostgreSQL HA (Patroni + etcd) + connection-pool failover fix | NFR-AVAIL-002 | Live: 3-node cluster, 3 failover modes drilled |
+| Commit | Delivered |
+|---|---|
+| `33bfd89` | Phase 4A — captive portal (FR-HSP-001), hotspot CoA enforcement (FR-HSP-003), document archival (FR-DOC-001), NAS management API, **RADIUS accounting repair** |
+| `1016d7f` | Phase 4B — report export and scheduling (FR-RPT-002), subscriber portal contract parity (FR-MOB-002) |
 
-**Designed, not built** — the Jaze-parity roadmap (CRD §1.11) adopted as
-BO-007: 40 FRs across 11 groups, phased. Phase 2 (network correctness) is
-done. Phase 3 (operations-suite parity) has one module designed:
+**Read the accounting repair before trusting any usage number that predates
+it.** `subscriber_session_history` was never written: nothing called
+`StartSession`/`StopSession`, and the daemon bound only `:1812` while every
+NAS sends accounting to `:1813`. FUP enforcement, CoA targeting, LEA lookups
+and the portal's usage history were therefore all reading an empty table
+while their own tests passed. Any historical usage data from before
+`33bfd89` does not exist, and any conclusion drawn from its absence was
+wrong for this reason rather than a business one.
 
-- **Helpdesk & SLA Engine** (FR-SUP-001..003) — MDS §4.13 + DBD §6.2 are
-  written and specific enough to build from. Migration would be
-  `023_create_sla_engine.sql`. **This is the obvious next thing to build.**
+### The FR count has an unreconciled gap
 
-Everything else in Phases 3–5 is requirements-stage only (SRS §2.1), with no
-module design yet. Each gets its own design pass when scheduled — deliberately
-not all at once.
+Working from the previously-tracked baseline of 92, this session's five FRs
+(HSP-001, HSP-003, DOC-001, MOB-002, RPT-002) reach **97**, and 97 + the
+deferred AAA-005 = 98, not 99. One FR is unaccounted for in that arithmetic.
+Nobody has reconciled it against the SRS. Do that before quoting a
+completion figure to anyone.
+
+Note also that FR-AAA-003 was *already inside* the 92 while being
+non-functional, so the count understates what actually changed.
 
 ---
 
-## Current numbers (verified 2026-08-12)
+## Current numbers (measured 2026-08-16)
 
 | | |
 |---|---|
-| Go packages | 26 total; **18 have tests and pass** |
-| Wiring check | **13/13** components have a production caller |
-| Browser tests | 45 (Playwright, 5 staff personas + subscriber portal) |
-| Migrations | 22 applied (`001`–`022`) |
-| Lint | 2 known pre-existing `gosec` findings, untriaged (see below) |
+| Go packages | 34 total; **23 have tests** |
+| Wiring check | **20/20** components have a production caller |
+| Migrations | 34 applied (`001`–`034`) |
+| Browser tests | 37 declared `test(...)` blocks (`e2e/portal.spec.ts` 15, `e2e/staff.spec.ts` 22) — **not run this session** |
+| Lint | **6** findings on default tags, **116** with `--build-tags=integration`; none introduced by recent work, all untriaged |
+| DB integration suite | ~700s; **must** be run with `-timeout 25m` |
+
+The lint figure is not a regression — the integration-tagged count has been
+that high for some time and simply was never measured before. It is mostly
+`noctx` in tests (`httptest.NewRequest` cannot take a context until the
+module moves past go1.22). It matters because 116 findings is enough noise
+to hide a real one.
+
+Two corrections to what the previous version asserted. The browser-test count
+was quoted as 45; there are 37 `test(...)` blocks in the two spec files, and
+the difference is unexplained — possibly parameterised runs, possibly the
+number was simply stale. **Nobody has run Playwright recently**, including
+this session, so treat that row as inventory rather than a passing result.
+The Go suites above *were* run and did pass.
 
 ---
 
@@ -60,12 +81,15 @@ not all at once.
    `CHAOS_MODE=kill ./scripts/run_sentinel_failover_test.sh`. See
    `DOD_STATUS_REPORT.md` Finding #6.
 
-2. **Two pre-existing `gosec` findings**, present since before the current
-   round of work and confirmed not introduced by it (verified via
-   `git stash`): G705 in `internal/api/invoices.go:222`, G710 in
-   `internal/staffui/screens.go`. Both need a real triage — suppress with a
-   reason, or fix. Note that earlier docs claiming "lint: 0 issues" were
-   wrong.
+2. **The lint backlog needs triage.** 6 findings on default tags, 116 with
+   the integration tag. Confirmed not introduced by recent work — the method
+   is a `git worktree` at the previous HEAD, lint both, and diff the finding
+   sets with line numbers stripped; that is more reliable than `git stash`,
+   which re-CRLFs files and creates phantom `gofmt` findings. The ones worth
+   a real decision rather than a suppression: G705 in
+   `internal/api/invoices.go`, G710 in `internal/staffui/screens.go`, G117 in
+   `internal/partner/dispatch.go`, and the missing cookie attributes in
+   `internal/tr069/acs.go`.
 
 3. **`staff_users` has no MFA, no lockout, no password rotation, and no
    account-creation screen** (accounts come from the seed). Migration 021
@@ -81,19 +105,30 @@ not all at once.
   (`staffpassword`). Same category as the existing `testpassword` subscriber
   hashes. Fine for a localhost demo, but this is a public repo — those
   accounts must never exist in a real deployment.
-- **The franchise/LCO module is built but unreachable.**
-  `internal/revenue/franchise.go` has commission calculation, franchise-scoped
-  listing, and `franchise_admin`/`franchise_staff` roles — and zero routes.
-  No `/api/v1/franchises` endpoint is registered anywhere. FR-FRN-004..006
-  (SRS) covers wiring it up.
 - **The 1-hour soak (L6-005) has never been run.**
   `./scripts/run_soak_test.sh` is committed and validated on a 90s run.
   Needs one uninterrupted hour on a machine that will not sleep.
-- **`assigned_to` on `tickets` has no FK** — migration 009's own comment
-  promises "FK to admin_users.id added in future migration"; that migration
-  was never written and `admin_users` never existed. The real staff table is
-  `staff_users` (migration 021). The SLA engine design (DBD §6.2) adds the
-  FK that should have been there.
+- **Voucher `data_cap_bytes` is recorded and not enforced.** A voucher sold
+  as "1 GB" is limited only by its duration. This is not a missing lookup:
+  the FUP scanner finds over-quota sessions by joining `subscribers`, and a
+  voucher-backed grant has no subscriber row by schema design
+  (`chk_grant_has_exactly_one_source`, migration 034), so voucher sessions
+  are invisible to the machinery that throttles everyone else. Fixing it is a
+  scanner and query change. The field is commented as unenforced at both the
+  type and the API, so nobody sells on it by accident.
+- **The captive portal does not complete MikroTik's own login.** It issues a
+  grant and relies on the NAS retrying MAC authentication, which needs
+  `login-by=mac` on the hotspot profile and produces the "turn Wi-Fi off and
+  on" instruction on the success page. The native flow — POSTing to
+  `$(link-login-only)` so the router authenticates immediately — is the
+  smoother path and is not built. Also note the walled garden must allow the
+  portal host, or a client cannot reach the sign-in page at all.
+- **Document archival is local-filesystem only.** The `archive.Store`
+  interface is the seam for S3 or SFTP; neither is implemented, and a copy on
+  the same machine is not disaster recovery.
+- **`ARCHIVE_DIR` unset disables archival and its retention purge** — both
+  say so at startup rather than failing silently, but a deployment that skips
+  it has no document retention at all.
 
 ---
 
@@ -147,6 +182,23 @@ re-CRLFs the files it touches, which makes `gofmt -l` flag entire files as
 unformatted even though nothing semantic changed. Fix with
 `sed -i 's/\r$//' <file>`; do not change the git config.
 
+### The demo stack keeps serving old code until you rebuild it
+
+`docker compose up -d` reuses the existing image. A stack left running across
+a few sessions serves whatever was built when it started, so new routes
+answer 404 and a fix appears not to work — which is indistinguishable from
+having written it wrong. Check what you are actually talking to:
+
+```bash
+docker ps --format '{{.Names}}\t{{.Status}}'   # "Up 20 hours" is the warning
+docker compose build api_service aaa_core_daemon && \
+  docker compose up -d api_service aaa_core_daemon
+```
+
+Note the API container publishes only `9101` (metrics). Application traffic
+goes through the reverse proxy, so probe `https://localhost/...` with
+`curl -k`, not `localhost:8080`.
+
 ### The demo stack's seeded Redis session expires
 
 `demo_up.sh` seeds `session:active:{id}` with a 24h TTL. A stack left running
@@ -165,16 +217,24 @@ where `gcc` resolves if race detection matters for what you are changing.
 ## Verification that keeps finding real bugs
 
 ```bash
-gofmt -l . && go build ./... && go vet -tags=integration ./...
-go test -count=1 -tags=integration ./...   # 18 packages with tests
-golangci-lint run ./...                    # 2 known pre-existing issues
-./scripts/check_wiring.sh                  # 13/13 wired
-npx playwright test                        # 45 browser tests
+gofmt -l internal/ cmd/ && go build ./... && go vet -tags=integration ./...
+go test -count=1 ./...                      # 23 packages with tests
+bash scripts/run_db_tests.sh -timeout 25m   # ~700s against real PostgreSQL
+golangci-lint run --build-tags=integration ./...   # 116 known, none recent
+./scripts/check_wiring.sh                   # 20/20 wired
+npx playwright test                         # 37 browser tests (not run recently)
 ```
+
+The DB suite **must** carry `-timeout 25m`. It runs ~700s and Go's 10-minute
+default kills it partway, which reads as a hang rather than a timeout.
 
 `check_wiring.sh` exists because three components once shipped complete,
 tested, and never called. It is a grep, not a test, and it caught what the
-suite could not.
+suite could not. It has since caught a fourth: RADIUS accounting persistence
+was the canonical case — written, tested, correct, and called by nothing.
+When adding a long-running component, add it there too, and prefer tracking
+the call that proves it is *mounted* (`handler.RegisterRoutes`) over the one
+that proves it was merely constructed.
 
 ### The pattern that keeps working
 
@@ -188,10 +248,21 @@ execution, across several sessions:
 - three components were built, tested, and never wired
 - Patroni's bootstrap silently did not create the application database
   (found by running migrations against a real cluster, not by reading docs)
+- RADIUS accounting acknowledged every record and stored none, with the
+  accounting port unbound, while four features quietly read an empty table
+- an accounting dedup test that passed while asserting the *wrong attribute*
+  (NAS-Identifier as the session key) — the test and the bug agreed
+- a captive-portal anti-oracle test that could not fail, because it compared
+  two refusals that shared a MAC
+- document retention of `8 * 365 * 24h`, two days short of eight calendar
+  years, deleting GST records early in a way nobody would ever notice
+- the JWT middleware answering `text/plain` while every handler answered
+  JSON, making token expiry the one error a mobile client could not parse
 
 When a check could plausibly pass for the wrong reason, break it
 deliberately and confirm it fails. Every negative control run so far has
-found something.
+found something — including two of the entries above, which were *test*
+defects found only because the control was run.
 
 ---
 
@@ -200,8 +271,12 @@ found something.
 | | |
 |---|---|
 | Roadmap and phasing | `specification_docs_v2/01_CRD_...` §1.11 |
-| All 92 FRs | `specification_docs_v2/02_SRS_...` |
-| Module designs | `specification_docs_v2/04_MDS_...` (§4.11 NAS, §4.12 PG HA, §4.13 SLA) |
+| All 99 FRs | `specification_docs_v2/02_SRS_...` |
+| Module designs | `specification_docs_v2/04_MDS_...` (§4.11 NAS, §4.12 PG HA, §4.13 SLA, §4.23 hotspot, §4.24 archival) |
+| Captive portal | `internal/hotspot` → `/hotspot` (unauthenticated by design) |
+| RADIUS accounting | `internal/radius/accounting.go` → `:1813` |
+| Document archival | `internal/archive` → purge scanner in `cmd/radiusd` |
+| Report export | `internal/reporting` → `/api/v1/reports` |
 | Schema | `specification_docs_v2/06_DBD_...` |
 | Infrastructure / HA topology | `specification_docs_v2/08_IDD_...` §8.2a |
 | Incident runbook | `specification_docs_v2/12_OPS_...` |
