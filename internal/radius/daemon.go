@@ -44,7 +44,58 @@ var (
 		Name: "radius_auth_reject_total",
 		Help: "RADIUS Access-Reject responses sent",
 	})
+	// Per-NAS outcomes, alongside the unlabelled totals above rather than
+	// replacing them: FR-OBS-005 asks for a failure rate "on any NAS", which
+	// cannot be computed from a global counter, while existing dashboards and
+	// the NFR harness read the totals by name.
+	//
+	// Cardinality is bounded by the registered inventory, not by traffic. The
+	// label is the NAS the resolver identified, and anything it does not
+	// recognise collapses into a single "unregistered" bucket — without that,
+	// a spoofed source address would mint a new time series per packet.
+	radiusAuthOutcome = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "radius_auth_outcome_total",
+		Help: "RADIUS authentication outcomes by NAS and result",
+	}, []string{"nas", "result"})
 )
+
+// unregisteredNAS is the single bucket every unidentified NAS shares, so
+// cardinality stays bounded by the inventory rather than by whoever sends
+// packets.
+const unregisteredNAS = "unregistered"
+
+// authAccepted and authRejected are the only places authentication outcomes
+// are counted.
+//
+// Every accept and reject goes through one of these rather than incrementing
+// the counters directly, because there are fourteen such sites across PAP, EAP
+// and MAB: updating the global total but not the per-NAS one at any single
+// site would leave FR-OBS-005's failure rate quietly wrong for that path, and
+// wrong in the direction that under-reports failures.
+func (d *RadiusDaemon) authAccepted(r *radius.Request) {
+	radiusAuthAccept.Inc()
+	d.recordAuthOutcome(r, true)
+}
+
+func (d *RadiusDaemon) authRejected(r *radius.Request) {
+	radiusAuthReject.Inc()
+	d.recordAuthOutcome(r, false)
+}
+
+// recordAuthOutcome counts one authentication result against its NAS.
+func (d *RadiusDaemon) recordAuthOutcome(r *radius.Request, accepted bool) {
+	nasLabel := unregisteredNAS
+	if d.nasResolver != nil && r != nil && r.RemoteAddr != nil {
+		if device := d.nasResolver.ResolveAddr(r.RemoteAddr); device.IP != "" {
+			nasLabel = device.IP
+		}
+	}
+	result := "reject"
+	if accepted {
+		result = "accept"
+	}
+	radiusAuthOutcome.WithLabelValues(nasLabel, result).Inc()
+}
 
 // DBQuerier is the minimal DB interface required by the RADIUS daemon.
 type DBQuerier interface {

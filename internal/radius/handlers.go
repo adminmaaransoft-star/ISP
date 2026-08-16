@@ -67,7 +67,7 @@ func (d *RadiusDaemon) handleAuth(ctx context.Context, w radius.ResponseWriter, 
 		log.Error().Err(err).Str("username", username).Msg("radius: brute-force check failed")
 	} else if blocked {
 		w.Write(r.Response(radius.CodeAccessReject)) //nolint:errcheck,gosec
-		radiusAuthReject.Inc()
+		d.authRejected(r)
 		return
 	}
 
@@ -75,14 +75,14 @@ func (d *RadiusDaemon) handleAuth(ctx context.Context, w radius.ResponseWriter, 
 	if err != nil || sub == nil {
 		d.recordAuthFailure(ctx, username)
 		w.Write(r.Response(radius.CodeAccessReject)) //nolint:errcheck,gosec
-		radiusAuthReject.Inc()
+		d.authRejected(r)
 		return
 	}
 
 	// Reject immediately for hard-suspended / terminated subscribers
 	if sub.Status == "hard_suspended" || sub.Status == "terminated" {
 		w.Write(r.Response(radius.CodeAccessReject)) //nolint:errcheck,gosec
-		radiusAuthReject.Inc()
+		d.authRejected(r)
 		return
 	}
 
@@ -104,7 +104,7 @@ func (d *RadiusDaemon) handleAuth(ctx context.Context, w radius.ResponseWriter, 
 		if err := bcrypt.CompareHashAndPassword([]byte(sub.PasswordHash), []byte(password)); err != nil {
 			d.recordAuthFailure(ctx, username)
 			w.Write(r.Response(radius.CodeAccessReject)) //nolint:errcheck,gosec
-			radiusAuthReject.Inc()
+			d.authRejected(r)
 			return
 		}
 		if err := d.verifierCache.Store(ctx, username, password, sub.PasswordHash); err != nil {
@@ -129,7 +129,7 @@ func (d *RadiusDaemon) handleAuth(ctx context.Context, w radius.ResponseWriter, 
 	d.applyRateLimit(resp, sub, r)
 
 	w.Write(resp) //nolint:errcheck,gosec
-	radiusAuthAccept.Inc()
+	d.authAccepted(r)
 }
 
 // applyRateLimit attaches the vendor-appropriate bandwidth attributes for a

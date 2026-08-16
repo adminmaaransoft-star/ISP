@@ -1,0 +1,71 @@
+# RADIUS alerting rules — FR-OBS-005 | SAD §3.2
+#
+# The PromQL form of the rule internal/radius/authalert.go evaluates in
+# process. Both exist deliberately:
+#
+#   - This file is the right answer for a deployment that runs Prometheus and
+#     Alertmanager. Evaluation, deduplication, silencing and routing are that
+#     stack's job, and doing them inside the daemon is a poor imitation.
+#   - The in-process monitor is what satisfies the requirement today, because
+#     this repository ships no Prometheus and no Alertmanager. Shipping only
+#     this file would be a requirement met on paper by something nothing reads.
+#
+# Keep the two thresholds in step. If you change 0.20 or 5m here, change
+# AuthFailureThreshold and authAlertWindow in internal/radius/authalert.go.
+#
+# Load with, in prometheus.yml:
+#   rule_files:
+#     - /etc/prometheus/radius_alerts.yml
+
+groups:
+  - name: radius-auth
+    interval: 30s
+    rules:
+      # FR-OBS-005: "emit proactive alert when RADIUS auth failure rate on any
+      # NAS exceeds 20% over 5 min".
+      #
+      # The `> 20` on the denominator is the same guard authAlertMinAttempts
+      # applies in process: without it, one failed authentication on an idle
+      # NAS is a 100% failure rate, and the alert fires forever on the quietest
+      # sites until everyone learns to ignore it.
+      - alert: RadiusAuthFailureRateHigh
+        expr: |
+          (
+            sum by (nas) (rate(radius_auth_outcome_total{result="reject"}[5m]))
+            /
+            sum by (nas) (rate(radius_auth_outcome_total[5m]))
+          ) > 0.20
+          and
+          sum by (nas) (increase(radius_auth_outcome_total[5m])) > 20
+        for: 1m
+        labels:
+          severity: critical
+          component: radius
+        annotations:
+          summary: "RADIUS auth failures above 20% on NAS {{ $labels.nas }}"
+          description: >-
+            {{ $labels.nas }} has rejected more than 20% of authentication
+            attempts over the last 5 minutes. Common causes, cheapest first:
+            a changed shared secret on the NAS, a subscriber base that has
+            been mass-suspended by dunning, or the NAS pointing at the wrong
+            RADIUS server after a failover.
+          runbook: "specification_docs_v2/12_OPS_Operations_Runbook.md"
+
+      # The companion nobody asks for until the first silent outage: a NAS that
+      # stops authenticating entirely produces no failures at all, so the rule
+      # above stays quiet while every subscriber behind it is offline.
+      - alert: RadiusNASWentSilent
+        expr: |
+          sum by (nas) (increase(radius_auth_outcome_total[15m])) == 0
+          and
+          sum by (nas) (radius_auth_outcome_total offset 1h) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: radius
+        annotations:
+          summary: "NAS {{ $labels.nas }} has sent no authentication traffic for 15 minutes"
+          description: >-
+            This NAS was authenticating an hour ago and has gone quiet. A
+            failure rate alert cannot catch this: zero attempts is zero
+            failures.

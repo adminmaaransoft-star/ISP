@@ -12,9 +12,9 @@ and `git log` are the truth, this file is a convenience.
 ## Where the project is
 
 The Jaze-parity roadmap (CRD §1.11, adopted as BO-007) is functionally
-complete at **98 of 99 FRs**: FR-AAA-005 is formally deferred and FR-OBS-005
-is outstanding. The ledger below is reconciled against the SRS rather than
-carried forward.
+complete at **98 of 99 FRs**, with FR-AAA-005 deferred by decision — every
+other requirement is implemented. The ledger below is reconciled against the
+SRS rather than carried forward.
 
 Phases 1–4 are shipped and pushed. The last two commits closed it out:
 
@@ -34,7 +34,7 @@ wrong for this reason rather than a business one.
 
 ### The FR ledger, reconciled 2026-08-16
 
-**98 implemented, 1 deferred, 1 outstanding.**
+**98 implemented, 1 deferred (FR-AAA-005), 0 outstanding.**
 
 The SRS contains exactly 99 `FR-*` requirements. Count them with a word
 boundary — `grep -oE 'FR-[A-Z]+-[0-9]{3}'` returns 108, because it matches
@@ -49,18 +49,24 @@ its first id — leaves three unreferenced:
 |---|---|
 | FR-OBS-001 (Prometheus `/metrics`) | Implemented, never cited by id |
 | FR-OBS-002 (structured JSON logs, `correlation_id`) | Implemented, never cited by id |
-| **FR-OBS-005** (alert when RADIUS auth failure rate on any NAS exceeds 20% over 5 min) | **Not implemented** |
+| FR-OBS-005 (alert when RADIUS auth failure rate on any NAS exceeds 20% over 5 min) | Implemented in `internal/radius/authalert.go` |
 
-- **FR-AAA-005** (plain CHAP) is formally deferred: it requires storing
-  recoverable plaintext passwords.
-- **FR-OBS-005** is the one genuine gap. It is not a missing rules file: there
-  is no alerting infrastructure in the repo at all, and the metric the rule
-  needs does not exist — `radius_auth_accept_total` and
-  `radius_auth_reject_total` are unlabelled counters, so "failure rate **on
-  any NAS**" cannot be computed from what is exposed. Closing it means adding
-  a `nas` label to both counters (the resolver already knows the device), a
-  rules file, and a decision about where alerts are delivered, since
-  `logAlerter` only writes to the log.
+**FR-AAA-005** (plain CHAP) is the only remaining item, and it is deferred by
+decision rather than pending: it requires storing recoverable plaintext
+passwords.
+
+FR-OBS-005 needed a new metric before the rule could be expressed at all —
+`radius_auth_accept_total` and `radius_auth_reject_total` are unlabelled, so
+"on **any NAS**" was not computable from them. `radius_auth_outcome_total`
+now carries a `nas` label, and every accept and reject in PAP, EAP and MAB
+routes through `authAccepted`/`authRejected` so the labelled and unlabelled
+counters cannot drift. Unidentified sources collapse into one `unregistered`
+bucket, so a spoofed address cannot mint a series per packet.
+
+Evaluation is in-process because this repository ships no Prometheus and no
+Alertmanager; `deploy/prometheus/radius_alerts.yml` carries the same rule in
+PromQL, and a test asserts the two thresholds agree. Alerts go to
+`logAlerter` — see the open decision below about where they should really go.
 
 Note that FR-AAA-003 was counted complete throughout while being
 non-functional until `33bfd89`, so any historical figure overstated reality
@@ -119,7 +125,15 @@ settled the question in seconds.
    `internal/partner/dispatch.go`, and the missing cookie attributes in
    `internal/tr069/acs.go`.
 
-3. **`staff_users` has no MFA, no lockout, no password rotation, and no
+3. **Alerts have nowhere to go but the log.** `logAlerter` is shared by the
+   dead-letter monitor, the SLA scanner and now the per-NAS auth failure
+   monitor (FR-OBS-005), and it writes a log line. That satisfies "emit an
+   alert" literally, and satisfies nobody at 3am. Deciding the destination —
+   Alertmanager, a webhook, the notification service that already sends
+   WhatsApp — is a real choice nobody has made, and `staff_users` carries no
+   contact details to route to.
+
+4. **`staff_users` has no MFA, no lockout, no password rotation, and no
    account-creation screen** (accounts come from the seed). Migration 021
    added a new authentication surface and none of this was ever specified,
    so these are open decisions rather than omissions.

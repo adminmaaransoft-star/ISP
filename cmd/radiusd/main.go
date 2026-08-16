@@ -277,6 +277,22 @@ func run() error {
 		log.Info().Msg("radiusd: reporting view refresh stopped")
 	}()
 
+	// ── Per-NAS auth failure alerting (FR-OBS-005 | SAD §3.2) ───────────────
+	//
+	// Evaluated in process because this deployment runs no Prometheus or
+	// Alertmanager; deploy/prometheus/radius_alerts.yml carries the same rule
+	// in PromQL for deployments that do. Shares logAlerter with the
+	// dead-letter monitor and the SLA scanner — see the note there about why
+	// the alert path is the log rather than a per-operator channel.
+	authMonitor := radius.NewAuthFailureMonitor(logAlerter{}, nil)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Info().Msg("radiusd: per-NAS auth failure monitor started")
+		authMonitor.Run(ctx)
+		log.Info().Msg("radiusd: per-NAS auth failure monitor stopped")
+	}()
+
 	// ── Voucher data caps (FR-HSP-001 | migration 035) ──────────────────────
 	//
 	// A voucher's data_cap_bytes was recorded and never read. Voucher sessions

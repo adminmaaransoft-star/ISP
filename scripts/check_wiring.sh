@@ -79,6 +79,9 @@ COMPONENTS=(
     # limited only by its duration. Nothing else can enforce it, because
     # voucher sessions have no subscriber row for the FUP scanner to find.
     "hotspot.NewQuotaScanner:voucher data-cap enforcement (ends exhausted hotspot sessions)"
+    # FR-OBS-005. The requirement is a proactive alert, so a monitor nobody
+    # runs satisfies nothing at all.
+    "NewAuthFailureMonitor:per-NAS RADIUS auth failure alerting (FR-OBS-005)"
 )
 
 if [ "${1:-}" = "--list" ]; then
