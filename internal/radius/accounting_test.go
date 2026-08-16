@@ -376,12 +376,130 @@ func TestFR_AAA_003_HotspotSessionIsAttributedViaMAC(t *testing.T) {
 	}
 }
 
-// TestFR_AAA_003_VoucherSessionIsNotRecorded pins the known gap rather than
-// letting it fail confusingly. A voucher grant has no subscriber row, and
-// session history's foreign key requires one, so the row cannot be written.
-// Recording this as a test means the day someone implements voucher sessions,
-// this fails and tells them where to look.
-func TestFR_AAA_003_VoucherSessionIsNotRecorded(t *testing.T) {
+// acctGrantMeter records voucher-session metering.
+type acctGrantMeter struct {
+	mu      sync.Mutex
+	calls   []acctGrantCall
+	matched bool
+	err     error
+}
+
+type acctGrantCall struct {
+	MAC       string
+	SessionID string
+	NASIP     string
+	Bytes     int64
+}
+
+func (m *acctGrantMeter) RecordGrantUsage(_ context.Context, mac, sessionID, nasIP string, bytesUsed int64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.err != nil {
+		return false, m.err
+	}
+	m.calls = append(m.calls, acctGrantCall{mac, sessionID, nasIP, bytesUsed})
+	return m.matched, nil
+}
+
+func (m *acctGrantMeter) snapshot() []acctGrantCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]acctGrantCall(nil), m.calls...)
+}
+
+// TestFR_HSP_001_VoucherSessionIsMeteredOnItsGrant — a voucher grant has no
+// subscriber row, so session history cannot hold it (its subscriber_id is NOT
+// NULL with a foreign key). Before migration 035 the usage was simply
+// discarded, which is why a voucher's data cap went unenforced.
+func TestFR_HSP_001_VoucherSessionIsMeteredOnItsGrant(t *testing.T) {
+	store := &acctRecorder{matched: true}
+	meter := &acctGrantMeter{matched: true}
+	d, _ := acctDaemon(t, store)
+	d.SetGrantUsageDB(meter)
+	w := &acctWriter{}
+
+	d.handleAccounting(context.Background(), w, acctRequest(t, acctOpts{
+		SessionID: "sess-voucher", Username: "11:22:33:44:55:66",
+		Status:      rfc2866.AcctStatusType_Value_InterimUpdate,
+		InputOctets: 700_000_000, OutputOctets: 300_000_000,
+		NASIP: "10.10.0.4",
+	}))
+
+	calls := meter.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("a voucher session must be metered on its grant, got %d calls", len(calls))
+	}
+	if calls[0].MAC != "11:22:33:44:55:66" {
+		t.Errorf("mac: got %q", calls[0].MAC)
+	}
+	// Total, not per-direction: a voucher's cap is a single volume.
+	if calls[0].Bytes != 1_000_000_000 {
+		t.Errorf("want the combined total 1000000000, got %d", calls[0].Bytes)
+	}
+	// The session and NAS are captured so an exhausted voucher has something to
+	// disconnect — a Disconnect-Request is addressed by Acct-Session-Id.
+	if calls[0].SessionID != "sess-voucher" || calls[0].NASIP != "10.10.0.4" {
+		t.Errorf("the grant must capture where to send a disconnect, got %+v", calls[0])
+	}
+
+	// It must not also be written to session history, which would violate the
+	// foreign key.
+	starts, updates, _ := store.snapshot()
+	if len(starts) != 0 || len(updates) != 0 {
+		t.Errorf("a voucher session must not reach subscriber session history: %+v %+v", starts, updates)
+	}
+	if w.count() != 1 {
+		t.Error("the NAS must still be acknowledged")
+	}
+}
+
+// TestFR_HSP_001_SubscriberMABSessionIsNotMeteredAsAVoucher — a registered
+// device belongs to a subscriber and is metered the ordinary way, so that FUP
+// throttles it rather than the quota scanner disconnecting it.
+func TestFR_HSP_001_SubscriberMABSessionIsNotMeteredAsAVoucher(t *testing.T) {
+	store := &acctRecorder{matched: true}
+	meter := &acctGrantMeter{matched: true}
+	d, _ := acctDaemon(t, store)
+	d.SetGrantUsageDB(meter)
+
+	// AA:BB:CC:DD:EE:FF resolves to subscriber 77 in the harness.
+	d.handleAccounting(context.Background(), &acctWriter{}, acctRequest(t, acctOpts{
+		SessionID: "sess-mab", Username: "AA:BB:CC:DD:EE:FF",
+		Status: rfc2866.AcctStatusType_Value_Start, NASIP: "10.10.0.2",
+	}))
+
+	if got := meter.snapshot(); len(got) != 0 {
+		t.Errorf("a subscriber's MAB session must not be metered as a voucher, got %+v — it "+
+			"would be disconnected on cap instead of throttled by FUP", got)
+	}
+	starts, _, _ := store.snapshot()
+	if len(starts) != 1 || starts[0].SubscriberID != 77 {
+		t.Errorf("it must go to session history against its subscriber, got %+v", starts)
+	}
+}
+
+// TestFR_HSP_001_VoucherSessionWithNoLiveGrantIsCounted — the voucher expired
+// or was revoked mid-session. Counted rather than dropped, since a rising
+// number means sessions are outliving their authorisation.
+func TestFR_HSP_001_VoucherSessionWithNoLiveGrantIsCounted(t *testing.T) {
+	meter := &acctGrantMeter{matched: false}
+	d, _ := acctDaemon(t, &acctRecorder{matched: true})
+	d.SetGrantUsageDB(meter)
+
+	before := acctCounter(t, radiusAcctUnmatched)
+	d.handleAccounting(context.Background(), &acctWriter{}, acctRequest(t, acctOpts{
+		SessionID: "sess-gone", Username: "11:22:33:44:55:66",
+		Status: rfc2866.AcctStatusType_Value_InterimUpdate, InputOctets: 10,
+	}))
+
+	if got := acctCounter(t, radiusAcctUnmatched); got != before+1 {
+		t.Errorf("radius_acct_unmatched_total: want +1, got %v", got-before)
+	}
+}
+
+// TestFR_HSP_001_NoGrantMeterFallsBackToTheOldBehaviour — without the meter
+// wired, a voucher session is simply unrecorded, as before migration 035.
+func TestFR_HSP_001_NoGrantMeterFallsBackToTheOldBehaviour(t *testing.T) {
 	store := &acctRecorder{matched: true}
 	d, _ := acctDaemon(t, store)
 	w := &acctWriter{}
@@ -393,10 +511,8 @@ func TestFR_AAA_003_VoucherSessionIsNotRecorded(t *testing.T) {
 
 	starts, _, _ := store.snapshot()
 	if len(starts) != 0 {
-		t.Errorf("a voucher-backed session has no subscriber to attribute to; writing one "+
-			"would violate the session-history foreign key, got %+v", starts)
+		t.Errorf("a voucher session has no subscriber to attribute to, got %+v", starts)
 	}
-	// Still acknowledged — the NAS must not be left retransmitting.
 	if w.count() != 1 {
 		t.Error("the NAS must be acknowledged even when the record cannot be attributed")
 	}

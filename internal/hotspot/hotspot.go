@@ -127,15 +127,13 @@ type NewVoucher struct {
 	PlanID          int
 	FranchiseID     *int
 	DurationMinutes int
-	// DataCapBytes is RECORDED BUT NOT ENFORCED. Nothing reads it back to cut a
-	// session off, so a voucher sold as "1 GB" is today limited only by
-	// DurationMinutes.
+	// DataCapBytes is the volume allowance. 0 means unlimited.
 	//
-	// Enforcing it needs more than a lookup: the FUP scanner finds over-quota
-	// sessions by joining subscribers, and a voucher-backed grant has no
-	// subscriber row (see chk_grant_has_exactly_one_source in migration 034), so
-	// voucher sessions are invisible to the machinery that throttles everyone
-	// else. That is a scanner change, not a field read, and it is not done.
+	// Enforced by QuotaScanner (migration 035), not by the FUP scanner: that one
+	// finds over-quota sessions by joining subscribers, and a voucher grant has
+	// no subscriber row by design (chk_grant_has_exactly_one_source, migration
+	// 034). Voucher sessions are therefore metered on the grant itself by RADIUS
+	// accounting and disconnected here when the cap is reached.
 	DataCapBytes int64
 	// ExpiresAt is the shelf life of the *unredeemed* code, distinct from
 	// DurationMinutes, which is how long the session lasts once claimed. A

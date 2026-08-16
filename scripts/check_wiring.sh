@@ -75,6 +75,10 @@ COMPONENTS=(
     # which under the DPDP Act is a violation the system documented against
     # itself.
     "archive.NewPurgeScanner:document retention purge (deletes archives past retain_until)"
+    # data_cap_bytes sat unread for a release: a voucher sold as "1 GB" was
+    # limited only by its duration. Nothing else can enforce it, because
+    # voucher sessions have no subscriber row for the FUP scanner to find.
+    "hotspot.NewQuotaScanner:voucher data-cap enforcement (ends exhausted hotspot sessions)"
 )
 
 if [ "${1:-}" = "--list" ]; then

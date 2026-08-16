@@ -52,6 +52,24 @@ type AccountingStore interface {
 	StopSession(ctx context.Context, sessionID string, inputOctets, outputOctets int64, cause string) (bool, error)
 }
 
+// GrantUsageDB meters a voucher-backed hotspot session.
+//
+// Separate from AccountingStore because these sessions cannot be written to
+// subscriber_session_history at all: its subscriber_id is NOT NULL with a
+// foreign key, and a voucher grant has no subscriber by design
+// (chk_grant_has_exactly_one_source, migration 034). Without this the usage
+// was simply discarded, which is why a voucher's data cap went unenforced.
+//
+// Satisfied by *db.HotspotStore.
+type GrantUsageDB interface {
+	RecordGrantUsage(ctx context.Context, mac, sessionID, nasIP string, bytesUsed int64) (bool, error)
+}
+
+// SetGrantUsageDB enables voucher-session metering (FR-HSP-001). Optional:
+// without it, voucher sessions authenticate and are simply not metered, which
+// is the behaviour before migration 035.
+func (d *RadiusDaemon) SetGrantUsageDB(g GrantUsageDB) { d.grantUsageDB = g }
+
 // SetAccountingStore enables session persistence.
 //
 // Optional, and its absence is loud rather than silent: without a store the
@@ -128,6 +146,13 @@ func (d *RadiusDaemon) handleAccounting(ctx context.Context, w radius.ResponseWr
 		return
 	}
 
+	// A voucher-backed hotspot session is metered on its grant instead, since
+	// it has no subscriber row for session history to reference. Checked first
+	// because for these the subscriber path below can only fail.
+	if d.meterVoucherSession(ctx, r, sessionID, status, inputOctets+outputOctets) {
+		return
+	}
+
 	switch statusType {
 	case rfc2866.AcctStatusType_Value_Start:
 		d.acctStart(ctx, r, sessionID, status)
@@ -138,6 +163,57 @@ func (d *RadiusDaemon) handleAccounting(ctx context.Context, w radius.ResponseWr
 	default:
 		radiusAcctProcessed.WithLabelValues(status, "ignored").Inc()
 	}
+}
+
+// meterVoucherSession records usage against a voucher grant, reporting whether
+// it took ownership of the record.
+//
+// Total octets rather than the two directions separately: a voucher's cap is a
+// single volume, and splitting it would invite the question of which direction
+// the cap applies to when the answer is both.
+func (d *RadiusDaemon) meterVoucherSession(ctx context.Context, r *radius.Request,
+	sessionID, status string, totalOctets int64,
+) bool {
+	if d.grantUsageDB == nil {
+		return false
+	}
+	mac, isMAC := NormaliseMAC(rfc2865.UserName_GetString(r.Packet))
+	if !isMAC {
+		return false
+	}
+	// Only sessions with no subscriber behind them. A MAB session for a
+	// registered device belongs to a subscriber and is metered the ordinary
+	// way, so that FUP throttles it rather than this path disconnecting it.
+	if d.mabDB != nil {
+		nasID := 0
+		if d.nasResolver != nil {
+			nasID = d.nasResolver.ResolveAddr(r.RemoteAddr).ID
+		}
+		sub, err := d.mabDB.AuthorizeMAC(ctx, mac, nasID)
+		if err != nil {
+			return false
+		}
+		if sub != nil && sub.ID != 0 {
+			return false
+		}
+	}
+
+	matched, err := d.grantUsageDB.RecordGrantUsage(ctx, mac, sessionID, accountingNASIP(r), totalOctets)
+	if err != nil {
+		radiusAcctProcessed.WithLabelValues(status, "error").Inc()
+		log.Error().Err(err).Str("mac", mac).Msg("radius: voucher session metering failed")
+		return true
+	}
+	if !matched {
+		// No live grant for this MAC: the voucher expired or was revoked
+		// mid-session. Counted rather than silently dropped, since a rising
+		// number here means sessions are outliving their authorisation.
+		radiusAcctUnmatched.Inc()
+		radiusAcctProcessed.WithLabelValues(status, "unmatched").Inc()
+		return true
+	}
+	radiusAcctProcessed.WithLabelValues(status, "metered_voucher").Inc()
+	return true
 }
 
 func (d *RadiusDaemon) acctStart(ctx context.Context, r *radius.Request, sessionID, status string) {

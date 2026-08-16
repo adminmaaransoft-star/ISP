@@ -42,9 +42,10 @@ type createVoucherBatchRequest struct {
 	PlanID          int `json:"plan_id"`
 	Count           int `json:"count"`
 	DurationMinutes int `json:"duration_minutes"`
-	// Accepted and stored, but nothing enforces it yet — see the note on
-	// hotspot.NewVoucher.DataCapBytes. Time is currently the only limit a
-	// voucher actually imposes, so do not sell one on a volume promise.
+	// Volume allowance in bytes; 0 means unlimited. Enforced by the quota
+	// scanner (migration 035), which ends the session on exhaustion rather than
+	// throttling it — a voucher is prepaid for a fixed volume, and a crawl
+	// after it runs out reads as a broken network rather than a spent voucher.
 	DataCapBytes int64  `json:"data_cap_bytes,omitempty"`
 	FranchiseID  *int   `json:"franchise_id,omitempty"`
 	ValidForDays *int   `json:"valid_for_days,omitempty"`

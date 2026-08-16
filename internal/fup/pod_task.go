@@ -19,9 +19,21 @@ var podAckTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 }, []string{"result"})
 
 // PoDPayload is the Asynq task payload for a forced disconnect.
+//
+// Either the session is named directly, or it is resolved from a subscriber.
+// The direct form exists for voucher-backed hotspot sessions (FR-HSP-001),
+// which have no subscriber row to look up — see migration 034's
+// chk_grant_has_exactly_one_source.
 type PoDPayload struct {
-	SubscriberID int `json:"subscriber_id"`
+	SubscriberID int `json:"subscriber_id,omitempty"`
+	// NasIP and SessionID, when both set, are used as-is and no subscriber
+	// lookup happens.
+	NasIP     string `json:"nas_ip,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
 }
+
+// direct reports whether the payload names its own session.
+func (p PoDPayload) direct() bool { return p.NasIP != "" && p.SessionID != "" }
 
 // PoDHandler processes forced-disconnect tasks with exponential backoff via
 // Asynq retry, sharing CoAQuerier since both need the same NAS session lookup.
@@ -59,11 +71,15 @@ func (h *PoDHandler) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		return fmt.Errorf("pod: unmarshal payload: %w", err)
 	}
 
-	nasIP, sessionID, _, _, err := h.db.GetSubscriberNASSession(ctx, p.SubscriberID)
-	if err != nil {
-		// No live session means there is nothing left to disconnect. Retrying
-		// cannot change that, so the task should not be retried.
-		return fmt.Errorf("pod: get NAS session for sub %d: %w: %w", p.SubscriberID, err, asynq.SkipRetry)
+	nasIP, sessionID := p.NasIP, p.SessionID
+	if !p.direct() {
+		var err error
+		nasIP, sessionID, _, _, err = h.db.GetSubscriberNASSession(ctx, p.SubscriberID)
+		if err != nil {
+			// No live session means there is nothing left to disconnect.
+			// Retrying cannot change that, so the task should not be retried.
+			return fmt.Errorf("pod: get NAS session for sub %d: %w: %w", p.SubscriberID, err, asynq.SkipRetry)
+		}
 	}
 
 	secret, port := h.secret, h.port
@@ -75,6 +91,18 @@ func (h *PoDHandler) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		secret, port = device.Secret, device.PoDPort
 	}
 	return SendReliablePoD(nasIP, port, sessionID, secret)
+}
+
+// NewDirectPoDTask builds a disconnect task for a session named outright,
+// used where there is no subscriber to resolve it from.
+func NewDirectPoDTask(nasIP, sessionID string) (*asynq.Task, error) {
+	payload, err := json.Marshal(PoDPayload{NasIP: nasIP, SessionID: sessionID})
+	if err != nil {
+		return nil, fmt.Errorf("pod: marshal payload: %w", err)
+	}
+	return asynq.NewTask(TaskTypePoD, payload,
+		asynq.Queue(QueueNetCommands),
+		asynq.MaxRetry(3)), nil
 }
 
 // SendReliablePoD sends a Disconnect-Request to the NAS and waits for

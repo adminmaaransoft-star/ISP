@@ -50,9 +50,9 @@ non-functional, so the count understates what actually changed.
 | | |
 |---|---|
 | Go packages | 34 total; **23 have tests** |
-| Wiring check | **20/20** components have a production caller |
-| Migrations | 34 applied (`001`–`034`) |
-| Browser tests | 37 declared `test(...)` blocks (`e2e/portal.spec.ts` 15, `e2e/staff.spec.ts` 22) — **not run this session** |
+| Wiring check | **21/21** components have a production caller |
+| Migrations | 35 applied (`001`–`035`) |
+| Browser tests | **45**, all passing (`npx playwright test`, run 2026-08-16) |
 | Lint | **6** findings on default tags, **116** with `--build-tags=integration`; none introduced by recent work, all untriaged |
 | DB integration suite | ~700s; **must** be run with `-timeout 25m` |
 
@@ -62,12 +62,17 @@ that high for some time and simply was never measured before. It is mostly
 module moves past go1.22). It matters because 116 findings is enough noise
 to hide a real one.
 
-Two corrections to what the previous version asserted. The browser-test count
-was quoted as 45; there are 37 `test(...)` blocks in the two spec files, and
-the difference is unexplained — possibly parameterised runs, possibly the
-number was simply stale. **Nobody has run Playwright recently**, including
-this session, so treat that row as inventory rather than a passing result.
-The Go suites above *were* run and did pass.
+A correction to the lint row, and a caution about counting tests by grep. The
+previous version's "2 known gosec findings" is now 6 and 116; that is a
+measurement, not a regression.
+
+The browser count is 45 and always was. Do not count these with
+`grep -c 'test('` — that gives 37, because `staff.spec.ts` generates one test
+per role from a matrix loop rather than declaring each. `npx playwright test
+--list` is the only count worth quoting. This file briefly claimed 37 for
+exactly that reason, which is a small example of the rule at the bottom of
+this document: the grep looked authoritative and was wrong, and running it
+settled the question in seconds.
 
 ---
 
@@ -108,14 +113,14 @@ The Go suites above *were* run and did pass.
 - **The 1-hour soak (L6-005) has never been run.**
   `./scripts/run_soak_test.sh` is committed and validated on a 90s run.
   Needs one uninterrupted hour on a machine that will not sleep.
-- **Voucher `data_cap_bytes` is recorded and not enforced.** A voucher sold
-  as "1 GB" is limited only by its duration. This is not a missing lookup:
-  the FUP scanner finds over-quota sessions by joining `subscribers`, and a
-  voucher-backed grant has no subscriber row by schema design
-  (`chk_grant_has_exactly_one_source`, migration 034), so voucher sessions
-  are invisible to the machinery that throttles everyone else. Fixing it is a
-  scanner and query change. The field is commented as unenforced at both the
-  type and the API, so nobody sells on it by accident.
+- **Voucher data caps end the session rather than throttling it.** Not a gap,
+  but a decision worth knowing: `hotspot.QuotaScanner` (migration 035)
+  disconnects an exhausted voucher instead of dropping it to a slower profile,
+  because a voucher is prepaid for a fixed volume and a crawl afterwards reads
+  as a broken network rather than a spent voucher. Subscriber-backed hotspot
+  grants are deliberately excluded from that scan — they are metered in
+  `subscriber_session_history` and throttled by the FUP scanner, and enforcing
+  them in both places would disconnect somebody the other path only slowed.
 - **The captive portal does not complete MikroTik's own login.** It issues a
   grant and relies on the NAS retrying MAC authentication, which needs
   `login-by=mac` on the hotspot profile and produces the "turn Wi-Fi off and
@@ -206,6 +211,12 @@ longer than that fails the two Playwright tests that check the "online"
 dashboard state, for reasons unrelated to whatever you just changed. Reseed
 with the same `redis-cli SET ... EX 86400` command from `demo_up.sh`.
 
+This is not hypothetical: it happened again on 2026-08-16. The two failures
+are `portal.spec.ts` "live usage" and `staff.spec.ts` "the 360 view". Confirm
+it is the seed and not your change before debugging anything —
+`redis-cli TTL session:active:1` returning `-2` means the key is gone, and
+reseeding makes both tests pass again in seconds.
+
 ### `-race` needs a C compiler
 
 `go test -race` requires cgo. In the Git-Bash shell used for recent sessions
@@ -222,7 +233,7 @@ go test -count=1 ./...                      # 23 packages with tests
 bash scripts/run_db_tests.sh -timeout 25m   # ~700s against real PostgreSQL
 golangci-lint run --build-tags=integration ./...   # 116 known, none recent
 ./scripts/check_wiring.sh                   # 20/20 wired
-npx playwright test                         # 37 browser tests (not run recently)
+npx playwright test                         # 45 browser tests
 ```
 
 The DB suite **must** carry `-timeout 25m`. It runs ~700s and Go's 10-minute

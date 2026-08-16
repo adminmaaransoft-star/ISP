@@ -88,6 +88,7 @@ type RadiusDaemon struct {
 	mabDB         MABQuerier
 	eapSessions   *EAPSessionStore
 	acctDB        AccountingStore
+	grantUsageDB  GrantUsageDB
 }
 
 // DefaultAcctAddr is the RFC 2866 accounting port. Authentication and

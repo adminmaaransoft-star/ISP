@@ -31,6 +31,7 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/config"
 	"github.com/maaransoft/isp-bss-oss/internal/db"
 	"github.com/maaransoft/isp-bss-oss/internal/fup"
+	"github.com/maaransoft/isp-bss-oss/internal/hotspot"
 	"github.com/maaransoft/isp-bss-oss/internal/nas"
 	"github.com/maaransoft/isp-bss-oss/internal/notifications"
 	"github.com/maaransoft/isp-bss-oss/internal/partner"
@@ -163,6 +164,9 @@ func run() error {
 	// lookups and the portal's usage history all read — without it they each
 	// query an empty table and quietly do nothing.
 	daemon.SetAccountingStore(database.FUP())
+	// Voucher-backed hotspot sessions have no subscriber row, so they cannot go
+	// in session history; they are metered on their grant instead (FR-HSP-001).
+	daemon.SetGrantUsageDB(database.Hotspot())
 	daemon.SetAcctAddr(cfg.RadiusAcctAddr)
 	wg.Add(1)
 	go func() {
@@ -271,6 +275,21 @@ func run() error {
 		log.Info().Msg("radiusd: reporting view refresh started")
 		reportingRefresher.Run(ctx)
 		log.Info().Msg("radiusd: reporting view refresh stopped")
+	}()
+
+	// ── Voucher data caps (FR-HSP-001 | migration 035) ──────────────────────
+	//
+	// A voucher's data_cap_bytes was recorded and never read. Voucher sessions
+	// have no subscriber row, so the FUP scanner cannot see them; they are
+	// metered on the grant by RADIUS accounting and enforced here.
+	quotaScanner := hotspot.NewQuotaScanner(database.Hotspot(),
+		&voucherDisconnector{client: asynqClient}, 0)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Info().Msg("radiusd: voucher data-cap scanner started")
+		quotaScanner.Run(ctx)
+		log.Info().Msg("radiusd: voucher data-cap scanner stopped")
 	}()
 
 	// ── Document retention purge (FR-DOC-001 | MDS §4.24) ───────────────────
@@ -491,6 +510,27 @@ func newDispatcher(cfg *config.Config, database *db.DB) *notifications.Dispatche
 // logAlerter reports dead-letter conditions to the log when PagerDuty is not
 // configured, so the signal is never silently dropped.
 type logAlerter struct{}
+
+// voucherDisconnector ends an exhausted voucher's session by queueing a
+// Disconnect-Request.
+//
+// An adapter rather than internal/hotspot depending on the task queue
+// directly: the captive-portal package has no other reason to know Asynq
+// exists, and keeping it that way is what lets its quota scanner be tested
+// without Redis.
+type voucherDisconnector struct{ client *asynq.Client }
+
+func (d *voucherDisconnector) Disconnect(ctx context.Context, nasIP, sessionID string) error {
+	task, err := fup.NewDirectPoDTask(nasIP, sessionID)
+	if err != nil {
+		return err
+	}
+	// The grant is already revoked by the time this runs, so a failure here
+	// costs a session that survives until the NAS re-authenticates it — not
+	// unlimited access.
+	_, err = d.client.EnqueueContext(ctx, task)
+	return err
+}
 
 func (logAlerter) Trigger(event string, detail any) {
 	log.Error().Str("event", event).Interface("detail", detail).Msg("radiusd: ALERT")

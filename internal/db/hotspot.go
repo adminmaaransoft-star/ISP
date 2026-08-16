@@ -15,8 +15,10 @@ import (
 type HotspotStore struct{ pool dbPool }
 
 var (
-	_ radius.MABQuerier  = (*HotspotStore)(nil)
-	_ hotspot.GrantStore = (*HotspotStore)(nil)
+	_ radius.MABQuerier   = (*HotspotStore)(nil)
+	_ hotspot.GrantStore  = (*HotspotStore)(nil)
+	_ hotspot.QuotaStore  = (*HotspotStore)(nil)
+	_ radius.GrantUsageDB = (*HotspotStore)(nil)
 )
 
 // AuthorizeMAC resolves a MAC to the subscriber it may authenticate as.
@@ -282,6 +284,108 @@ func (s *HotspotStore) GrantForSubscriber(ctx context.Context, mac string,
 		return 0, fmt.Errorf("db: grant hotspot access: %w", err)
 	}
 	return grantID, nil
+}
+
+// ── Voucher data caps (FR-HSP-001 | migration 035) ──────────────────────────
+
+// RecordGrantUsage meters a voucher-backed session against its grant.
+//
+// Called from RADIUS accounting for MAC-authenticated sessions that resolve to
+// a voucher rather than a subscriber. Those cannot go in
+// subscriber_session_history — its subscriber_id is NOT NULL with a foreign
+// key, and a voucher grant has no subscriber by design — so the grant itself
+// carries the counter.
+//
+// Octets are assigned, not added: RADIUS interim updates report a running
+// total for the session, so accumulating them would multiply usage by the
+// number of updates received and exhaust a voucher in minutes.
+//
+// Reports whether a live grant matched, so the caller can count records for
+// sessions this system has no grant for rather than silently discarding them.
+func (s *HotspotStore) RecordGrantUsage(ctx context.Context, mac, sessionID, nasIP string, bytesUsed int64) (bool, error) {
+	const q = `
+		UPDATE hotspot_grants
+		   SET bytes_used     = $4,
+		       session_id     = COALESCE(NULLIF($2,''), session_id),
+		       nas_ip_address = COALESCE(NULLIF($3,'')::inet, nas_ip_address),
+		       last_seen_at   = NOW()
+		 WHERE mac_address = $1
+		   AND revoked_at IS NULL
+		   AND expires_at > NOW()`
+
+	tag, err := s.pool.Exec(ctx, q, mac, sessionID, nasIP, bytesUsed)
+	if err != nil {
+		return false, fmt.Errorf("db: record grant usage for %s: %w", mac, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// ListGrantsOverCap returns live voucher grants that have reached their cap.
+//
+// A cap of 0 means unlimited and is excluded here rather than treated as
+// "immediately exhausted" — 0 is also the column default, so the opposite
+// reading would cut off every voucher ever issued without one.
+//
+// Subscriber-backed grants are excluded too: those sessions are metered in
+// subscriber_session_history and policed by the FUP scanner, and enforcing
+// them here as well would disconnect a subscriber the other path had only
+// throttled.
+func (s *HotspotStore) ListGrantsOverCap(ctx context.Context, limit int) ([]hotspot.OverCapGrant, error) {
+	const q = `
+		SELECT g.id, g.mac_address, v.id, COALESCE(g.session_id, ''),
+		       COALESCE(host(g.nas_ip_address), ''), g.bytes_used, v.data_cap_bytes
+		  FROM hotspot_grants g
+		  JOIN hotspot_vouchers v ON v.id = g.voucher_id
+		 WHERE g.revoked_at IS NULL
+		   AND g.expires_at > NOW()
+		   AND v.data_cap_bytes > 0
+		   AND g.bytes_used >= v.data_cap_bytes
+		 ORDER BY g.bytes_used DESC
+		 LIMIT $1`
+
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	rows, err := s.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("db: list grants over cap: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]hotspot.OverCapGrant, 0, limit)
+	for rows.Next() {
+		var g hotspot.OverCapGrant
+		if err := rows.Scan(&g.GrantID, &g.MAC, &g.VoucherID, &g.SessionID,
+			&g.NASIP, &g.BytesUsed, &g.CapBytes); err != nil {
+			return nil, fmt.Errorf("db: scan over-cap grant: %w", err)
+		}
+		out = append(out, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterate over-cap grants: %w", err)
+	}
+	return out, nil
+}
+
+// MarkGrantExhausted revokes a grant because its data cap is spent.
+//
+// exhausted_at is set alongside revoked_at so "your data ran out" can be told
+// apart from "your time ran out" at a counter; revoked_at alone cannot
+// distinguish an exhausted voucher from one an operator pulled.
+//
+// The revoked_at IS NULL predicate makes this a conditional claim, the same
+// pattern the voucher redemption itself uses: two scanner replicas must not
+// both count the same exhaustion, and the loser needs to know it lost.
+func (s *HotspotStore) MarkGrantExhausted(ctx context.Context, grantID int64) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE hotspot_grants
+		    SET revoked_at = NOW(), exhausted_at = NOW()
+		  WHERE id = $1 AND revoked_at IS NULL`, grantID)
+	if err != nil {
+		return false, fmt.Errorf("db: mark grant %d exhausted: %w", grantID, err)
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // RevokeGrant ends a grant early.
