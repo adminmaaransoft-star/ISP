@@ -78,12 +78,27 @@ by one.
 
 | | |
 |---|---|
-| Go packages | 34 total; **23 have tests** |
-| Wiring check | **21/21** components have a production caller |
+| Go packages | 35 total; **24 have tests** |
+| Wiring check | **22/22** components have a production caller |
 | Migrations | 35 applied (`001`–`035`) |
 | Browser tests | **45**, all passing (`npx playwright test`, run 2026-08-16) |
 | Lint | **6** findings on default tags, **116** with `--build-tags=integration`; none introduced by recent work, all untriaged |
 | DB integration suite | ~700s; **must** be run with `-timeout 25m` |
+| NFR-PERF-001 (RADIUS auth p99 ≤15ms) | **PASS at 13.224ms**, 5,000 req/s, 30s, 0 errors — `run_nfr_tests.sh`, 2026-08-16 |
+| NFR-PERF-002 (API p99 ≤200ms) | **PASS**, 49.01ms at 500 VUs |
+| NFR-BIZ-001 (unbilled query ≤60s @20k subs) | **PASS**, 12.2ms |
+| NFR-SEC-002 (no plaintext PII) | **PASS** |
+
+**`run_nfr_tests.sh` and the demo stack cannot run at the same time on this
+machine.** The demo stack is 11 containers (Postgres, a 3-node Redis Sentinel
+cluster with two replicas, the API, radiusd, the reverse proxy, Gotenberg);
+the NFR harness spins up its own isolated set. Sharing this host's 12 CPUs
+between both turned a genuine 13ms p99 into a false 20ms failure on
+2026-08-16 — the daemon's own histogram showed 99.4% of requests under 15ms
+while the client measured a 20ms tail, and the rate sweep was non-monotonic
+(1,000 req/s scored worse than 3,000 req/s), both signatures of scheduling
+contention rather than slow code. `docker compose stop` before running the
+NFR suite, `docker compose start` after.
 
 The lint figure is not a regression — the integration-tagged count has been
 that high for some time and simply was never measured before. It is mostly
@@ -142,6 +157,17 @@ settled the question in seconds.
 
 ## Known gaps worth knowing about
 
+- **Three features shipped this session have no NFR at all**: document
+  archival (FR-DOC-001), the captive portal (FR-HSP-001), and report export
+  (FR-RPT-002). The SRS's 11 NFRs are cross-cutting system properties, not
+  one per feature, so this isn't automatically a gap — but these three sit
+  outside every existing NFR's scope. Draft entries proposed for review, not
+  merged: `specification_docs_v2/_draft_new_nfrs_2026-08-16.md`. Two are
+  grounded in real constants already in code (`DefaultAttemptLimit`,
+  `chk_archive_not_purged_before_retention`); the report-export latency
+  figure is flagged in the draft as an unmeasured guess and should be timed
+  against a seeded 120-month dataset before being written into the SRS as a
+  real target.
 - **`scripts/seed_local.sql` publishes demo credentials.** Bcrypt hashes for
   five staff accounts, with the password named in `TESTERS_MANUAL.md`
   (`staffpassword`). Same category as the existing `testpassword` subscriber
