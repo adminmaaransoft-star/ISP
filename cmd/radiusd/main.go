@@ -40,6 +40,8 @@ import (
 	"github.com/maaransoft/isp-bss-oss/internal/revenue"
 	"github.com/maaransoft/isp-bss-oss/internal/tickets"
 	"github.com/maaransoft/isp-bss-oss/pkg/crypto"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 const (
@@ -523,8 +525,23 @@ func newDispatcher(cfg *config.Config, database *db.DB) *notifications.Dispatche
 	return dispatcher
 }
 
-// logAlerter reports dead-letter conditions to the log when PagerDuty is not
-// configured, so the signal is never silently dropped.
+// alertsEmitted is the metric an external alerting pipeline scrapes.
+//
+// logAlerter is shared by four monitors — dead-letter, revenue reconciliation,
+// SLA breach, and per-NAS auth failure — and a structured log line alone
+// requires something to be tailing this process's stdout to ever see it. This
+// counter is what lets an existing Prometheus/Alertmanager setup catch these
+// the same way it catches everything else, without this codebase committing
+// to a specific webhook or paging provider it cannot currently configure or
+// test against.
+var alertsEmitted = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "alerts_emitted_total",
+	Help: "Operational alerts raised, by alert name",
+}, []string{"alert_name"})
+
+// logAlerter reports operational conditions to the log and to
+// alerts_emitted_total, so the signal is visible both to a human reading this
+// process's stdout and to a scraping pipeline that is not.
 type logAlerter struct{}
 
 // voucherDisconnector ends an exhausted voucher's session by queueing a
@@ -549,6 +566,7 @@ func (d *voucherDisconnector) Disconnect(ctx context.Context, nasIP, sessionID s
 }
 
 func (logAlerter) Trigger(event string, detail any) {
+	alertsEmitted.WithLabelValues(event).Inc()
 	log.Error().Str("event", event).Interface("detail", detail).Msg("radiusd: ALERT")
 }
 

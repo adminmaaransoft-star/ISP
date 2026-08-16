@@ -10,6 +10,7 @@ package db_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,6 +198,47 @@ func TestFR_DOC_001_PurgedRowFreesTheUniqueIndex(t *testing.T) {
 	}
 	if got.ID != second {
 		t.Errorf("GetArchive must return the live archive %d, got %d", second, got.ID)
+	}
+}
+
+// TestNFR_DUR_002_RetentionFloorIsEnforcedAtTheDatabase — NFR-DUR-002.
+//
+// MarkPurged always sets purged_at to NOW(), so the application code cannot
+// currently produce an early purge on its own. That is exactly why this test
+// bypasses it and issues the UPDATE directly: the guarantee that matters is
+// that the database itself refuses the write, so a future bug in application
+// code — a batch job, a manual fix, a different code path added later — hits
+// the same wall rather than relying on every caller getting it right.
+func TestNFR_DUR_002_RetentionFloorIsEnforcedAtTheDatabase(t *testing.T) {
+	database, pool := newTestDB(t)
+	ctx := context.Background()
+	store := database.Archive()
+
+	future := time.Now().Add(365 * 24 * time.Hour)
+	id, err := store.RecordArchive(ctx, archiveRecord(archive.KindInvoice, 1, &future))
+	if err != nil {
+		t.Fatalf("RecordArchive: %v", err)
+	}
+
+	_, err = pool.Exec(ctx,
+		`UPDATE document_archives SET purged_at = NOW() WHERE id = $1`, id)
+	if err == nil {
+		t.Fatal("purging before retain_until must be rejected by chk_archive_not_purged_before_retention " +
+			"— a row with no policy behind it, purged early by a bug elsewhere, is exactly the case " +
+			"this constraint exists to catch regardless of what application code did or didn't check")
+	}
+	if !strings.Contains(err.Error(), "chk_archive_not_purged_before_retention") {
+		t.Errorf("want a rejection naming the retention constraint, got: %v", err)
+	}
+
+	// The legitimate case must still work: purging at or after retain_until.
+	past := time.Now().Add(-time.Hour)
+	dueID, err := store.RecordArchive(ctx, archiveRecord(archive.KindReport, 2, &past))
+	if err != nil {
+		t.Fatalf("RecordArchive (due): %v", err)
+	}
+	if ok, err := store.MarkPurged(ctx, dueID); err != nil || !ok {
+		t.Fatalf("MarkPurged on a due archive must succeed: ok=%v err=%v", ok, err)
 	}
 }
 

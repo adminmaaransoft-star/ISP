@@ -291,3 +291,14 @@ jobs:
 | INT-FRN-001 | LCO JWT queries subscriber list | Returns only subscribers belonging to that `franchise_id` |
 | INT-FRN-002 | Subscriber recharge triggers LCO commission | `lco_ledger` record created with correct commission amount |
 | INT-FRN-003 | Billing admin queries consolidated P&L | Returns aggregate across all franchises |
+
+## 13.12 Archival, Captive Portal, and Report Export NFR Tests *(new — NFR-DUR-002, NFR-SEC-003, NFR-PERF-004)*
+
+| Test ID | Scenario | Expected Result |
+|---|---|---|
+| NFR-DUR-002-1 | Archive a document, independently hash the stored file on disk | Matches the checksum recorded in `document_archives` — corruption during write is detectable |
+| NFR-DUR-002-2 | Attempt to purge an archive before `retain_until` | `chk_archive_not_purged_before_retention` rejects the write |
+| *(not yet buildable)* | Corrupt a stored file, retrieve it through the application | **No such path exists** — `archive.Store` has no `Get`/restore method. Add this test when one is built |
+| NFR-SEC-003-1 | Exceed 10 voucher-redemption attempts per MAC within 15 minutes | 11th attempt is refused |
+| NFR-SEC-003-2 | Redis (limiter backend) is unavailable during a redemption attempt | Request is refused, not admitted — fail closed |
+| NFR-PERF-004 | Export each of growth, ticket-resolution, and collection at `months=120` against a seeded 20,000-subscriber / 50-franchise / ~430k-invoice dataset, 30 iterations each | p99 ≤ 4.5 s for every report type. Baseline measured 2026-08-16: collection p50 840 ms / p99 1.69 s (worst case); growth p99 57 ms; ticket-resolution p99 6.7 ms |

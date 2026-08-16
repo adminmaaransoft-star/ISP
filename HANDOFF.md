@@ -88,6 +88,7 @@ by one.
 | NFR-PERF-002 (API p99 ≤200ms) | **PASS**, 49.01ms at 500 VUs |
 | NFR-BIZ-001 (unbilled query ≤60s @20k subs) | **PASS**, 12.2ms |
 | NFR-SEC-002 (no plaintext PII) | **PASS** |
+| NFR-DUR-002, NFR-SEC-003, NFR-PERF-004 (archival, portal rate-limit, report export) | Merged into the SRS 2026-08-16, all with real code/tests behind them. Report-export threshold (4.5s p99) is set at 2.5× a measured empirical baseline — collection report, worst of the three, ran p99 1.69s over 30 iterations against a seeded 20,000-subscriber/430k-invoice 120-month dataset |
 
 **`run_nfr_tests.sh` and the demo stack cannot run at the same time on this
 machine.** The demo stack is 11 containers (Postgres, a 3-node Redis Sentinel
@@ -157,17 +158,17 @@ settled the question in seconds.
 
 ## Known gaps worth knowing about
 
-- **Three features shipped this session have no NFR at all**: document
-  archival (FR-DOC-001), the captive portal (FR-HSP-001), and report export
-  (FR-RPT-002). The SRS's 11 NFRs are cross-cutting system properties, not
-  one per feature, so this isn't automatically a gap — but these three sit
-  outside every existing NFR's scope. Draft entries proposed for review, not
-  merged: `specification_docs_v2/_draft_new_nfrs_2026-08-16.md`. Two are
-  grounded in real constants already in code (`DefaultAttemptLimit`,
-  `chk_archive_not_purged_before_retention`); the report-export latency
-  figure is flagged in the draft as an unmeasured guess and should be timed
-  against a seeded 120-month dataset before being written into the SRS as a
-  real target.
+- **The archive `Store` interface has no retrieval method.** `Put` and
+  `Delete` only — there is currently no code path to read an archived
+  document back out and re-verify it. Found 2026-08-16 while writing
+  NFR-DUR-002 into the SRS: the checksum is real and verified at write time
+  (`archive.LocalStore.Put` hashes while streaming), but "verify on
+  retrieval" can't be tested because there is no retrieval. For a compliance
+  feature holding 8-year GST invoices and 5-year KYC documents, this matters
+  more than it would elsewhere — nobody can currently prove to an auditor
+  that a specific archived document is intact without going around the
+  application and hashing the file on disk by hand. Adding `Store.Get` and a
+  restore/verify path is the natural next slice.
 - **`scripts/seed_local.sql` publishes demo credentials.** Bcrypt hashes for
   five staff accounts, with the password named in `TESTERS_MANUAL.md`
   (`staffpassword`). Same category as the existing `testpassword` subscriber
