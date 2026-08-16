@@ -12,9 +12,9 @@ and `git log` are the truth, this file is a convenience.
 ## Where the project is
 
 The Jaze-parity roadmap (CRD §1.11, adopted as BO-007) is functionally
-complete at **97 of 99 FRs**. FR-AAA-005 (plain CHAP) is formally deferred —
-it requires storing recoverable plaintext passwords. See the count caveat
-below.
+complete at **98 of 99 FRs**: FR-AAA-005 is formally deferred and FR-OBS-005
+is outstanding. The ledger below is reconciled against the SRS rather than
+carried forward.
 
 Phases 1–4 are shipped and pushed. The last two commits closed it out:
 
@@ -32,16 +32,39 @@ while their own tests passed. Any historical usage data from before
 `33bfd89` does not exist, and any conclusion drawn from its absence was
 wrong for this reason rather than a business one.
 
-### The FR count has an unreconciled gap
+### The FR ledger, reconciled 2026-08-16
 
-Working from the previously-tracked baseline of 92, this session's five FRs
-(HSP-001, HSP-003, DOC-001, MOB-002, RPT-002) reach **97**, and 97 + the
-deferred AAA-005 = 98, not 99. One FR is unaccounted for in that arithmetic.
-Nobody has reconciled it against the SRS. Do that before quoting a
-completion figure to anyone.
+**98 implemented, 1 deferred, 1 outstanding.**
 
-Note also that FR-AAA-003 was *already inside* the 92 while being
-non-functional, so the count understates what actually changed.
+The SRS contains exactly 99 `FR-*` requirements. Count them with a word
+boundary — `grep -oE 'FR-[A-Z]+-[0-9]{3}'` returns 108, because it matches
+`FR-AVAIL-001` *inside* `NFR-AVAIL-001`. `grep -oE '\bFR-...'` gives 99, plus
+11 genuine NFRs.
+
+Cross-referencing those against every `FR-` citation in Go, SQL and shell —
+expanding range notation like `FR-NAS-001..004`, which otherwise matches only
+its first id — leaves three unreferenced:
+
+| FR | Status |
+|---|---|
+| FR-OBS-001 (Prometheus `/metrics`) | Implemented, never cited by id |
+| FR-OBS-002 (structured JSON logs, `correlation_id`) | Implemented, never cited by id |
+| **FR-OBS-005** (alert when RADIUS auth failure rate on any NAS exceeds 20% over 5 min) | **Not implemented** |
+
+- **FR-AAA-005** (plain CHAP) is formally deferred: it requires storing
+  recoverable plaintext passwords.
+- **FR-OBS-005** is the one genuine gap. It is not a missing rules file: there
+  is no alerting infrastructure in the repo at all, and the metric the rule
+  needs does not exist — `radius_auth_accept_total` and
+  `radius_auth_reject_total` are unlabelled counters, so "failure rate **on
+  any NAS**" cannot be computed from what is exposed. Closing it means adding
+  a `nas` label to both counters (the resolver already knows the device), a
+  rules file, and a decision about where alerts are delivered, since
+  `logAlerter` only writes to the log.
+
+Note that FR-AAA-003 was counted complete throughout while being
+non-functional until `33bfd89`, so any historical figure overstated reality
+by one.
 
 ---
 
