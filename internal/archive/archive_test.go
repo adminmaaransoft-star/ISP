@@ -34,6 +34,7 @@ type memRecorder struct {
 	recErr  error
 	listErr error
 	markErr error
+	getErr  error
 }
 
 func newMemRecorder() *memRecorder {
@@ -94,6 +95,21 @@ func (m *memRecorder) MarkPurged(_ context.Context, id int64) (bool, error) {
 	r.PurgedAt = &now
 	m.purged = append(m.purged, id)
 	return true, nil
+}
+
+func (m *memRecorder) GetArchive(_ context.Context, docKind string, entityID int) (*Record, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.getErr != nil {
+		return nil, m.getErr
+	}
+	for _, r := range m.records {
+		if r.PurgedAt == nil && r.DocKind == docKind && r.EntityID == entityID {
+			cp := *r
+			return &cp, nil
+		}
+	}
+	return nil, nil
 }
 
 func (m *memRecorder) liveCount() int {
@@ -529,6 +545,162 @@ func TestFR_DOC_001_PurgeSurvivesAListingFailure(t *testing.T) {
 	err := NewPurgeScanner(localStore(t), rec, time.Hour).PurgeOnce(context.Background())
 	if err == nil {
 		t.Error("a listing failure must be reported so the caller can log it")
+	}
+}
+
+// ── Retrieval ────────────────────────────────────────────────────────────────
+//
+// NFR-DUR-002: an archived document's checksum must verify against its stored
+// bytes on retrieval. Until now archive.Store had Put and Delete but no way to
+// read a document back at all — these are the tests for the path that closes
+// that gap.
+
+func TestFR_DOC_001_RetrieveReturnsVerifiedBytes(t *testing.T) {
+	store := localStore(t)
+	rec := newMemRecorder()
+	archiver := NewArchiver(store, rec)
+
+	original := []byte("this is the invoice PDF, verified")
+	archived, err := archiver.Archive(context.Background(), Document{
+		Kind: KindInvoice, EntityID: 1, Filename: "inv.pdf", Body: bytes.NewReader(original),
+	})
+	if err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	got, err := archiver.Retrieve(context.Background(), *archived)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Errorf("retrieved bytes do not match what was archived: got %q, want %q", got, original)
+	}
+}
+
+// TestFR_DOC_001_RetrieveCatchesCorruption is the actual point of this
+// feature. A checksum computed only at write time proves nothing about
+// whether the file is still intact years later — this is what makes the
+// promise "we can prove this GST invoice has not been altered" real rather
+// than aspirational.
+func TestFR_DOC_001_RetrieveCatchesCorruption(t *testing.T) {
+	store := localStore(t)
+	rec := newMemRecorder()
+	archiver := NewArchiver(store, rec)
+
+	archived, err := archiver.Archive(context.Background(), Document{
+		Kind: KindKYC, EntityID: 7, Filename: "kyc.jpg", Body: strings.NewReader("original bytes"),
+	})
+	if err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	// Corrupt the file directly on disk, bypassing the application entirely —
+	// the scenario this check exists for: bit rot, a bad disk, or someone with
+	// filesystem access editing the file outside the software's knowledge.
+	path := pathOf(archived.StorageURL)
+	if err := os.WriteFile(path, []byte("tampered bytes, same length"), 0o600); err != nil {
+		t.Fatalf("corrupt the stored file: %v", err)
+	}
+
+	_, err = archiver.Retrieve(context.Background(), *archived)
+	if err == nil {
+		t.Fatal("a corrupted document must fail verification, not be handed back silently")
+	}
+	var mismatch *ErrChecksumMismatch
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("want ErrChecksumMismatch, got %T: %v", err, err)
+	}
+	if mismatch.DocKind != KindKYC || mismatch.EntityID != 7 {
+		t.Errorf("the error should identify which document failed, got %+v", mismatch)
+	}
+	if mismatch.Want != archived.ChecksumSHA256 {
+		t.Errorf("Want should be the checksum recorded at archive time, got %q", mismatch.Want)
+	}
+}
+
+func TestFR_DOC_001_RetrieveLatestFindsTheLiveRow(t *testing.T) {
+	store := localStore(t)
+	rec := newMemRecorder()
+	archiver := NewArchiver(store, rec)
+
+	if _, err := archiver.Archive(context.Background(), Document{
+		Kind: KindInvoice, EntityID: 42, Filename: "a.pdf", Body: strings.NewReader("v1"),
+	}); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	body, gotRec, err := archiver.RetrieveLatest(context.Background(), KindInvoice, 42)
+	if err != nil {
+		t.Fatalf("RetrieveLatest: %v", err)
+	}
+	if string(body) != "v1" {
+		t.Errorf("want v1, got %q", body)
+	}
+	if gotRec == nil || gotRec.EntityID != 42 {
+		t.Errorf("want the matching record, got %+v", gotRec)
+	}
+}
+
+// TestFR_DOC_001_RetrieveLatestOfUnarchivedDocument — nil, nil rather than an
+// error, so a caller can ask "is this archived yet" without treating "no" as a
+// failure. Matches Recorder.GetArchive's own contract.
+func TestFR_DOC_001_RetrieveLatestOfUnarchivedDocument(t *testing.T) {
+	archiver := NewArchiver(localStore(t), newMemRecorder())
+
+	body, rec, err := archiver.RetrieveLatest(context.Background(), KindInvoice, 999)
+	if err != nil {
+		t.Fatalf("want no error for a document that was never archived, got %v", err)
+	}
+	if body != nil || rec != nil {
+		t.Errorf("want nil, nil; got body=%v rec=%+v", body, rec)
+	}
+}
+
+func TestFR_DOC_001_GetOfAMissingObjectFails(t *testing.T) {
+	store := localStore(t)
+	_, err := store.Get(context.Background(), "file://"+filepath.Join(store.root, "invoice", "nope.pdf"))
+	if err == nil {
+		t.Error("Get of an object that was never Put must fail, not return an empty reader")
+	}
+}
+
+// TestFR_DOC_001_GetRefusesURLsOutsideTheRoot mirrors the same containment
+// check Delete already has: storage_url comes from the database, and a
+// restore that trusted it unchecked would read whatever a tampered row
+// pointed at.
+func TestFR_DOC_001_GetRefusesURLsOutsideTheRoot(t *testing.T) {
+	store := localStore(t)
+
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("not yours"), 0o600); err != nil {
+		t.Fatalf("write victim file: %v", err)
+	}
+
+	_, err := store.Get(context.Background(), "file://"+filepath.ToSlash(outside))
+	if err == nil {
+		t.Error("Get must refuse a URL outside the archive root")
+	}
+}
+
+func TestFR_DOC_001_RetrieveSurvivesAStoreFailure(t *testing.T) {
+	rec := newMemRecorder()
+	archiver := NewArchiver(localStore(t), rec)
+
+	archived, err := archiver.Archive(context.Background(), Document{
+		Kind: KindReport, EntityID: 1, Filename: "r.csv", Body: strings.NewReader("data"),
+	})
+	if err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	// Delete the underlying file without telling the archiver, simulating
+	// storage that has lost the object the database still believes exists.
+	if err := os.Remove(pathOf(archived.StorageURL)); err != nil {
+		t.Fatalf("remove underlying file: %v", err)
+	}
+
+	if _, err := archiver.Retrieve(context.Background(), *archived); err == nil {
+		t.Error("retrieving a document storage no longer has must fail, not return empty bytes")
 	}
 }
 

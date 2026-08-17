@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -305,7 +306,15 @@ func (h *Handler) UpdateTicketStatus(w http.ResponseWriter, r *http.Request) {
 		h.enqueueTicketUpdate(r.Context(), *updated)
 	}
 
-	http.Redirect(w, r, "/staff/tickets?subscriber_id="+subscriberID+"&updated=1", http.StatusSeeOther)
+	// gosec G710 (open redirect): the target can never leave /staff/tickets —
+	// it is a fixed literal, and subscriberID only ever fills a query
+	// parameter's value, not the redirect's host. Genuinely fixed anyway:
+	// subscriberID was raw PostFormValue, concatenated unescaped, so a value
+	// containing & or # could inject additional query parameters or corrupt
+	// the target the browser navigates to. url.Values.Encode is the correct
+	// way to build this regardless of whether that was exploitable today.
+	redirectQuery := url.Values{"subscriber_id": {subscriberID}, "updated": {"1"}}
+	http.Redirect(w, r, "/staff/tickets?"+redirectQuery.Encode(), http.StatusSeeOther) //nolint:gosec
 }
 
 // enqueueTicketUpdate tells the subscriber their ticket's status changed

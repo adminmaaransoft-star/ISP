@@ -27,7 +27,8 @@ The platform implements an asynchronous, decoupled, multi-tier architecture. The
 Go runtime executing `layeh.com/radius` bindings across a 128-worker bounded channel pool. Single master listener forwards UDP packets to workers. Workers authenticate from Redis, increment accounting atomically, and never touch PostgreSQL synchronously.
 
 ### SAD-COMP-002 — Cache & Event Streaming Tier (Redis 7.2 Sentinel HA)
-**Delivers:** FR-AAA-002, FR-FUP-001, NFR-AVAIL-001 (≤3s failover)
+**Delivers:** FR-AAA-002, FR-FUP-001, NFR-AVAIL-001 (≤8s failover — retargeted
+2026-08-18 from an unachievable 3s; see TST §13.4)
 **Detail:** [IDD §8.3](08_IDD_Infrastructure_Design.md)
 
 3-node Sentinel cluster (1 primary, 2 replicas). Hosts subscriber session hashes, FUP usage sorted sets, deduplication keys, Asynq task queues, dead-letter queues, and rate-limiting token buckets.
@@ -155,4 +156,4 @@ Asynq flush worker → XREAD accounting_stream (batched)
 | Configuration | Git | On every change | 10 min | Indefinite | — |
 | TLS certificates | Auto-renew | 30d before expiry | 10 min | — | — |
 
-Redis Sentinel: 3-node quorum (2 of 3 must agree for failover). Automated master promotion ≤ 3 seconds. AAA daemon reconnects within one retry cycle (≤ 500ms).
+Redis Sentinel: 3-node quorum (2 of 3 must agree for failover). Automated master promotion ≤ 8 seconds (retargeted from 3s — measured 3086-3192ms at the lowest safe detection setting, see TST §13.4). AAA daemon reconnects within one retry cycle (≤ 500ms) of promotion completing.

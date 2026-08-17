@@ -3,6 +3,8 @@ package archive
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"path"
@@ -30,7 +32,25 @@ var (
 		Name: "document_archived_bytes_total",
 		Help: "Bytes written to archival storage, by kind",
 	}, []string{"kind"})
+	retrievedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "document_retrieved_total",
+		Help: "Archived documents retrieved and checksum-verified, by kind and outcome",
+	}, []string{"kind", "outcome"})
 )
+
+// ErrChecksumMismatch means the bytes a Store returned do not hash to the
+// checksum recorded when the document was archived — the one outcome this
+// package exists to catch, and the reason Retrieve exists at all rather than
+// callers reading Store.Get directly.
+type ErrChecksumMismatch struct {
+	DocKind, Want, Got string
+	EntityID           int
+}
+
+func (e *ErrChecksumMismatch) Error() string {
+	return fmt.Sprintf("archive: %s %d failed checksum verification: recorded %s, got %s",
+		e.DocKind, e.EntityID, e.Want, e.Got)
+}
 
 // Record is a stored archive row.
 type Record struct {
@@ -51,6 +71,10 @@ type Recorder interface {
 	RecordArchive(ctx context.Context, r Record) (int64, error)
 	ListDueForPurge(ctx context.Context, limit int) ([]Record, error)
 	MarkPurged(ctx context.Context, id int64) (bool, error)
+	// GetArchive returns the live archive row for a document, or nil, nil when
+	// none exists (purged, or never archived) — not an error, since "is this
+	// archived yet" is a legitimate question with "no" as a legitimate answer.
+	GetArchive(ctx context.Context, docKind string, entityID int) (*Record, error)
 }
 
 // Document is one thing to archive.
@@ -186,6 +210,62 @@ func (a *Archiver) Archive(ctx context.Context, doc Document) (*Record, error) {
 	archivedTotal.WithLabelValues(doc.Kind, "archived").Inc()
 	archivedBytes.WithLabelValues(doc.Kind).Add(float64(put.SizeBytes))
 	return &rec, nil
+}
+
+// Retrieve fetches an archived document and verifies it against the checksum
+// recorded when it was written, returning ErrChecksumMismatch rather than the
+// bytes if they disagree.
+//
+// Buffered rather than streamed back to the caller on purpose. The documents
+// this package holds — invoice PDFs, KYC scans — are bounded in size, and a
+// streaming verify would need a wrapper that only reports a mismatch after
+// the caller has already consumed a corrupt prefix. Reading the whole thing
+// first means a caller gets either fully verified bytes or an error, never
+// partial trust.
+func (a *Archiver) Retrieve(ctx context.Context, rec Record) ([]byte, error) {
+	rc, err := a.store.Get(ctx, rec.StorageURL)
+	if err != nil {
+		retrievedTotal.WithLabelValues(rec.DocKind, "store_error").Inc()
+		return nil, err
+	}
+	defer rc.Close() //nolint:errcheck // read-only handle; nothing to recover from a close failure
+
+	hasher := sha256.New()
+	body, err := io.ReadAll(io.TeeReader(rc, hasher))
+	if err != nil {
+		retrievedTotal.WithLabelValues(rec.DocKind, "read_error").Inc()
+		return nil, fmt.Errorf("archive: read %s %d: %w", rec.DocKind, rec.EntityID, err)
+	}
+
+	if got := hex.EncodeToString(hasher.Sum(nil)); got != rec.ChecksumSHA256 {
+		retrievedTotal.WithLabelValues(rec.DocKind, "checksum_mismatch").Inc()
+		return nil, &ErrChecksumMismatch{
+			DocKind: rec.DocKind, EntityID: rec.EntityID, Want: rec.ChecksumSHA256, Got: got,
+		}
+	}
+
+	retrievedTotal.WithLabelValues(rec.DocKind, "verified").Inc()
+	return body, nil
+}
+
+// RetrieveLatest looks up a document's live archive row and retrieves it in
+// one call — the read-side counterpart to Archive, for the common case where
+// a caller has a doc kind and an entity id and nothing more. Returns nil, nil
+// when the document was never archived or has since been purged, matching
+// Recorder.GetArchive.
+func (a *Archiver) RetrieveLatest(ctx context.Context, docKind string, entityID int) ([]byte, *Record, error) {
+	rec, err := a.db.GetArchive(ctx, docKind, entityID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if rec == nil {
+		return nil, nil, nil
+	}
+	body, err := a.Retrieve(ctx, *rec)
+	if err != nil {
+		return nil, rec, err
+	}
+	return body, rec, nil
 }
 
 // ArchiveReport stores a generated report and returns where it landed.

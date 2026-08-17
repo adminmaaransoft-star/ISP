@@ -213,7 +213,8 @@ if [ ! -f config/redis/sentinel.conf ]; then
     echo "config/redis/sentinel.conf not found"; exit 1
 fi
 
-info "sentinel down-after-milliseconds: ${DOWN_AFTER_MS}ms (committed config uses $(grep -oE 'down-after-milliseconds [a-z_]+ [0-9]+' config/redis/sentinel.conf | grep -oE '[0-9]+$'))"
+COMMITTED_DOWN_AFTER_MS="$(grep -oE 'down-after-milliseconds [a-z_]+ [0-9]+' config/redis/sentinel.conf | grep -oE '[0-9]+$')"
+info "sentinel down-after-milliseconds: ${DOWN_AFTER_MS}ms (committed config uses ${COMMITTED_DOWN_AFTER_MS})"
 
 # Sentinel rewrites its own config file at runtime (it records the observed
 # topology), so it needs a writable copy — mounting the committed file would
@@ -501,8 +502,10 @@ for r in "${RESULTS[@]}"; do
 done
 
 echo ""
-printf "Measured with down-after-milliseconds=%sms. The committed config uses 3000ms,\n" "$DOWN_AFTER_MS"
-printf "which alone exceeds the %sms election budget — see this script's header.\n" "$ELECTION_BUDGET_MS"
+printf "Measured with down-after-milliseconds=%sms. The committed config uses %sms.\n" "$DOWN_AFTER_MS" "$COMMITTED_DOWN_AFTER_MS"
+if [ "$COMMITTED_DOWN_AFTER_MS" -gt "$ELECTION_BUDGET_MS" ]; then
+    printf "That alone exceeds the %sms election budget — see this script's header.\n" "$ELECTION_BUDGET_MS"
+fi
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

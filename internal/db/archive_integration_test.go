@@ -10,6 +10,8 @@ package db_test
 
 import (
 	"context"
+	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -253,5 +255,60 @@ func TestFR_DOC_001_UnarchivedDocumentReportsAbsence(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("want nil for a document that was never archived, got %+v", got)
+	}
+}
+
+// TestNFR_DUR_002_ArchiveAndRetrieveRoundTripsThroughRealStorage is the
+// production path end to end: db.ArchiveStore against real PostgreSQL,
+// archive.LocalStore against a real filesystem, tied together by
+// archive.Archiver — not the in-memory recorder the archive package's own
+// tests use. This is what actually runs when an operator restores a GST
+// invoice.
+func TestNFR_DUR_002_ArchiveAndRetrieveRoundTripsThroughRealStorage(t *testing.T) {
+	database, _ := newTestDB(t)
+	ctx := context.Background()
+
+	store, err := archive.NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+	archiver := archive.NewArchiver(store, database.Archive())
+
+	const body = "GST invoice, exactly as filed"
+	archived, err := archiver.Archive(ctx, archive.Document{
+		Kind: archive.KindInvoice, EntityID: 501, Filename: "inv-501.pdf",
+		Body: strings.NewReader(body),
+	})
+	if err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	got, rec, err := archiver.RetrieveLatest(ctx, archive.KindInvoice, 501)
+	if err != nil {
+		t.Fatalf("RetrieveLatest: %v", err)
+	}
+	if string(got) != body {
+		t.Errorf("retrieved bytes: want %q, got %q", body, got)
+	}
+	if rec == nil || rec.ID != archived.ID {
+		t.Errorf("want the record RecordArchive created, got %+v", rec)
+	}
+
+	// Corrupt the file PostgreSQL's row still points at, then confirm the
+	// real ArchiveStore-backed path catches it exactly like the in-memory one
+	// does — this is the property NFR-DUR-002 actually asks for.
+	onDisk := strings.TrimPrefix(archived.StorageURL, "file://")
+	if err := os.WriteFile(onDisk, []byte("a different, tampered invoice"), 0o600); err != nil {
+		t.Fatalf("corrupt the archived file: %v", err)
+	}
+
+	_, _, err = archiver.RetrieveLatest(ctx, archive.KindInvoice, 501)
+	if err == nil {
+		t.Fatal("a corrupted document must fail verification through the real store and DB, " +
+			"not just the in-memory test double")
+	}
+	var mismatch *archive.ErrChecksumMismatch
+	if !errors.As(err, &mismatch) {
+		t.Errorf("want ErrChecksumMismatch, got %T: %v", err, err)
 	}
 }

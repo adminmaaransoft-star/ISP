@@ -200,6 +200,16 @@ func TestFR_API_002_SSRFBlocklist(t *testing.T) {
 		{"::ffff:10.0.0.1", "IPv4-mapped RFC1918 — the bypass when only 4-byte addresses are checked"},
 		{"::ffff:169.254.169.254", "IPv4-mapped cloud metadata"},
 		{"0.0.0.0", "unspecified"},
+		// IPv4-*compatible* IPv6 (RFC 5156-deprecated, ::a.b.c.d — distinct from
+		// the IPv4-*mapped* form above, ::ffff:a.b.c.d). To4() recognises only
+		// the mapped form's marker bytes, so this form previously passed
+		// IsBlockedIP's CIDR loop unmatched regardless of what it embedded: a
+		// partner could register https://[::169.254.169.254]/ and reach cloud
+		// metadata past a blocklist that visibly listed 169.254.0.0/16.
+		{"::169.254.169.254", "IPv4-compatible cloud metadata — the bypass this fix closes"},
+		{"::10.0.0.1", "IPv4-compatible RFC1918"},
+		{"::127.0.0.1", "IPv4-compatible loopback"},
+		{"::192.168.1.1", "IPv4-compatible RFC1918"},
 	}
 	for _, tc := range blocked {
 		if !partner.IsBlockedIP(net.ParseIP(tc.ip)) {
@@ -210,6 +220,18 @@ func TestFR_API_002_SSRFBlocklist(t *testing.T) {
 	for _, ip := range []string{"93.184.216.34", "8.8.8.8", "2606:2800:220:1:248:1893:25c8:1946"} {
 		if partner.IsBlockedIP(net.ParseIP(ip)) {
 			t.Errorf("%s is a legitimate public address and must be allowed", ip)
+		}
+	}
+
+	// ::1 and :: are ordinary IPv6 loopback/unspecified, already caught by
+	// IsLoopback/IsUnspecified before the compatible-form check ever runs. A
+	// regression guard: embeddedIPv4Compatible's byte pattern for "no
+	// embedded address" (trailing 0.0.0.0/0.0.0.1) shares its all-zero prefix
+	// with exactly these two addresses, so it is worth pinning that both stay
+	// blocked after the fix, even though this API cannot show which check did it.
+	for _, ip := range []string{"::1", "::"} {
+		if !partner.IsBlockedIP(net.ParseIP(ip)) {
+			t.Errorf("%s must still be blocked, via its real IPv6 semantics", ip)
 		}
 	}
 

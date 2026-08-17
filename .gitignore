@@ -51,3 +51,11 @@ e2e/live-test/
 e2e/demo-recordings/
 e2e/demo-videos/
 e2e/demo-frames/
+
+# scripts/run_soak_test.sh output. .soak_users.csv is removed by the script's
+# own cleanup trap on a normal exit; listed anyway in case a run is
+# interrupted. soak_metrics_*.tsv is deliberately kept by the script itself
+# (so a run can be re-analysed without repeating an hour of load) and would
+# otherwise linger as clutter in every git status after every run.
+.soak_users.csv
+soak_metrics_*.tsv

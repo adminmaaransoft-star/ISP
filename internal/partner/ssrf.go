@@ -90,7 +90,59 @@ func IsBlockedIP(ip net.IP) bool {
 			return true
 		}
 	}
+
+	// IPv4-*compatible* IPv6 (::10.0.0.1, RFC 5156-deprecated — distinct from
+	// the IPv4-*mapped* form above, ::ffff:10.0.0.1) is not caught by the loop
+	// above. To4() recognises only the mapped form's 0xff,0xff marker at bytes
+	// 10-11; the compatible form has 0x00,0x00 there instead, so To4() returns
+	// nil, IPNet.Contains compares 16 bytes against a 4-byte network and never
+	// matches, and this loop passes it through no matter what it embeds —
+	// ::169.254.169.254 reads as "not blocked".
+	//
+	// No mainstream OS actually routes this deprecated form to its embedded
+	// IPv4 target (confirmed by dialling one against a real listener during
+	// review: RFC 5156, 2008), so this is not exploitable today. It is fixed
+	// anyway, because "not exploitable on the OS this happened to be tested
+	// against" is not a property this function can see or depend on, and the
+	// fix is one bounds check.
+	if v4 := embeddedIPv4Compatible(ip); v4 != nil {
+		for _, n := range blockedNets {
+			if n.Contains(v4) {
+				return true
+			}
+		}
+	}
 	return false
+}
+
+// embeddedIPv4Compatible extracts the trailing 4 bytes of a 16-byte address
+// whose first 10 bytes are zero — the IPv4-compatible IPv6 form, ::a.b.c.d —
+// and nil for anything else, including plain IPv6 addresses like ::1 or ::2
+// that happen to share that same all-zero prefix.
+//
+// Deliberately not folded into the mapped-form path above: mapped and
+// compatible are bit-for-bit different only in bytes 10-11, and conflating
+// the two checks would make it easy to silently stop checking one of them
+// during a future edit.
+func embeddedIPv4Compatible(ip net.IP) net.IP {
+	ip16 := ip.To16()
+	if ip16 == nil || ip.To4() != nil {
+		return nil // already plain IPv4, or not a valid 16-byte address
+	}
+	for i := 0; i < 10; i++ {
+		if ip16[i] != 0 {
+			return nil
+		}
+	}
+	// ::0.0.0.0 and ::0.0.0.1 are the unspecified and loopback addresses under
+	// this reading — both are indistinguishable from ::/128 and ::1, which
+	// IsLoopback/IsUnspecified above already block by their real IPv6
+	// semantics. Excluding them here avoids blocking on a coincidental byte
+	// pattern rather than on an actual embedded address.
+	if ip16[12] == 0 && ip16[13] == 0 && ip16[14] == 0 && (ip16[15] == 0 || ip16[15] == 1) {
+		return nil
+	}
+	return net.IPv4(ip16[12], ip16[13], ip16[14], ip16[15])
 }
 
 // ValidateWebhookURL checks a URL at registration time.

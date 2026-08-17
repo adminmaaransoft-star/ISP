@@ -175,8 +175,16 @@ func (a *ACS) handleInform(ctx context.Context, w http.ResponseWriter, env *Enve
 		return
 	}
 
+	// Secure and SameSite added alongside HttpOnly: this endpoint is mounted on
+	// the same mux as every JWT-protected route (cmd/api/main.go), so it never
+	// actually receives a plain-HTTP request in this deployment — Caddy
+	// terminates TLS in front of all of it — and Secure costs nothing here.
+	// SameSite=Strict is the conservative default for a session that never
+	// legitimately needs cross-site semantics: CWMP is a CPE-to-ACS protocol
+	// session, not something a browser navigates to.
 	http.SetCookie(w, &http.Cookie{
-		Name: "cwmp-session", Value: sessionID, Path: "/", HttpOnly: true,
+		Name: "cwmp-session", Value: sessionID, Path: "/",
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
 	})
 	a.writeSOAP(w, BuildInformResponse(env.Header.ID))
 }
@@ -311,7 +319,7 @@ func renderTask(task *Task) (string, error) {
 		if url == "" {
 			// Issuing a Download with no URL can leave a device in a
 			// half-upgraded state, so it fails here rather than on the box.
-			return "", fmt.Errorf("Download with no url parameter")
+			return "", fmt.Errorf("download RPC has no url parameter")
 		}
 		return BuildDownload("", url, commandKey, 0), nil
 

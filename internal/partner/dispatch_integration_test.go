@@ -78,10 +78,10 @@ func newTask(t *testing.T, endpointID int, url string) *asynq.Task {
 		t.Fatalf("NewEvent: %v", err)
 	}
 	payload, err := json.Marshal(partner.TaskPayload{
-		EndpointID: endpointID,
-		URL:        url,
-		Secret:     "encrypted-placeholder",
-		Event:      ev,
+		EndpointID:      endpointID,
+		URL:             url,
+		SecretEncrypted: "encrypted-placeholder",
+		Event:           ev,
 	})
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)

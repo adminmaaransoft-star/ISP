@@ -54,6 +54,12 @@ type Store interface {
 	// normal — and must not leave a partial object visible under key if they
 	// fail midway.
 	Put(ctx context.Context, key string, r io.Reader) (*PutResult, error)
+	// Get opens a previously-Put object for reading, addressed by the URL Put
+	// returned. The caller must Close it. Checksum verification is not this
+	// method's job — it returns exactly what is stored, corrupt or not — so
+	// that Archiver.Retrieve can tell "the file is wrong" apart from "the file
+	// could not be read" instead of this layer collapsing the two.
+	Get(ctx context.Context, url string) (io.ReadCloser, error)
 	// Delete removes a previously-Put object. Deleting something already gone
 	// is not an error: the purge scanner retries, and a backend that reported
 	// failure for an object it had already removed would retry forever.
@@ -158,6 +164,26 @@ func (s *LocalStore) Put(ctx context.Context, key string, r io.Reader) (*PutResu
 		SizeBytes:      size,
 		ChecksumSHA256: hex.EncodeToString(hasher.Sum(nil)),
 	}, nil
+}
+
+// Get opens the object at url for reading.
+//
+// url is re-validated against the archive root the same way Delete's is —
+// storage_url comes back out of the database, and a purge or a restore that
+// trusted it unchecked would act on whatever a tampered row pointed at.
+func (s *LocalStore) Get(_ context.Context, url string) (io.ReadCloser, error) {
+	path, err := s.pathFromURL(url)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(path) //nolint:gosec // path re-validated by pathFromURL against s.root
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("archive: %q: %w", url, os.ErrNotExist)
+		}
+		return nil, fmt.Errorf("archive: open %q: %w", url, err)
+	}
+	return f, nil
 }
 
 // Delete removes the object at url. A missing file is success.

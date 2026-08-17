@@ -218,8 +218,21 @@ func (h *Handler) GetInvoicePDF(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/pdf")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"invoice-%d.pdf\"", detail.ID))
+	// nosniff is the actual, concrete answer to what gosec G705 is gesturing at
+	// below (see that comment) rather than an unrelated addition: it is what
+	// stops an old or misconfigured browser from MIME-sniffing this response
+	// as HTML and executing anything in it as script, regardless of the
+	// Content-Type header above, if pdfGen ever returned bytes that did not
+	// start with the PDF magic header.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(pdfBytes) //nolint:errcheck
+	// gosec G705 (XSS via taint analysis) flags this write because pdfBytes
+	// traces back through GeneratePDF to subscriber-derived invoice data. Not
+	// exploitable as XSS: this response is served as application/pdf (set
+	// above) plus X-Content-Type-Options: nosniff, so no browser executes it
+	// as HTML/JS regardless of what the PDF's own content contains — there is
+	// no script-execution context for a PDF served this way.
+	_, _ = w.Write(pdfBytes) //nolint:errcheck,gosec
 }
 
 // BuildInvoiceData maps the DB-sourced detail into the billing package's

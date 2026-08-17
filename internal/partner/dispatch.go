@@ -79,8 +79,14 @@ type Decryptor interface {
 type TaskPayload struct {
 	EndpointID int    `json:"endpoint_id"`
 	URL        string `json:"url"`
-	Secret     string `json:"secret_encrypted"`
-	Event      Event  `json:"event"`
+	// SecretEncrypted, not Secret: this is ciphertext sitting in Redis (the
+	// Asynq queue backend) until ProcessTask decrypts it, and the field name
+	// said otherwise — gosec's G117 flags struct fields named like a secret
+	// that get marshaled, and here it was also just an inaccurate name, not
+	// only a lint finding. The JSON tag is unchanged; only the Go-side name
+	// now matches what the field actually holds.
+	SecretEncrypted string `json:"secret_encrypted"`
+	Event           Event  `json:"event"`
 }
 
 // Emitter fans an event out to every subscribed endpoint.
@@ -120,10 +126,10 @@ func (e *Emitter) Emit(ctx context.Context, eventType string, entityID int) {
 
 	for _, ep := range endpoints {
 		payload, err := json.Marshal(TaskPayload{
-			EndpointID: ep.EndpointID,
-			URL:        ep.URL,
-			Secret:     ep.SecretEncrypted,
-			Event:      ev,
+			EndpointID:      ep.EndpointID,
+			URL:             ep.URL,
+			SecretEncrypted: ep.SecretEncrypted,
+			Event:           ev,
 		})
 		if err != nil {
 			log.Error().Err(err).Int("endpoint_id", ep.EndpointID).Msg("partner: marshal webhook task")
@@ -169,7 +175,7 @@ func (s *Sender) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		return fmt.Errorf("partner: unmarshal webhook task: %w: %w", err, asynq.SkipRetry)
 	}
 
-	secret, err := s.decryptor.Decrypt(p.Secret)
+	secret, err := s.decryptor.Decrypt(p.SecretEncrypted)
 	if err != nil {
 		s.record(ctx, p, StatusAbandoned, nil, "", "signing secret could not be decrypted")
 		return fmt.Errorf("partner: decrypt webhook secret: %w: %w", err, asynq.SkipRetry)
