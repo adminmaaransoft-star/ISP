@@ -23,6 +23,11 @@ REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
 GO_IMAGE="${GO_IMAGE:-golang:1.22}"
 
 SUFFIX="$$"
+# Per-run key store. The containers mount config/keys as a directory, so the
+# file has to live there — but it must not be the shared aes_keys.json a demo
+# stack is using. .gitignore already covers config/keys/*.json.
+KEY_NAME="aes_keys.smoke-${SUFFIX}.json"
+KEY_PATH="${REPO_ROOT}/config/keys/${KEY_NAME}"
 NETWORK="smoke_net_${SUFFIX}"
 PG="smoke_pg_${SUFFIX}"
 REDIS="smoke_redis_${SUFFIX}"
@@ -50,7 +55,10 @@ cleanup() {
     fi
     docker rm -f "$API" "$RADIUSD" "$PG" "$REDIS" >/dev/null 2>&1 || true
     docker network rm "$NETWORK" >/dev/null 2>&1 || true
-    rm -f "$REPO_ROOT/config/keys/aes_keys.json" 2>/dev/null || true
+    # Only this run's own key file — see the note in run_nfr_tests.sh: writing
+    # or deleting the shared config/keys/aes_keys.json breaks a running demo
+    # stack, fatally for the API.
+    rm -f "$KEY_PATH" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -99,7 +107,7 @@ pass "migrations applied"
 info "generating a local AES key store"
 mkdir -p "$REPO_ROOT/config/keys"
 KEY_B64=$(docker run --rm "$GO_IMAGE" sh -c "head -c 32 /dev/urandom | base64 -w0")
-cat > "$REPO_ROOT/config/keys/aes_keys.json" <<EOF
+cat > "$KEY_PATH" <<EOF
 {"active_version":"v1","keys":{"v1":"${KEY_B64}"}}
 EOF
 pass "key store written"
@@ -145,7 +153,7 @@ docker run -d --rm --name "$API" --network "$NETWORK" \
     -e "DB_DSN=${DSN}" \
     -e "REDIS_ADDR=${REDIS}:6379" \
     -e "JWT_SECRET=${JWT_SECRET}" \
-    -e "AES_KEY_STORE_URL=local:/app/config/keys/aes_keys.json" \
+    -e "AES_KEY_STORE_URL=local:/app/config/keys/${KEY_NAME}" \
     -e "LOG_FORMAT=json" \
     -p 18080:8080 \
     "$API_IMAGE" >/dev/null

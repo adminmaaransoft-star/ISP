@@ -44,6 +44,11 @@ API_VUS="${API_VUS:-500}"
 API_DURATION="${API_DURATION:-30s}"
 
 SUFFIX="$$"
+# Per-run key store. The containers mount config/keys as a directory, so the
+# file has to live there — but it must not be the shared aes_keys.json a demo
+# stack is using. .gitignore already covers config/keys/*.json.
+KEY_NAME="aes_keys.nfr-${SUFFIX}.json"
+KEY_PATH="${REPO_ROOT}/config/keys/${KEY_NAME}"
 NETWORK="nfr_net_${SUFFIX}"
 PG="nfr_pg_${SUFFIX}"
 REDIS="nfr_redis_${SUFFIX}"
@@ -68,7 +73,12 @@ RESULTS=()
 cleanup() {
     docker rm -f "$API" "$RADIUSD" "$PG" "$REDIS" >/dev/null 2>&1 || true
     docker network rm "$NETWORK" >/dev/null 2>&1 || true
-    rm -f "$REPO_ROOT/config/keys/aes_keys.json" "$REPO_ROOT/.nfr_users.csv" 2>/dev/null || true
+    # Only this run's own key file. Never config/keys/aes_keys.json — that one
+    # belongs to whatever demo stack is running, and both writing and deleting
+    # it broke that stack: the API treats a missing key store as fatal and
+    # crash-loops, and an overwrite silently re-keys data encrypted under the
+    # old key so nothing can decrypt it afterwards.
+    rm -f "$KEY_PATH" "$REPO_ROOT/.nfr_users.csv" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -113,7 +123,7 @@ in_go_container "$GO_IMAGE" go run github.com/pressly/goose/v3/cmd/goose@v3.19.2
 info "generating key store"
 mkdir -p "$REPO_ROOT/config/keys"
 KEY_B64=$(docker run --rm "$GO_IMAGE" sh -c "head -c 32 /dev/urandom | base64 -w0")
-printf '{"active_version":"v1","keys":{"v1":"%s"}}\n' "$KEY_B64" > "$REPO_ROOT/config/keys/aes_keys.json"
+printf '{"active_version":"v1","keys":{"v1":"%s"}}\n' "$KEY_B64" > "$KEY_PATH"
 
 head1 "Seeding ${SUBSCRIBERS} subscribers"
 SEED_START=$(date +%s)
@@ -163,7 +173,7 @@ docker run -d --rm --name "$API" --network "$NETWORK" \
     -v "${MOUNT_ROOT}/config/keys:/app/config/keys:ro" \
     -e "DB_DSN=${DSN}" -e "REDIS_ADDR=${REDIS}:6379" \
     -e "JWT_SECRET=${JWT_SECRET}" \
-    -e "AES_KEY_STORE_URL=local:/app/config/keys/aes_keys.json" \
+    -e "AES_KEY_STORE_URL=local:/app/config/keys/${KEY_NAME}" \
     -e "LOG_FORMAT=json" -e "LOG_LEVEL=warn" \
     -e "DB_MAX_CONNS=50" \
     isp-bss-api:nfr >/dev/null

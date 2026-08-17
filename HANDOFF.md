@@ -101,6 +101,15 @@ while the client measured a 20ms tail, and the rate sweep was non-monotonic
 contention rather than slow code. `docker compose stop` before running the
 NFR suite, `docker compose start` after.
 
+They no longer fight over the AES key store, though. Until 2026-08-17 both
+`run_nfr_tests.sh` and `smoke_test.sh` wrote and then deleted
+`config/keys/aes_keys.json` — the file `demo_up.sh` owns. That crash-looped the
+demo API (fatal there by design: the key store encrypts KYC data at rest, so
+`cmd/api` refuses to start without it, unlike `radiusd` where it is optional
+and only enables multi-vendor NAS support) and silently re-keyed anything
+encrypted under the previous key. Each script now writes
+`config/keys/aes_keys.<run>-<pid>.json` and removes only its own.
+
 The lint figure is not a regression — the integration-tagged count has been
 that high for some time and simply was never measured before. It is mostly
 `noctx` in tests (`httptest.NewRequest` cannot take a context until the

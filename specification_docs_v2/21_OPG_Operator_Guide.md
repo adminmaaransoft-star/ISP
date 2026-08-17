@@ -292,9 +292,13 @@ Metrics worth watching:
 | Usage figures all zero for a period | Accounting was not being written then | Sessions before commit `33bfd89` do not exist |
 | Report CSV has blank cells | Correct — nothing was resolved/billed | Not a bug; see §5.4 |
 
-> **One caution about running the performance suite.** `run_nfr_tests.sh`
-> deletes `config/keys/aes_keys.json` on exit, which the demo stack needs — the
-> API will crash-loop afterwards until the key is regenerated. It also competes
-> with the demo stack for CPU, which can turn a passing latency budget into a
-> failing one. Stop the demo stack before running it, and regenerate the key
-> afterwards.
+> **One caution about running the performance suite.** `run_nfr_tests.sh` and
+> `smoke_test.sh` bring up their own containers, which compete with the demo
+> stack for CPU — enough to turn a passing latency budget into a failing one on
+> a shared machine. Stop the demo stack before running either.
+>
+> They no longer touch `config/keys/aes_keys.json`. Until 2026-08-17 both wrote
+> and then deleted that shared file, which crash-looped the demo API (fatally —
+> the key store is mandatory there because it encrypts KYC data at rest) and
+> silently re-keyed anything encrypted under the previous key. Each script now
+> uses its own `aes_keys.<run>-<pid>.json` and removes only that.
