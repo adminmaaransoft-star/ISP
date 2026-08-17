@@ -44,3 +44,10 @@ e2e/snapshots/
 # Ad-hoc live-verification screenshots (driven by hand against a running
 # stack, not by the committed suite) — same reasoning as e2e/snapshots/
 e2e/live-test/
+
+# Demo walkthrough recordings (scripts/record_demo.sh). Multi-megabyte binaries
+# regenerated from the live stack on demand — the specs that produce them are
+# committed, the output is not.
+e2e/demo-recordings/
+e2e/demo-videos/
+e2e/demo-frames/
