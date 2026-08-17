@@ -4,9 +4,10 @@ How to run the system, sign in as each persona, and exercise the parts that
 matter. Every command here was run against the live stack before being written
 down.
 
-There is a visual version of the subscriber-portal walkthrough, with
-screenshots, published separately; this file is the reference that ships with
-the code.
+This file is the command reference. For an illustrated version — every persona's
+screens, with screenshots, including the side-by-side contrasts that show what
+each role is blocked from — see
+`specification_docs_v2/22_PWT_Persona_Walkthrough.md`.
 
 ---
 
@@ -17,8 +18,8 @@ the code.
 ```
 
 That brings up PostgreSQL, Redis with three Sentinels and two replicas,
-Gotenberg, the RADIUS daemon, the API and the reverse proxy; applies all 20
-migrations; generates any missing secrets into `.env`; and seeds demo data.
+Gotenberg, the RADIUS daemon, the API and the reverse proxy; applies every
+migration; generates any missing secrets into `.env`; and seeds demo data.
 
 The portal is then at **`https://localhost/ui/login`**.
 
@@ -233,7 +234,7 @@ if you are validating the compliance story.
 | Gap | Status |
 |---|---|
 | Renewal payments | **Blocked** — needs `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET`. The screen works; the payment round trip cannot complete. Report as blocked, not failed. |
-| Admin / staff UI | **Does not exist** and was never specified. Staff use the JSON API. |
+| Archived document retrieval | **Not built.** `archive.Store` has `Put` and `Delete` but no read path, so an archived invoice cannot be fetched back and re-verified through the application. |
 | Sentinel failover | ~5.1s on the shipped config against a 3s budget. See `DOD_STATUS_REPORT.md` finding 6. |
 
 ---
